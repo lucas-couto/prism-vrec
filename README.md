@@ -6,6 +6,8 @@ Comes with a fashion starter pack (4 pre-configured DVBPR datasets) and supports
 
 Authored by **Lucas Silva Couto** ([ORCID 0009-0000-0641-8166](https://orcid.org/0009-0000-0641-8166)) with **Prof. Dr. Marcos Aurelio Domingues** ([ORCID 0000-0001-7195-0714](https://orcid.org/0000-0001-7195-0714)), at the Graduate Program in Computer Science, Universidade Estadual de Maringá (UEM). One reported use of the framework is the author's M.Sc. dissertation (see [§16](#16-citation)).
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20357510.svg)](https://doi.org/10.5281/zenodo.20357510)
+
 ---
 
 ## Table of contents
@@ -834,11 +836,13 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  url     = {https://github.com/lucas-couto/prism-vrec}
+  version = {1.0.0},
+  doi     = {10.5281/zenodo.20357510},
+  url     = {https://doi.org/10.5281/zenodo.20357510}
 }
 ```
 
-A companion tool paper and an archived release (with DOI) are planned; this section will be updated when they are available. In the meantime, see `CITATION.cff` for the canonical software citation metadata.
+The archived release is available on Zenodo: [10.5281/zenodo.20357510](https://doi.org/10.5281/zenodo.20357510). A companion tool paper is planned and this section will be updated when it is available. See `CITATION.cff` for the canonical software citation metadata.
 
 ### Citing a reported use of the framework
 

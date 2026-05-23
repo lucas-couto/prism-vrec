@@ -17,7 +17,12 @@ authors:
 repository-code: "https://github.com/lucas-couto/prism-vrec"
 license: MIT
 version: 1.0.0
-date-released: 2026-XX-XX
+date-released: 2026-05-23
+doi: 10.5281/zenodo.20357510
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.20357510
+    description: "Concept DOI (Zenodo) — resolves to the latest archived version"
 abstract: >-
   Prism VRec is a reproducible framework for evaluating
   visual feature extractors as drop-in front-ends for recommender
