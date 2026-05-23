@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/prism_vrec_readme_banner.svg" alt="Prism VRec — a reproducible framework for visual recommendation research">
+</p>
+
 # Prism VRec
 
 **A reproducible framework for evaluating visual feature extractors in recommender systems, including pure architectures, CNN-Transformer hybrids, foundation models, and late-fusion strategies.**
