@@ -1,0 +1,17 @@
+# Smoke profile — small k values, lighter bootstrap.
+k_values: [5, 10]
+
+metrics:
+  - "precision"
+  - "recall"
+  - "ndcg"
+
+statistical:
+  alpha: 0.05
+  correction: "holm"
+  bootstrap:
+    enabled: true
+    n_iterations: 100
+  friedman:
+    enabled: true
+  effect_size: true

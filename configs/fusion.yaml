@@ -1,0 +1,57 @@
+# Configuração das estratégias de fusão
+#
+# `fusion_strategies_enabled` controla quais estratégias rodam neste
+# experimento. Lista vazia ou ausente = nenhuma fusão roda. Para
+# desativar uma estratégia basta removê-la desta lista (a definição em
+# `strategies:` continua como catálogo). Nomes válidos: mean, sum, prod,
+# max_pool, weighted_mean, attention_weighted, gated, concat, pca,
+# pca_per_model, adaptive_gated.
+fusion_strategies_enabled:
+  - mean
+  - sum
+  - prod
+  - max_pool
+  - weighted_mean
+  - attention_weighted
+  - gated
+  - concat
+  - pca
+  - pca_per_model
+  - adaptive_gated
+
+# Normalizar L2 antes da fusão
+normalize_before_fusion: true
+
+strategies:
+  # Estratégias que requerem dims iguais
+  mean: {}
+  sum: {}
+  prod: {}
+  max_pool: {}
+
+  # Single-variant protocol (decided 2026-05-15): one canonical value
+  # per parameterised strategy. These match the prior expand_grid
+  # defaults, so embeddings stay bit-identical to earlier runs.
+  weighted_mean:
+    w_cnn: [0.5]  # w_vit = 1 - w_cnn
+
+  attention_weighted: {}
+
+  gated: {}
+
+  # Estratégias que aceitam dims diferentes
+  concat: {}
+
+  pca:
+    n_components: [128]
+
+  pca_per_model:
+    n_components_per_model: [64]
+
+  # Online (learned) fusion: per-item per-dim gate from a small MLP,
+  # trained jointly with the recommender.  No offline .npy is produced;
+  # the fuse step writes a JSON sidecar listing the component
+  # embeddings (resnet50 + vit_b16 by default), and the recommender
+  # instantiates the gate module at construction time.  See
+  # docs/learned_fusion.md.
+  adaptive_gated: {}

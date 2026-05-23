@@ -1,0 +1,22 @@
+# Configuração do fine-tuning por classificação de categorias
+finetuning:
+  epochs_max: 15
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  # Batch 128 saturates an RTX 4090 (24GB) on the heaviest extractors
+  # (ResNet50, ViT-B/16) while keeping convergence in 15 epochs.  On
+  # smaller GPUs override via env: BATCH_SIZE=32 docker compose ...
+  batch_size: 128
+  patience: 5
+
+  # Extratores que recebem fine-tuning (CLIP e DINOv2 ficam congelados)
+  extractors:
+    - "resnet50"
+    - "vit_b16"
+    - "cvt_13"
+    - "coatnet_0"
+    - "levit_256"
+    - "convnext_base"
+
+  # Para Tradesy (sem categorias), usar pesos fine-tuned de qual dataset
+  tradesy_transfer_from: "amazon_fashion"

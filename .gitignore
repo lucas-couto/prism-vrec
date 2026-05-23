@@ -1,0 +1,44 @@
+# Data (large files, not versioned)
+data/raw/
+data/processed/
+data/embeddings/
+data/smoke_raw/
+data/smoke_processed/
+data/smoke_embeddings/
+
+# Checkpoints (extraction, training, finetune, grid search state).
+# Regenerable, opaque binaries.
+checkpoints/
+
+# Results (generated, execution artefacts).
+results/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+
+# Misc
+*.tmp

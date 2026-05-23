@@ -1,0 +1,31 @@
+# Pre-commit hooks for prism-vrec.
+#
+# Install once with::
+#
+#     pip install -e ".[dev]"
+#     pre-commit install
+#
+# After that, every ``git commit`` runs the hooks below; failures block
+# the commit until they are fixed.  The same hooks run in CI on pull
+# requests, so passing locally guarantees green CI.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.5
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format

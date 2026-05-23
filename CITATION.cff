@@ -1,0 +1,58 @@
+# Citation File Format (https://citation-file-format.github.io/)
+# GitHub renders the "Cite this repository" button from this file.
+
+cff-version: 1.2.0
+title: "Prism VRec: A reproducible framework for evaluating visual feature extractors in recommender systems"
+message: "If you use this framework in academic work, please cite it as below."
+type: software
+authors:
+  - given-names: Lucas
+    family-names: "Silva Couto"
+    email: contato@lucas-couto.com
+    orcid: "https://orcid.org/0009-0000-0641-8166"
+  - given-names: "Marcos Aurelio"
+    family-names: Domingues
+    affiliation: "State University of Maringá (UEM)"
+    orcid: "https://orcid.org/0000-0001-7195-0714"
+repository-code: "https://github.com/lucas-couto/prism-vrec"
+license: MIT
+version: 1.0.0
+date-released: 2026-XX-XX
+abstract: >-
+  Prism VRec is a reproducible framework for evaluating
+  visual feature extractors as drop-in front-ends for recommender
+  systems. It supports four families of extractors — pure
+  architectures (ResNet50, ViT-B/16), CNN+Transformer architectural
+  hybrids (CvT, CoAtNet, LeViT), foundation models (CLIP, DINOv2),
+  and ten late-fusion strategies over the primary CNN+ViT pair —
+  together with five recommender models (BPR, VBPR, VNPR, DeepStyle,
+  AVBPR). The framework is domain-agnostic: it ships with a fashion
+  starter pack (the four DVBPR datasets) and accepts any visual
+  recommendation domain via a CSV-based provider. Reproducibility is
+  enforced through deterministic per-job seeds, a run manifest
+  capturing git SHA, hardware, configuration, and pinned dependency
+  versions, and an idempotent, checkpointed pipeline.
+keywords:
+  - recommender-systems
+  - visual-recommendation
+  - feature-fusion
+  - cnn-transformer-hybrids
+  - foundation-models
+  - reproducible-research
+references:
+  - type: thesis
+    thesis-type: "M.Sc. Dissertation"
+    title: "Hybrid Visual Feature Extraction for Clothing Recommendation Based on Deep Learning"
+    authors:
+      - given-names: Lucas
+        family-names: "Silva Couto"
+        orcid: "https://orcid.org/0009-0000-0641-8166"
+    supervisors:
+      - given-names: "Marcos Aurelio"
+        family-names: Domingues
+        orcid: "https://orcid.org/0000-0001-7195-0714"
+    institution:
+      name: "State University of Maringá (UEM)"
+      address: "Maringá, PR, Brazil"
+    year: 2026
+    notes: "Graduate Program in Computer Science (PCC/UEM). The fashion starter pack and DVBPR results in this framework constitute the validation case study reported in this dissertation."

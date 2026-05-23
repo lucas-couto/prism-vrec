@@ -1,0 +1,84 @@
+# Single compose file for every host.  GPU is picked up automatically
+# when the host's Docker daemon uses nvidia-container-runtime by default
+# (RunPod, lab servers with the toolkit installed).  On hosts without
+# it (Mac, Linux without NVIDIA driver, CI runners) the container runs
+# on CPU.  The framework's ``device: "auto"`` config resolves to the
+# right one at startup; the resolved value is recorded in the manifest.
+#
+# Usage
+# -----
+#   docker compose up -d --build           # full pipeline
+#   docker compose --profile tools run --rm bootstrap   # download + preprocess only
+#   docker compose --profile tools run --rm shell       # interactive shell
+
+services:
+  pipeline:
+    build: .
+    container_name: prism-vrec
+    volumes:
+      - ./data:/app/data
+      - ./results:/app/results
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+      - ./checkpoints:/app/checkpoints
+      - ./plugins:/app/plugins
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./main.py:/app/main.py
+      - model_cache:/root/.cache
+    working_dir: /app
+    entrypoint: ["python", "main.py"]
+    restart: on-failure:3
+    shm_size: "4g"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # One-shot helper to fetch + preprocess amazon_fashion.  Narrows the
+  # dataset list to amazon_fashion only via a transient YAML override
+  # (configs/default.yaml normally lists all four DVBPR datasets).
+  bootstrap:
+    build: .
+    profiles: ["tools"]
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+      - ./src:/app/src
+      - ./main.py:/app/main.py
+      - model_cache:/root/.cache
+    working_dir: /app
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        OVERRIDE=configs/zz_bootstrap_override.yaml
+        printf 'datasets:\n  - amazon_fashion\n' > "$$OVERRIDE"
+        trap 'rm -f "$$OVERRIDE"' EXIT
+        python main.py --from download --to preprocess
+    shm_size: "2g"
+
+  shell:
+    build: .
+    profiles: ["tools"]
+    volumes:
+      - ./data:/app/data
+      - ./results:/app/results
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+      - ./checkpoints:/app/checkpoints
+      - ./plugins:/app/plugins
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./main.py:/app/main.py
+      - model_cache:/root/.cache
+    working_dir: /app
+    entrypoint: ["bash"]
+    stdin_open: true
+    tty: true
+    shm_size: "4g"
+
+volumes:
+  model_cache:

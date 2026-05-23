@@ -1,0 +1,86 @@
+# Configuração dos modelos de recomendação
+#
+# `recommenders_enabled` controla quais recomendadores rodam neste
+# experimento. Lista vazia ou ausente = nenhum recomendador roda. Para
+# desativar um modelo basta removê-lo desta lista. Nomes válidos: bpr,
+# vbpr, vnpr, deepstyle, avbpr.
+recommenders_enabled:
+  - bpr
+  - vbpr
+  - vnpr
+  - deepstyle
+  - avbpr
+
+# Filter embeddings by dimension suffix (e.g. ["D128"] or ["D64", "D128"])
+# Empty list or omitted = use all available embeddings
+embedding_dims: ["D128"]
+
+common:
+  latent_dim: [64, 128]
+  learning_rate: [0.001, 0.01]
+  l2_reg: [0.0001, 0.001]
+  visual_dim: [64, 128]  # D (dimensão da projeção visual)
+  epochs: 100
+  batch_size: 4096
+  early_stopping_patience: 20
+  early_stopping_metric: "ndcg@10"
+
+  # Evaluation frequency during training (epochs between validations).
+  # Full-ranking over the entire validation set is always used; only the
+  # frequency changed relative to earlier runs (was 5, now 10) to reduce
+  # training cost while preserving the same hyperparameter-selection
+  # metric across all models.
+  eval_every_epochs: 10
+
+  # Optional subset-size for validation-set evaluation. Kept null so that
+  # hyperparameter selection is performed on the full validation set,
+  # consistent with the protocol used for bpr and vbpr. Set to an integer
+  # only when explicitly accepting faster-but-approximate grid search.
+  eval_sample_size: null
+
+vnpr:
+  hidden_layers: [[256, 128], [512, 256, 128]]
+
+deepstyle:
+  style_dim: [64, 128]
+
+avbpr:
+  att_hidden: [64, 128]
+
+# =============================================================================
+# Hyperparameter-search strategy
+# =============================================================================
+# When ``strategy: grid`` (default), the framework runs the full Cartesian
+# product of every list above (legacy behaviour).
+#
+# When ``strategy: optuna``, the framework runs Bayesian search via Optuna,
+# sequential within each (dataset, model, embedding) cell.  Median pruning
+# kills bad trials early — typically 40-60% wall-clock saved per study.
+#
+# Per-recommender ``hp_space`` blocks (commented examples below) declare
+# continuous / log-uniform / categorical search ranges.  Without ``hp_space``,
+# Optuna falls back to sampling from the discrete lists above as if it
+# were a fancy random search.
+hp_search:
+  strategy: "grid"   # "grid" or "optuna"
+
+  optuna:
+    n_trials: 30
+    sampler: "tpe"           # tpe | random | cmaes
+    pruner: "median"         # median | hyperband | none
+    n_startup_trials: 5
+    warm_start: true
+    timeout_seconds: null
+    storage: null            # set to e.g. "sqlite:///optuna.db" to persist
+                              # studies across pod restarts
+
+# --- Optional: declare continuous / log-uniform search spaces ---------------
+# Uncomment and adjust under each recommender to use Optuna's smart sampling
+# instead of falling back to the discrete lists above.
+#
+# vbpr:
+#   hp_space:
+#     latent_dim:    { type: int,         low: 8,    high: 256, log: true }
+#     learning_rate: { type: float,       low: 1e-5, high: 1e-1, log: true }
+#     l2_reg:        { type: float,       low: 1e-7, high: 1e-2, log: true }
+#     visual_dim:    { type: categorical, choices: [64, 128, 256] }

@@ -1,0 +1,17 @@
+# Smoke profile — only the lightest extractor, single projection dim.
+extractors_enabled:
+  - resnet50
+
+extractors:
+  resnet50:
+    model_name: "resnet50"
+    weights: "IMAGENET1K_V2"
+    raw_dim: 2048
+    role: primary
+
+fusion_extractors:
+  - "resnet50"
+
+projection_dims: [64]
+batch_size: 16
+checkpoint_every: 50

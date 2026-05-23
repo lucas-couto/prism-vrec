@@ -1,0 +1,77 @@
+# =============================================================================
+# General configuration
+# =============================================================================
+# Seed used for every random source (NumPy, Python random, PyTorch).  The
+# grid-search worker derives one deterministic seed per job from this value
+# plus the job identity (dataset, model, embedding, hyperparams).
+seed: 42
+
+# "auto" picks cuda when a GPU is visible, otherwise cpu.  "cuda" and
+# "cpu" force a specific device; "cuda" still falls back to cpu with a
+# warning if no GPU is detected, so a misconfigured host does not
+# silently crash.  The resolved device is recorded in the run manifest.
+device: "auto"
+
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  embeddings: "data/embeddings"
+  checkpoints: "checkpoints"
+  results: "results"
+  logs: "logs"
+
+datasets:
+  - "amazon_fashion"
+  - "amazon_women"
+  - "amazon_men"
+  - "tradesy"
+
+# k-core filtering applied during preprocessing
+preprocessing:
+  n_min: 5  # minimum interactions per user and per item
+
+# =============================================================================
+# Pipeline orchestration (consumed by main.py)
+# =============================================================================
+# These values are the defaults used when ``python main.py`` is invoked
+# without CLI flags (e.g. ``docker compose up -d --build``).  The CLI
+# always wins when a flag is provided.
+#
+# Step order is fixed and lives in ``main.py``; the same names accepted
+# here are accepted by ``--step`` / ``--from`` / ``--to``.
+#
+# Available step names:
+#   download, preprocess, extract, finetune, evaluate_finetuning,
+#   fuse, train, evaluate, statistical, export_best
+pipeline:
+  # When true the entire pipeline runs end-to-end (Battery 1 + Battery 2).
+  # Set to false to honour ``start_from`` / ``stop_at`` instead.
+  run_all: true
+
+  # First step to execute (inclusive).  Ignored when ``run_all`` is true.
+  start_from: null
+
+  # Last step to execute (inclusive).  Ignored when ``run_all`` is true.
+  stop_at: null
+
+  # Which condition to run for fuse / train / evaluate steps.
+  # "frozen", "finetuned" or "both" (runs each twice in order).
+  condition: "both"
+
+# =============================================================================
+# DataLoader sizing (optional)
+# =============================================================================
+# By default the framework picks num_workers, prefetch_factor and the
+# re-extract batch_size from the host's CPU count and cgroup memory
+# budget (see src/utils/dataloader.py and docs/observability.md).
+#
+# Uncomment any field below to pin a value instead of letting the
+# autotune decide.  Pinned values win over the autotune; fields left
+# commented fall through to the autotune.  The resolved values
+# (autotuned or pinned) and any active overrides are recorded under
+# ``manifest['dataloader_autotune']``.
+#
+# dataloader:
+#   num_workers: 4
+#   prefetch_factor: 4
+#   batch_size: 64

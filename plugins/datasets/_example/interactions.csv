@@ -1,0 +1,10 @@
+user_id,item_id,image_path
+u_alice,it_001,images/it_001.jpg
+u_alice,it_002,images/it_002.jpg
+u_alice,it_003,images/it_003.jpg
+u_bob,it_001,images/it_001.jpg
+u_bob,it_004,images/it_004.jpg
+u_bob,it_005,images/it_005.jpg
+u_carol,it_002,images/it_002.jpg
+u_carol,it_003,images/it_003.jpg
+u_carol,it_006,images/it_006.jpg

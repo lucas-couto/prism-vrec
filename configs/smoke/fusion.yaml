@@ -1,0 +1,10 @@
+# Smoke profile — only the simplest fusion (mean).  Single-extractor
+# setup means fusion is effectively a passthrough; this still exercises
+# the fuse step's IO and registry plumbing.
+fusion_strategies_enabled:
+  - mean
+
+normalize_before_fusion: true
+
+strategies:
+  mean: {}

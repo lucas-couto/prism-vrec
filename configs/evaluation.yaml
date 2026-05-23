@@ -1,0 +1,64 @@
+# =============================================================================
+# Evaluation and statistical reporting
+# =============================================================================
+
+# Ranking protocol used by step 06 (evaluate.py).
+#
+# "full_ranking" (default, recommended) scores every item in the
+# catalogue for every test user.  This is the thesis-grade primary
+# protocol.
+#
+# "sampled" ranks each user's positives against ``n_negatives``
+# random unseen items.  Much cheaper, but the resulting metrics are
+# statistically inconsistent with full-ranking — the relative ordering
+# of models can flip between the two protocols (Krichene & Rendle,
+# "On Sampled Metrics for Item Recommendation", KDD 2020).  Use only
+# for comparability with prior work that adopted the same protocol;
+# never as the headline benchmark number.
+evaluation:
+  protocol: "full_ranking"
+  n_negatives: 100
+  negative_sampling_seed: 42
+
+# Cut-off positions for the ranking metrics.
+k_values: [5, 10, 20]
+
+# Metrics computed per (user, model) pair by step 06 (evaluate.py).
+metrics:
+  - "precision"
+  - "recall"
+  - "f1"
+  - "map"
+  - "ndcg"
+
+# Step 07 (statistical.py) consumes the per-user metrics produced by
+# step 06 and writes one CSV per analysis under results/tables/.
+statistical:
+  # Family-wise significance level shared by every test below.
+  alpha: 0.05
+
+  # Multiple-comparison correction for pairwise Wilcoxon tests.
+  # "holm"       — Holm-Bonferroni (default; uniformly more powerful)
+  # "bonferroni" — vanilla Bonferroni (simpler, more conservative)
+  # "none"       — uncorrected (do not use in published tables)
+  correction: "holm"
+
+  # Bootstrap confidence intervals for the per-model mean.
+  # Cheap (~100 ms per metric on hundreds of thousands of users) and
+  # gives the reader a sense of metric uncertainty without re-training.
+  bootstrap:
+    enabled: true
+    n_iterations: 1000
+
+  # Friedman omnibus test across all models on the same set of users.
+  # Always run before pairwise tests when there are 3+ competing models:
+  # if Friedman is not significant, no pairwise effect can be claimed
+  # at the family level.
+  friedman:
+    enabled: true
+
+  # Add Cohen's d (parametric) and Cliff's delta (non-parametric)
+  # effect-size columns to the pairwise table.  Always report effect
+  # sizes alongside p-values — magnitude is what the reader cares
+  # about beyond "non-zero difference".
+  effect_size: true

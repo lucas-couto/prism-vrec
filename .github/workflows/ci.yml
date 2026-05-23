@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run when a new commit lands on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install ruff
+        run: pip install "ruff>=0.5.0"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install package + dev deps
+        # Torch + torchvision are large; the CPU-only wheels are enough
+        # for the contract tests, which never instantiate a real backbone.
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.1.0,<2.6" "torchvision>=0.16.0,<0.21"
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -q
+
+  smoke-import:
+    name: Import smoke test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install package
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.1.0,<2.6" "torchvision>=0.16.0,<0.21"
+          pip install -e .
+
+      - name: Verify every step module imports cleanly
+        # Side-effect imports populate the registries; if any step's
+        # module-level code (auto_register, etc.) breaks, this fails.
+        run: |
+          python -c "import src.steps; print(sorted(src.steps.__all__))"
+          python -c "import src.extractors; print(src.extractors.registered_extractor_names())"
+          python -c "import src.fusions; print(src.fusions.registered_fusion_strategies())"
+          python -c "import src.recommenders; print(src.recommenders.registered_recommender_names())"

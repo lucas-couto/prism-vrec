@@ -1,0 +1,30 @@
+# Smoke profile — runs the full pipeline end-to-end on a tiny synthetic
+# dataset.  Intended for installation validation and CI; numerical
+# results are meaningless by design.  Expected wall-clock on a laptop:
+# under 5 minutes (CPU or MPS).
+#
+# Usage:
+#     python main.py --all --config-dir configs/smoke
+
+seed: 42
+device: "auto"   # picks MPS / CUDA when available, falls back to CPU
+
+paths:
+  data_raw: "data/smoke_raw"
+  data_processed: "data/smoke_processed"
+  embeddings: "data/smoke_embeddings"
+  checkpoints: "checkpoints/smoke"
+  results: "results/smoke"
+  logs: "logs/smoke"
+
+datasets:
+  - "synthetic"
+
+preprocessing:
+  n_min: 1   # k-core off — synthetic dataset is already minimal
+
+pipeline:
+  run_all: true
+  start_from: null
+  stop_at: null
+  condition: "frozen"   # skip finetune/evaluate_finetuning for speed
