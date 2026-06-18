@@ -8,6 +8,14 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-06-18
+
+### Changed
+
+- Simplified the ACF comment in ``configs/recommenders.yaml``: ``acf``
+  now just appears in the "valid names" list like the other
+  recommenders, with no inline explanation (and in English).
+
 ## [1.1.0] - 2026-06-18
 
 ### Added
@@ -287,6 +295,7 @@ This version covers the contracts the framework exposes to outside users
   `src/utils/manifest.py` replaced with the `datetime.UTC` alias
   (Python 3.11+), addressing ruff `UP017`.
 
-[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/lucas-couto/prism-vrec/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/lucas-couto/prism-vrec/releases/tag/v1.0.0
