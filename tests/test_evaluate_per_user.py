@@ -76,7 +76,7 @@ class TestRunResume:
             },
         )
         monkeypatch.setattr(ev, "resolve_device", lambda d: "cpu")
-        monkeypatch.setattr(ev, "load_data", lambda p, d: (2, 5, {}, {}))
+        monkeypatch.setattr(ev, "load_data", lambda p, d: (2, 5, {}, {}, {}))
 
         class _Eval:
             def __init__(self, *a, **k) -> None: ...

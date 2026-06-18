@@ -298,17 +298,25 @@ deepstyle:
 
 avbpr:
   att_hidden: [64, 128]
+
+# ACF needs per-item component embeddings (*_comp artifacts; enable
+# `extract_components: true` in configs/default.yaml) and the user
+# history. Add `acf` to recommenders_enabled only for ACF runs.
+acf:
+  att_hidden: [64, 128]
+  max_history: [50]
 ```
 
 Each list becomes a Cartesian dimension; scalars stay constant. Combination counts per recommender:
 
-| Recommender | Combinations | Dimensions                |
-| ----------- | -----------: | ------------------------- |
-| BPR         |            8 | latent × LR × L2          |
-| VBPR        |           16 | + visual_dim              |
-| VNPR        |           16 | + hidden_layers           |
-| DeepStyle   |           16 | + style_dim               |
-| AVBPR       |           32 | + visual_dim + att_hidden |
+| Recommender | Combinations | Dimensions                         |
+| ----------- | -----------: | ---------------------------------- |
+| BPR         |            8 | latent × LR × L2                   |
+| VBPR        |           16 | + visual_dim                       |
+| VNPR        |           16 | + hidden_layers                    |
+| DeepStyle   |           16 | + style_dim                        |
+| AVBPR       |           32 | + visual_dim + att_hidden          |
+| ACF         |           32 | + visual_dim + att_hidden (+ max_history) |
 
 ### `configs/finetuning.yaml`
 
@@ -543,8 +551,11 @@ Optional L2 normalisation before fusion (`normalize_before_fusion` in `configs/f
 | **VNPR**      | MLP(concat(u, q, v))                                         | Fully neural        |
 | **DeepStyle** | γ_u^T γ_i + s_u^T MLP(f_i) + β_i                             | Learned style space |
 | **AVBPR**     | γ_u^T γ_i + α_u^T (a ⊙ W · f_i) + β_i, a = softmax(g(W·f_i)) | Attention-weighted  |
+| **ACF**       | p̂_u^T (γ_l + v_l) + β_l, with component- and item-level attention | Component + history attention (Chen et al., SIGIR 2017) |
 
 All trained with BPR loss, Adam optimiser, mixed-precision (FP16 via `torch.amp`), and early stopping on validation NDCG@10.
+
+**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, D)` written as `<extractor>_D<dim>_comp.npy` when `extract_components: true` is set. Its two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
 
 ---
 
@@ -760,7 +771,7 @@ prism-vrec/
 │   │
 │   ├── recommenders/
 │   │   ├── base.py               # BaseRecommender (BPR loss, L2 reg)
-│   │   ├── bpr.py, vbpr.py, vnpr.py, deepstyle.py, avbpr.py
+│   │   ├── bpr.py, vbpr.py, vnpr.py, deepstyle.py, avbpr.py, acf.py
 │   │
 │   ├── evaluation/
 │   │   ├── metrics.py            # Precision, Recall, F1, MAP, NDCG @ K

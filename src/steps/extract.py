@@ -90,17 +90,30 @@ def _extract_for_config(
     batch_size: int,
     checkpoint_every: int,
     device: str,
+    extract_components: bool = False,
 ) -> None:
-    """Extract embeddings for a single ``(extractor, dataset, dim)`` cell."""
-    output_path = Path(embeddings_dir) / dataset_name / f"{extractor_name}_D{dim}.npy"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    """Extract embeddings for a single ``(extractor, dataset, dim)`` cell.
 
-    if output_path.exists():
+    Always writes the pooled ``<extractor>_D<dim>.npy``.  When
+    ``extract_components`` is set and the extractor advertises
+    ``supports_components``, additionally writes the 3-D
+    ``<extractor>_D<dim>_comp.npy`` (per-item components) consumed by ACF.
+    Both outputs are skipped independently when already present.
+    """
+    out_dir = Path(embeddings_dir) / dataset_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pooled_path = out_dir / f"{extractor_name}_D{dim}.npy"
+    comp_path = out_dir / f"{extractor_name}_D{dim}_comp.npy"
+
+    want_components = extract_components and getattr(extractor_cls, "supports_components", False)
+    need_pooled = not pooled_path.exists()
+    need_components = want_components and not comp_path.exists()
+
+    if not need_pooled and not need_components:
         logger.info("  %s D=%d: already exists, skipping.", extractor_name, dim)
         return
 
     logger.info("  Extracting %s D=%d...", extractor_name, dim)
-
     extractor = extractor_cls(device=device, output_dim=dim)
 
     dataset = ImageDataset(image_dir, item_ids, transform=extractor.transform)
@@ -112,23 +125,32 @@ def _extract_for_config(
         num_workers=extract_settings.num_workers,
     )
 
-    ckpt_path = f"checkpoints/extraction/{dataset_name}_{extractor_name}_D{dim}"
-    Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+    ckpt_base = f"checkpoints/extraction/{dataset_name}_{extractor_name}_D{dim}"
+    Path(ckpt_base).parent.mkdir(parents=True, exist_ok=True)
 
-    embeddings, extracted_ids = extractor.extract_batch(
-        dataloader,
-        checkpoint_path=ckpt_path,
-        save_every=checkpoint_every,
-    )
+    if need_pooled:
+        embeddings, extracted_ids = extractor.extract_batch(
+            dataloader,
+            checkpoint_path=ckpt_base,
+            save_every=checkpoint_every,
+        )
+        extractor.save(embeddings, extracted_ids, str(pooled_path))
+        logger.info("  %s D=%d: pooled saved to %s (%s)", extractor_name, dim, pooled_path, embeddings.shape)
 
-    extractor.save(embeddings, extracted_ids, str(output_path))
-    logger.info(
-        "  %s D=%d: saved to %s (%s)",
-        extractor_name,
-        dim,
-        output_path,
-        embeddings.shape,
-    )
+    if need_components:
+        components, comp_ids = extractor.extract_components_batch(
+            dataloader,
+            checkpoint_path=f"{ckpt_base}_comp",
+            save_every=checkpoint_every,
+        )
+        extractor.save_components(components, comp_ids, str(comp_path))
+        logger.info(
+            "  %s D=%d: components saved to %s (%s)",
+            extractor_name,
+            dim,
+            comp_path,
+            components.shape,
+        )
 
 
 def run() -> None:
@@ -143,6 +165,7 @@ def run() -> None:
     batch_size = config.get("batch_size", 64)
     checkpoint_every = config.get("checkpoint_every", 500)
     datasets = config.get("datasets", ["amazon_fashion", "amazon_women", "amazon_men"])
+    extract_components = bool(config.get("extract_components", False))
 
     # Instantiating the manager guarantees the on-disk directories exist.
     CheckpointManager()
@@ -198,6 +221,7 @@ def run() -> None:
                         batch_size=batch_size,
                         checkpoint_every=checkpoint_every,
                         device=device,
+                        extract_components=extract_components,
                     )
 
     logger.info("Embedding extraction complete.")

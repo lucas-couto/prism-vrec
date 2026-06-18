@@ -5,6 +5,7 @@ recommenders dropped under ``plugins/recommenders/`` are
 auto-discovered via :mod:`src.recommenders.auto_register`.
 """
 
+from src.recommenders.acf import ACF
 from src.recommenders.avbpr import AVBPR
 from src.recommenders.base import BaseRecommender
 from src.recommenders.bpr import BPR
@@ -61,6 +62,17 @@ register_recommender(
     uses_visual_dim=True,
     extra_hyperparam_keys=("att_hidden",),
 )
+# ACF consumes per-item component embeddings (3-D *_comp artifacts) and
+# the user's training history; scheduled last (most expensive).
+register_recommender(
+    "acf",
+    ACF,
+    priority=5,
+    requires_visual=True,
+    uses_visual_dim=True,
+    requires_components=True,
+    extra_hyperparam_keys=("att_hidden", "max_history"),
+)
 
 
 from src.recommenders.auto_register import scan_user_recommenders  # noqa: E402
@@ -69,6 +81,7 @@ scan_user_recommenders()
 
 
 __all__ = [
+    "ACF",
     "BaseRecommender",
     "BPR",
     "VBPR",

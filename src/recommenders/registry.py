@@ -72,6 +72,12 @@ class RecommenderSpec:
         ``configs/recommenders.yaml -> <name>:``.  Each value may be a
         scalar or a list (lists become Cartesian dimensions in the
         grid).
+    requires_components:
+        ``True`` when the model consumes per-item *component* embeddings
+        (the 3-D ``<extractor>_D<dim>_comp.npy`` artifacts) instead of the
+        pooled 2-D embeddings.  The train/eval enumeration routes ``_comp``
+        artifacts only to such models and excludes them from the pooled
+        pool used by every other recommender.
     """
 
     name: str
@@ -80,6 +86,7 @@ class RecommenderSpec:
     requires_visual: bool = True
     uses_visual_dim: bool = False
     extra_hyperparam_keys: tuple[str, ...] = field(default_factory=tuple)
+    requires_components: bool = False
 
 
 _REGISTRY: dict[str, RecommenderSpec] = {}
@@ -93,6 +100,7 @@ def register_recommender(
     requires_visual: bool = True,
     uses_visual_dim: bool = False,
     extra_hyperparam_keys: tuple[str, ...] | list[str] = (),
+    requires_components: bool = False,
 ) -> None:
     """Register a recommender class under ``name``.
 
@@ -120,6 +128,7 @@ def register_recommender(
         requires_visual=requires_visual,
         uses_visual_dim=uses_visual_dim,
         extra_hyperparam_keys=tuple(extra_hyperparam_keys),
+        requires_components=requires_components,
     )
 
 

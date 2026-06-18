@@ -46,6 +46,12 @@ def load_data(processed_dir: str, dataset_name: str):
     For final evaluation, ``train`` and ``val`` are merged and used as the
     "seen" set whose items are masked from the candidate ranking.
     Metrics are then computed against the held-out ``test`` set.
+
+    Returns ``(n_users, n_items, seen_interactions, test_interactions,
+    train_interactions)``.  The pure-train ``train_interactions`` (without
+    val) is returned separately so history-consuming models (ACF) rebuild
+    the exact same user profile they trained on, while the merged
+    ``seen_interactions`` still drives candidate masking.
     """
     base = Path(processed_dir) / dataset_name
     train_df = pd.read_csv(base / "train.csv")
@@ -71,7 +77,7 @@ def load_data(processed_dir: str, dataset_name: str):
 
     test_interactions = _build_interactions(test_df)
 
-    return n_users, n_items, seen_interactions, test_interactions
+    return n_users, n_items, seen_interactions, test_interactions, train_interactions
 
 
 def find_best_models(dataset_name: str, results_dir: Path | str = "results") -> list[dict]:
@@ -175,6 +181,7 @@ def _evaluate_cell(
     evaluator: Evaluator,
     embeddings_dir: str,
     device: str,
+    train_interactions: dict[int, set[int]] | None = None,
 ) -> pd.DataFrame | None:
     """Load a cell's best checkpoint and return its per-user metrics.
 
@@ -216,11 +223,18 @@ def _evaluate_cell(
         model_config = {"latent_dim": 64, "l2_reg": 0.0001}
         logger.warning("    Legacy checkpoint (no hyperparams): %s", model_info["path"])
 
+    # History-consuming models (ACF) need the pure-train interactions at
+    # construction; other models keep the original 4-argument constructor.
+    ctor_kwargs: dict = {}
+    if getattr(model_cls, "wants_history", False):
+        ctor_kwargs["train_interactions"] = train_interactions
+
     model = model_cls(
         n_users=n_users,
         n_items=n_items,
         visual_embeddings=visual_emb,
         config=model_config,
+        **ctor_kwargs,
     ).to(device)
     model.load_state_dict(state_dict)
     return evaluator.evaluate_per_user(model, device=device)
@@ -265,9 +279,11 @@ def run(condition: str = "frozen") -> None:
 
     for dataset_name in datasets:
         logger.info("=== Dataset: %s ===", dataset_name)
-        n_users, n_items, train_inter, test_inter = load_data(processed_dir, dataset_name)
+        n_users, n_items, seen_inter, test_inter, train_only_inter = load_data(
+            processed_dir, dataset_name
+        )
         evaluator = Evaluator(
-            train_inter,
+            seen_inter,
             test_inter,
             n_items,
             k_values=k_values,
@@ -300,6 +316,7 @@ def run(condition: str = "frozen") -> None:
                     evaluator,
                     embeddings_dir,
                     device,
+                    train_interactions=train_only_inter,
                 )
             if per_user is None:
                 continue

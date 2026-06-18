@@ -38,6 +38,17 @@ class _ResNet50Backbone(nn.Module):
         x = torch.flatten(x, 1)
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return per-cell projected features ``(B, H*W, output_dim)``.
+
+        Uses the conv5 spatial map (``2048×7×7`` for 224² input, i.e.
+        ``M=49`` components) before the global average pool, projected
+        through the same trainable ``projection`` as the pooled path.
+        """
+        x = self.features[:-1](x)  # drop avgpool -> (B, 2048, H, W)
+        x = x.flatten(2).transpose(1, 2)  # (B, H*W, 2048)
+        return self.projection(x)
+
 
 class ResNet50Extractor(BaseExtractor):
     """Visual feature extractor based on ResNet-50.
@@ -57,6 +68,9 @@ class ResNet50Extractor(BaseExtractor):
     # ``layer4`` (the last ResNet block) is unfrozen during fine-tuning.
     unfreeze_prefixes = ["features.8"]
 
+    #: ResNet exposes its conv5 spatial map (``M=49`` cells) for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self.model = self._build_model()
@@ -67,6 +81,9 @@ class ResNet50Extractor(BaseExtractor):
         model = model.to(self.device)
         model.eval()
         return model
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_transform(self) -> transforms.Compose:
         return transforms.Compose(

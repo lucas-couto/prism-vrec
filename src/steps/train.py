@@ -62,8 +62,26 @@ def get_embedding_files(
     names.extend(f.stem for f in sorted(emb_dir.glob("hybrid_*.json")))
     names = sorted(set(names))
     if dim_filter:
-        names = [n for n in names if any(n.endswith(d) for d in dim_filter)]
+        # Component artifacts end in "_comp" after the dim token
+        # (``<extractor>_D<dim>_comp``); accept that suffixed form too so
+        # the dim filter does not silently drop them.
+        names = [
+            n
+            for n in names
+            if any(n.endswith(d) or n.endswith(f"{d}_comp") for d in dim_filter)
+        ]
     return names
+
+
+def is_component_artifact(stem: str) -> bool:
+    """Whether an embedding stem is a 3-D per-item component artifact.
+
+    Component artifacts (``<extractor>_D<dim>_comp``) feed models that
+    declare ``requires_components`` (e.g. ACF).  They are routed only to
+    those models and excluded from the pooled-embedding pool consumed by
+    every other recommender, so existing models' job lists are unchanged.
+    """
+    return stem.endswith("_comp")
 
 
 def _resolve_embedding_path(embeddings_dir: str, dataset_name: str, stem: str) -> str | None:
@@ -161,7 +179,11 @@ def build_job_list(
                 # run in the frozen condition with embedding_name="none".
                 sources = ["none"] if condition == "frozen" else []
             else:
-                sources = list(embedding_names)
+                sources = [
+                    e
+                    for e in embedding_names
+                    if is_component_artifact(e) == spec.requires_components
+                ]
 
             for emb_name in sources:
                 experiment_key = f"{dataset_name}_{emb_name}_{model_name}"
@@ -397,11 +419,14 @@ def _list_cells(
 
         for model_name in model_names:
             spec = get_recommender_spec(model_name)
-            sources = (
-                ["none"]
-                if not spec.requires_visual and condition == "frozen"
-                else (list(embedding_names) if spec.requires_visual else [])
-            )
+            if not spec.requires_visual:
+                sources = ["none"] if condition == "frozen" else []
+            else:
+                sources = [
+                    e
+                    for e in embedding_names
+                    if is_component_artifact(e) == spec.requires_components
+                ]
             for emb_name in sources:
                 if emb_name == "none":
                     emb_path = None
