@@ -16,7 +16,7 @@ authors:
     orcid: "https://orcid.org/0000-0001-7195-0714"
 repository-code: "https://github.com/lucas-couto/prism-vrec"
 license: MIT
-version: 1.1.0
+version: 1.1.1
 date-released: 2026-06-18
 doi: 10.5281/zenodo.20357510
 identifiers:
