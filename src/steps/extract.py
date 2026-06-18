@@ -135,7 +135,9 @@ def _extract_for_config(
             save_every=checkpoint_every,
         )
         extractor.save(embeddings, extracted_ids, str(pooled_path))
-        logger.info("  %s D=%d: pooled saved to %s (%s)", extractor_name, dim, pooled_path, embeddings.shape)
+        logger.info(
+            "  %s D=%d: pooled saved to %s (%s)", extractor_name, dim, pooled_path, embeddings.shape
+        )
 
     if need_components:
         components, comp_ids = extractor.extract_components_batch(

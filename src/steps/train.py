@@ -66,9 +66,7 @@ def get_embedding_files(
         # (``<extractor>_D<dim>_comp``); accept that suffixed form too so
         # the dim filter does not silently drop them.
         names = [
-            n
-            for n in names
-            if any(n.endswith(d) or n.endswith(f"{d}_comp") for d in dim_filter)
+            n for n in names if any(n.endswith(d) or n.endswith(f"{d}_comp") for d in dim_filter)
         ]
     return names
 

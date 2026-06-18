@@ -12,11 +12,15 @@ from src.steps.evaluate import _evaluate_cell, load_data
 
 def _write_dataset(base: Path) -> None:
     base.mkdir(parents=True)
-    pd.DataFrame({"user_idx": [0, 0, 1], "item_idx": [1, 2, 3]}).to_csv(base / "train.csv", index=False)
+    pd.DataFrame({"user_idx": [0, 0, 1], "item_idx": [1, 2, 3]}).to_csv(
+        base / "train.csv", index=False
+    )
     pd.DataFrame({"user_idx": [0, 1], "item_idx": [5, 6]}).to_csv(base / "val.csv", index=False)
     pd.DataFrame({"user_idx": [0, 1], "item_idx": [8, 9]}).to_csv(base / "test.csv", index=False)
     (base / "user2idx.json").write_text('{"0": 0, "1": 1}')
-    (base / "item2idx.json").write_text('{"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7, "i": 8, "j": 9}')
+    (base / "item2idx.json").write_text(
+        '{"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7, "i": 8, "j": 9}'
+    )
 
 
 def test_load_data_returns_train_only_history_separate_from_seen(tmp_path: Path) -> None:

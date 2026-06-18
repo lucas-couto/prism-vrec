@@ -307,6 +307,45 @@ The earlier steps' outputs (extracts, fusions) are reused.
 
 ---
 
+## 9b. "Run ACF (component-level + item-level attention)"
+
+ACF is the only recommender that consumes per-item *component*
+embeddings (`<extractor>_D<dim>_comp.npy`, shape `(n_items, M, D)`)
+instead of the pooled `(n_items, D)` ones. Two edits enable it: turn on
+component extraction, and add `acf` to the recommender list.
+
+```yaml
+# configs/default.yaml
+extract_components: true        # extractors also emit the 3-D *_comp artifacts
+
+# configs/recommenders.yaml
+recommenders_enabled:
+  - bpr
+  - vbpr
+  - acf                         # routed only to the *_comp artifacts
+
+acf:
+  att_hidden: [64, 128]
+  max_history: [50]             # H: items per user profile (item-level attention)
+```
+
+```bash
+python main.py --from extract   # re-extract to add the *_comp files, then train+eval
+```
+
+Notes:
+
+- The pooled `.npy` files are **not** recomputed — only the new `_comp`
+  files are added (idempotent extraction). Existing non-ACF results are
+  untouched.
+- Component artifacts are `M`× larger on disk and re-run each backbone
+  forward, so `extract` with `extract_components: true` costs more than
+  a pooled-only run — budget accordingly.
+- The user history is built from **train** interactions only, so
+  validation/test items never enter the profile.
+
+---
+
 ## 10. "Dry-run, what is still pending in Battery 1?"
 
 ```bash
@@ -325,6 +364,7 @@ GPU.
 | --- | --- | --- |
 | `datasets:` | `configs/default.yaml` | Every step that loops datasets becomes a no-op. |
 | `extractors_enabled` | `configs/extractors.yaml` | `extract` and `finetune` skip. |
+| `extract_components` | `configs/default.yaml` | Off → no `*_comp` artifacts written (ACF cannot run); pooled output unchanged. |
 | `finetuning.extractors` | `configs/finetuning.yaml` | `finetune` and `evaluate_finetuning` skip. |
 | `fusion_strategies_enabled` | `configs/fusion.yaml` | `fuse` step skips entirely. |
 | `recommenders_enabled` | `configs/recommenders.yaml` | `train` step skips entirely. |

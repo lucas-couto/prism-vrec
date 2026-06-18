@@ -16,8 +16,8 @@ authors:
     orcid: "https://orcid.org/0000-0001-7195-0714"
 repository-code: "https://github.com/lucas-couto/prism-vrec"
 license: MIT
-version: 1.0.0
-date-released: 2026-05-23
+version: 1.1.0
+date-released: 2026-06-18
 doi: 10.5281/zenodo.20357510
 identifiers:
   - type: doi
@@ -30,8 +30,9 @@ abstract: >-
   architectures (ResNet50, ViT-B/16), CNN+Transformer architectural
   hybrids (CvT, CoAtNet, LeViT), foundation models (CLIP, DINOv2),
   and ten late-fusion strategies over the primary CNN+ViT pair —
-  together with five recommender models (BPR, VBPR, VNPR, DeepStyle,
-  AVBPR). The framework is domain-agnostic: it ships with a fashion
+  together with six recommender models (BPR, VBPR, VNPR, DeepStyle,
+  AVBPR, and ACF with item- and component-level attention). The
+  framework is domain-agnostic: it ships with a fashion
   starter pack (the four DVBPR datasets) and accepts any visual
   recommendation domain via a CSV-based provider. Reproducibility is
   enforced through deterministic per-job seeds, a run manifest

@@ -83,11 +83,19 @@ def test_vbpr_pool_is_identical_with_and_without_comp_file(tmp_path, monkeypatch
     (tmp_path / "a").mkdir()
     monkeypatch.chdir(tmp_path / "a")
     p1, e1 = _setup(tmp_path / "a", with_comp=False)
-    baseline = {j.embedding_name for j in build_job_list("frozen", _config(), p1, e1, "cpu") if j.model_name == "vbpr"}
+    baseline = {
+        j.embedding_name
+        for j in build_job_list("frozen", _config(), p1, e1, "cpu")
+        if j.model_name == "vbpr"
+    }
 
     (tmp_path / "b").mkdir()
     monkeypatch.chdir(tmp_path / "b")
     p2, e2 = _setup(tmp_path / "b", with_comp=True)
-    with_comp = {j.embedding_name for j in build_job_list("frozen", _config(), p2, e2, "cpu") if j.model_name == "vbpr"}
+    with_comp = {
+        j.embedding_name
+        for j in build_job_list("frozen", _config(), p2, e2, "cpu")
+        if j.model_name == "vbpr"
+    }
 
     assert baseline == with_comp

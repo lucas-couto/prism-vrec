@@ -114,6 +114,28 @@ That is the only edit. The pipeline picks the new extractor up at
 the next run; `extract`, `finetune` and `evaluate_finetuning`
 automatically include it.
 
+### 1.4 Expose component features (optional — for ACF)
+
+By default an extractor emits one pooled `(N, output_dim)` vector per
+item. Models with **component-level attention** (e.g. ACF) instead need
+the *pre-pool* representation: the spatial feature-map cells (CNNs) or
+patch tokens (ViTs) of shape `(N, M, output_dim)`. To make a backbone
+expose them:
+
+- Set the class attribute `supports_components = True`.
+- Override `_forward_components(images) -> (B, M, output_dim)`, running
+  the pre-pool tensor through the **same** `projection` as the pooled
+  path so components live in the same `output_dim` space (see
+  `src/extractors/resnet.py` for the conv5 → `M=49` reference).
+
+The base class already provides `extract_components_batch` and
+`save_components`; the `extract` step writes
+`<extractor>_D<dim>_comp.npy` (3-D) **only** when
+`extract_components: true` is set in `configs/default.yaml`. The pooled
+path is unchanged and byte-identical when the flag is off. All eight
+built-in extractors implement this (`M`: ResNet-50 / ConvNeXt / CoAtNet
+/ CLIP = 49, ViT-B/16 / CvT = 196, LeViT = 16, DINOv2 = 256).
+
 ---
 
 ## 2. Add a fusion strategy
@@ -198,6 +220,7 @@ Plus the metadata supplied at registration:
 | `requires_visual` | `False` for plain BPR; runs only in the `frozen` condition with `embedding_name="none"`. |
 | `uses_visual_dim` | Adds `common.visual_dim` to the hyperparameter grid. |
 | `extra_hyperparam_keys` | Tuple of keys read from `configs/recommenders.yaml -> <name>:`. Each value may be a scalar or a list (becomes a Cartesian dimension in the grid). |
+| `requires_components` | `True` to consume 3-D per-item component embeddings (`*_comp` artifacts) instead of pooled 2-D ones. The train/eval enumeration routes `_comp` artifacts only to such models. See § 3.4. |
 
 ### 3.2 Minimal example
 
@@ -245,6 +268,32 @@ register_recommender(
 Add the name to `configs/recommenders.yaml -> recommenders_enabled` and,
 if your model has extra hyperparameters, also a block under the same
 file with the value lists.
+
+### 3.4 Component- and history-consuming recommenders (the ACF pattern)
+
+The built-in `acf` (`src/recommenders/acf.py`) is the reference for a
+recommender that needs more than a pooled embedding. Two additive,
+defaulted hooks on `BaseRecommender` make this possible without
+touching the other models:
+
+- **Component buffer.** Set the class attribute
+  `consumes_raw_components = True`. A 3-D `(n_items, M, D)` visual buffer
+  is then kept raw — the base class does **not** instantiate an online
+  fusion module (which assumes exactly two stacked sources). The model
+  indexes `self.visual_features[item_ids]` itself. Pair this with
+  `requires_components=True` at registration so the enumeration feeds it
+  the `*_comp` artifacts (produced per § 1.4).
+- **User history.** Set the class attribute `wants_history = True`. The
+  train and eval steps then pass `train_interactions` (a
+  `{user_idx: set(item_idx)}` dict, **train-only** so val/test never
+  leak) to the constructor — accept it as a keyword-only
+  `train_interactions=None` argument. Models that do not set the flag
+  never receive the keyword, so their constructor is untouched.
+
+All four flags (`requires_components`, `consumes_raw_components`,
+`wants_history`, plus `supports_components` on the extractor side)
+default off, so every pre-existing recommender, fusion and embedding
+stays bit-identically reproducible.
 
 ---
 
