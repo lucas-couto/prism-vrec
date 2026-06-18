@@ -4,11 +4,6 @@
 # experimento. Lista vazia ou ausente = nenhum recomendador roda. Para
 # desativar um modelo basta removê-lo desta lista. Nomes válidos: bpr,
 # vbpr, vnpr, deepstyle, avbpr, acf.
-#
-# `acf` (Attentive Collaborative Filtering) consome os artefatos de
-# componentes `<extractor>_D<dim>_comp.npy` (gere-os com
-# `extract_components: true` em configs/default.yaml) e o histórico do
-# usuário. Adicione `acf` abaixo apenas ao rodar experimentos de ACF.
 recommenders_enabled:
   - bpr
   - vbpr
