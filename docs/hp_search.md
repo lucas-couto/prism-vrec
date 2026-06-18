@@ -39,6 +39,10 @@ vbpr:
 
 avbpr:
   att_hidden: [64, 128]   # extra_hyperparam_keys for AVBPR
+
+acf:
+  att_hidden: [64, 128]   # extra_hyperparam_keys for ACF
+  max_history: [50]       # H: items per user profile (item-level attention)
 ```
 
 Jobs are distributed across workers via `TrainingOrchestrator`; every

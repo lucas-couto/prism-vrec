@@ -63,6 +63,15 @@ python main.py --from train       # the recommender picks up the
   remain agnostic to whether features come from an offline ``.npy`` or
   an online module.
 
+> **Not every 3-D buffer is an online fusion.** A 3-D buffer here means
+> *two stacked source embeddings* to be fused (``M == 2``). ACF also
+> receives a 3-D buffer, but its ``M`` axis holds an item's *components*
+> (49–256 spatial cells / patch tokens), not fusion sources. ACF sets
+> the class attribute ``consumes_raw_components = True`` so the base
+> class keeps the raw buffer and skips online-fusion instantiation —
+> the model runs its own component-level attention instead of
+> ``_resolve_visual``. See ``docs/extending.md`` § 3.4.
+
 ## Caching caveat
 
 Recommenders such as VBPR, AVBPR, VNPR and DeepStyle cache the

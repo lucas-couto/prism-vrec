@@ -41,6 +41,7 @@ def test_register_recommender_sets_defaults() -> None:
     assert spec.requires_visual is True
     assert spec.uses_visual_dim is False
     assert spec.extra_hyperparam_keys == ()
+    assert spec.requires_components is False
 
 
 def test_register_recommender_full_metadata() -> None:
@@ -51,12 +52,14 @@ def test_register_recommender_full_metadata() -> None:
         requires_visual=False,
         uses_visual_dim=True,
         extra_hyperparam_keys=("alpha", "beta"),
+        requires_components=True,
     )
     spec = get_recommender_spec("test_dummy_full")
     assert spec.priority == 1
     assert spec.requires_visual is False
     assert spec.uses_visual_dim is True
     assert spec.extra_hyperparam_keys == ("alpha", "beta")
+    assert spec.requires_components is True
 
 
 def test_register_recommender_rejects_non_subclass() -> None:
@@ -100,7 +103,17 @@ def test_builtin_recommenders_register_themselves() -> None:
     """Importing src.recommenders must populate the registry with built-ins."""
     import src.recommenders  # noqa: F401
 
-    expected_subset = {"bpr", "vbpr", "avbpr", "vnpr", "deepstyle"}
+    expected_subset = {"bpr", "vbpr", "avbpr", "vnpr", "deepstyle", "acf"}
     registered = set(registered_recommender_names())
     missing = expected_subset - registered
     assert not missing, f"built-in recommenders not registered: {missing}"
+
+
+def test_acf_is_the_only_component_consuming_builtin() -> None:
+    """Only ACF consumes component artifacts; all others use pooled embeddings."""
+    component_models = {
+        name
+        for name in ("bpr", "vbpr", "vnpr", "deepstyle", "avbpr", "acf")
+        if get_recommender_spec(name).requires_components
+    }
+    assert component_models == {"acf"}

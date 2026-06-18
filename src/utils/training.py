@@ -194,11 +194,19 @@ def train_single_run(
 
     model_config = {**hyperparams, "l2_reg": hyperparams.get("l2_reg", 0.0001)}
 
+    # Only models that declare ``wants_history`` accept the
+    # ``train_interactions`` keyword (e.g. ACF item-level attention); every
+    # other recommender keeps the original 4-argument constructor untouched.
+    ctor_kwargs: dict = {}
+    if getattr(model_cls, "wants_history", False):
+        ctor_kwargs["train_interactions"] = train_interactions
+
     model = model_cls(
         n_users=n_users,
         n_items=n_items,
         visual_embeddings=visual_embeddings,
         config=model_config,
+        **ctor_kwargs,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hyperparams["learning_rate"])

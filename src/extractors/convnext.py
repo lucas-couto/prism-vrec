@@ -32,6 +32,12 @@ class _ConvNeXtBackbone(nn.Module):
         x = self.backbone(x)
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return projected spatial cells ``(B, H*W, output_dim)`` (7x7=49)."""
+        feat = self.backbone.forward_features(x)  # (B, 1024, H, W)
+        tokens = feat.flatten(2).transpose(1, 2)  # (B, H*W, 1024)
+        return self.projection(tokens)
+
 
 class ConvNeXtExtractor(BaseExtractor):
     """Visual feature extractor based on ConvNeXt-Base.
@@ -52,10 +58,16 @@ class ConvNeXtExtractor(BaseExtractor):
 
     unfreeze_prefixes = ["backbone.stages.3"]
 
+    #: ConvNeXt exposes its final 7x7=49 spatial cells for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self.model = self._build_model()
         self.transform = self._build_transform()
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_model(self) -> nn.Module:
         model = _ConvNeXtBackbone(output_dim=self.output_dim)

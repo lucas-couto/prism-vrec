@@ -27,6 +27,13 @@ class _LeViTBackbone(nn.Module):
         x = self.backbone(x)
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return projected final-stage tokens ``(B, M, output_dim)``."""
+        feat = self.backbone.forward_features(x)  # (B, N, 512) or (B, C, H, W)
+        if feat.dim() == 4:
+            feat = feat.flatten(2).transpose(1, 2)
+        return self.projection(feat)
+
 
 class LeViTExtractor(BaseExtractor):
     """Visual feature extractor based on LeViT-256.
@@ -44,10 +51,16 @@ class LeViTExtractor(BaseExtractor):
 
     unfreeze_prefixes = ["backbone.stages.2"]
 
+    #: LeViT exposes its final-stage token sequence for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self.model = self._build_model()
         self.transform = self._build_transform()
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_model(self) -> nn.Module:
         model = _LeViTBackbone(output_dim=self.output_dim)

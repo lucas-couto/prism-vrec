@@ -39,6 +39,13 @@ class BaseExtractor(abc.ABC):
     #: subclasses that want their backbone partially unfrozen.
     unfreeze_prefixes: list[str] = []
 
+    #: ``True`` when the extractor can emit per-item *component* features
+    #: (the spatial feature-map cells / patch tokens before global
+    #: pooling) of shape ``(M, output_dim)``.  Subclasses that override
+    #: :meth:`_forward_components` set this to ``True``; the pooled output
+    #: path is unaffected.
+    supports_components: bool = False
+
     def __init__(self, device: str, output_dim: int):
         self.device = torch.device(device)
         self.output_dim = output_dim
@@ -170,6 +177,95 @@ class BaseExtractor(abc.ABC):
             )
 
         return final_embeddings, all_item_ids
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        """Return per-item component features ``(B, M, output_dim)``.
+
+        Override in subclasses that expose pre-pool features (spatial
+        feature-map cells or patch tokens) and set
+        :attr:`supports_components` to ``True``.  Components are passed
+        through the SAME trainable ``projection`` as the pooled path, so
+        the last dimension is ``output_dim``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose component features.",
+        )
+
+    def extract_components_batch(
+        self,
+        dataloader,
+        checkpoint_path: str | None = None,
+        save_every: int = 500,
+    ) -> tuple[np.ndarray, list]:
+        """Extract component features for a dataloader, stacking ``(N, M, output_dim)``.
+
+        Mirrors :meth:`extract_batch` (same checkpoint/resume semantics)
+        but uses :meth:`_forward_components` instead of the pooled model.
+        """
+        all_components: list[np.ndarray] = []
+        all_item_ids: list = []
+        start_batch = 0
+
+        if checkpoint_path is not None and Path(checkpoint_path).exists():
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            all_components = [ckpt["components"]]
+            all_item_ids = ckpt["item_ids"]
+            start_batch = ckpt["last_batch_index"] + 1
+
+        use_amp = self.device.type == "cuda"
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, (images, item_ids) in enumerate(
+                tqdm(dataloader, desc="Extracting components")
+            ):
+                if batch_idx < start_batch:
+                    continue
+                if not isinstance(images, torch.Tensor):
+                    images = torch.stack([self.transform(img) for img in images])
+                images = images.to(self.device)
+                with cuda_autocast(enabled=use_amp):
+                    components = self._forward_components(images)
+                all_components.append(components.float().cpu().numpy())
+                if isinstance(item_ids, torch.Tensor):
+                    all_item_ids.extend(item_ids.tolist())
+                else:
+                    all_item_ids.extend(list(item_ids))
+
+                if checkpoint_path is not None and (batch_idx + 1) % save_every == 0:
+                    torch.save(
+                        {
+                            "components": np.concatenate(all_components, axis=0),
+                            "item_ids": all_item_ids,
+                            "last_batch_index": batch_idx,
+                        },
+                        checkpoint_path,
+                    )
+
+        if len(all_components) == 0:
+            final = np.empty((0, 0, self.output_dim), dtype=np.float32)
+        else:
+            final = np.concatenate(all_components, axis=0)
+
+        if checkpoint_path is not None:
+            torch.save(
+                {"components": final, "item_ids": all_item_ids, "last_batch_index": -1},
+                checkpoint_path,
+            )
+        return final, all_item_ids
+
+    def save_components(self, components: np.ndarray, item_ids: list, path: str):
+        """Save 3-D component features as ``<path>.npy`` + ``<path>_ids.json``.
+
+        ``components`` has shape ``(N, M, output_dim)``.
+        """
+        base = Path(path)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        npy_path = base.with_suffix(".npy")
+        json_path = base.with_name(base.stem + "_ids.json")
+        atomic_np_save(components, npy_path)
+        with open(json_path, "w") as f:
+            json.dump(item_ids, f)
+        print(f"Saved {len(item_ids)} component features to {npy_path} ({components.shape})")
 
     def save(self, embeddings: np.ndarray, item_ids: list, path: str):
         """Save embeddings as ``.npy`` and item_ids as ``.json``.

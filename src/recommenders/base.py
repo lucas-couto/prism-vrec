@@ -29,7 +29,26 @@ class BaseRecommender(nn.Module, abc.ABC):
         that do not use visual features (e.g. plain BPR).
     config:
         Model-specific configuration dictionary (latent_dim, l2_reg, etc.).
+    train_interactions:
+        Optional ``{user_idx: set(item_idx)}`` of training interactions.
+        Only models that set :attr:`wants_history` (e.g. ACF, whose
+        item-level attention operates over the user profile) consume it;
+        for every other model it defaults to ``None`` and is ignored, so
+        existing behaviour is bit-identical.
     """
+
+    #: ``True`` for models whose 3-D visual buffer holds per-item
+    #: *components* (e.g. ACF, ``M`` spatial tokens) rather than the two
+    #: stacked sources of an online fusion.  When ``True`` the base class
+    #: keeps the raw 3-D buffer and does NOT instantiate an online fusion
+    #: module (which assumes exactly two sources).
+    consumes_raw_components: bool = False
+
+    #: ``True`` for models that need each user's training history at
+    #: construction time (e.g. ACF item-level attention).  The training
+    #: and evaluation steps pass ``train_interactions`` only to such
+    #: models, so models that do not accept the keyword are untouched.
+    wants_history: bool = False
 
     def __init__(
         self,
@@ -37,11 +56,14 @@ class BaseRecommender(nn.Module, abc.ABC):
         n_items: int,
         visual_embeddings: np.ndarray | None,
         config: dict,
+        *,
+        train_interactions: dict[int, set[int]] | None = None,
     ) -> None:
         super().__init__()
         self.n_users = n_users
         self.n_items = n_items
         self.config = config
+        self.train_interactions = train_interactions
 
         # Register visual embeddings as a non-trainable buffer if provided.
         # Two shapes are accepted:
@@ -56,10 +78,16 @@ class BaseRecommender(nn.Module, abc.ABC):
         self._online_fusion: nn.Module | None = None
         if visual_embeddings is not None:
             arr = torch.FloatTensor(visual_embeddings)
-            if arr.dim() == 3:
+            if arr.dim() == 3 and not self.consumes_raw_components:
                 self.register_buffer("visual_features", arr)
                 self.visual_dim_raw = int(arr.shape[-1])
                 self._init_online_fusion(int(arr.shape[1]), self.visual_dim_raw, config)
+            elif arr.dim() == 3:
+                # Raw component buffer (n_items, M, D): the consuming model
+                # (e.g. ACF) applies its own component attention; no online
+                # fusion module is created.
+                self.register_buffer("visual_features", arr)
+                self.visual_dim_raw = int(arr.shape[-1])
             elif arr.dim() == 2:
                 self.register_buffer("visual_features", arr)
                 self.visual_dim_raw = int(arr.shape[-1])

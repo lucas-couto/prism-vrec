@@ -3,7 +3,12 @@
 # `recommenders_enabled` controla quais recomendadores rodam neste
 # experimento. Lista vazia ou ausente = nenhum recomendador roda. Para
 # desativar um modelo basta removê-lo desta lista. Nomes válidos: bpr,
-# vbpr, vnpr, deepstyle, avbpr.
+# vbpr, vnpr, deepstyle, avbpr, acf.
+#
+# `acf` (Attentive Collaborative Filtering) consome os artefatos de
+# componentes `<extractor>_D<dim>_comp.npy` (gere-os com
+# `extract_components: true` em configs/default.yaml) e o histórico do
+# usuário. Adicione `acf` abaixo apenas ao rodar experimentos de ACF.
 recommenders_enabled:
   - bpr
   - vbpr
@@ -46,6 +51,20 @@ deepstyle:
 
 avbpr:
   att_hidden: [64, 128]
+
+acf:
+  att_hidden: [64, 128]
+  max_history: [50]   # H: max items per user profile (item-level attention)
+  # Optuna hp_space mirrors the grid lists exactly so both strategies
+  # explore the same space (keeps grid/optuna comparable and the
+  # hp_space <-> optuna.db distributions consistent).
+  hp_space:
+    latent_dim:    { type: categorical, choices: [64, 128] }
+    learning_rate: { type: categorical, choices: [0.001, 0.01] }
+    l2_reg:        { type: categorical, choices: [0.0001, 0.001] }
+    visual_dim:    { type: categorical, choices: [64, 128] }
+    att_hidden:    { type: categorical, choices: [64, 128] }
+    max_history:   { type: categorical, choices: [50] }
 
 # =============================================================================
 # Hyperparameter-search strategy

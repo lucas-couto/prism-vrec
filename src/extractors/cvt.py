@@ -27,6 +27,12 @@ class _CvTBackbone(nn.Module):
         x = outputs.cls_token_value.squeeze(1)
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return projected spatial tokens ``(B, H*W, output_dim)``."""
+        feat = self.backbone(x).last_hidden_state  # (B, 384, H, W)
+        tokens = feat.flatten(2).transpose(1, 2)  # (B, H*W, 384)
+        return self.projection(tokens)
+
 
 class CvTExtractor(BaseExtractor):
     """Visual feature extractor based on CvT-13.
@@ -45,10 +51,16 @@ class CvTExtractor(BaseExtractor):
 
     unfreeze_prefixes = ["backbone.stages.2"]
 
+    #: CvT exposes its final-stage spatial tokens (14x14=196) for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self.model = self._build_model()
         self.transform = self._build_transform()
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_model(self) -> nn.Module:
         model = _CvTBackbone(output_dim=self.output_dim)

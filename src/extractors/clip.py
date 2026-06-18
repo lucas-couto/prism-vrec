@@ -30,6 +30,24 @@ class _CLIPVisualBackbone(nn.Module):
         x = self.visual(x)
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return projected patch tokens ``(B, M, output_dim)`` (49 for B/32).
+
+        ``output_tokens`` makes open_clip's visual encoder return the
+        per-patch sequence (pre-projection ``width``); we apply the same
+        ``visual.proj`` the pooled path uses so components live in the
+        512-d CLIP space before the trainable projection.
+        """
+        self.visual.output_tokens = True
+        try:
+            _, tokens = self.visual(x)  # tokens: (B, M, width)
+        finally:
+            self.visual.output_tokens = False
+        proj = getattr(self.visual, "proj", None)
+        if proj is not None:
+            tokens = tokens @ proj  # (B, M, 512)
+        return self.projection(tokens)
+
 
 class CLIPExtractor(BaseExtractor):
     """Visual feature extractor based on CLIP ViT-B/32.
@@ -46,11 +64,17 @@ class CLIPExtractor(BaseExtractor):
         Dimensionality of the output embedding.
     """
 
+    #: CLIP exposes its 49 patch tokens (via open_clip output_tokens) for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self._backbone = _CLIPVisualBackbone(output_dim=self.output_dim)
         self.model = self._build_model()
         self.transform = self._build_transform()
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_model(self) -> nn.Module:
         model = self._backbone
