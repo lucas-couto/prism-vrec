@@ -555,7 +555,7 @@ Optional L2 normalisation before fusion (`normalize_before_fusion` in `configs/f
 
 All trained with BPR loss, Adam optimiser, mixed-precision (FP16 via `torch.amp`), and early stopping on validation NDCG@10.
 
-**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, D)` written as `<extractor>_D<dim>_comp.npy` when `extract_components: true` is set. Its two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
+**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, D)` written as `<extractor>_D<dim>_comp.npy` when `extract_components: true` is set. All eight extractors expose components (`M`: ResNet-50 / ConvNeXt / CoAtNet / CLIP = 49, ViT-B/16 / CvT = 196, LeViT = 16, DINOv2 = 256). ACF's two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
 
 ---
 

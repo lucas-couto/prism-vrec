@@ -30,6 +30,13 @@ class _ViTBackbone(nn.Module):
             x = x[:, 0]
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return projected patch tokens ``(B, M, output_dim)`` (no [CLS])."""
+        feats = self.backbone.forward_features(x)  # (B, T, 768)
+        prefix = getattr(self.backbone, "num_prefix_tokens", 1)
+        tokens = feats[:, prefix:] if feats.dim() == 3 else feats
+        return self.projection(tokens)
+
 
 class ViTExtractor(BaseExtractor):
     """Visual feature extractor based on ViT-B/16.
@@ -48,10 +55,16 @@ class ViTExtractor(BaseExtractor):
 
     unfreeze_prefixes = ["backbone.blocks.11", "backbone.blocks.10"]
 
+    #: ViT exposes its 196 patch tokens (before [CLS] pooling) for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self.model = self._build_model()
         self.transform = self._build_transform()
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_model(self) -> nn.Module:
         model = _ViTBackbone(output_dim=self.output_dim)

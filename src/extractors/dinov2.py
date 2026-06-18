@@ -41,6 +41,16 @@ class _DINOv2Backbone(nn.Module):
         x = self.backbone(x)  # CLS token by default
         return self.projection(x)
 
+    def forward_components(self, x: torch.Tensor) -> torch.Tensor:
+        """Return projected patch tokens ``(B, M, output_dim)`` (256 for B/14).
+
+        DINOv2 exposes ``get_intermediate_layers`` which returns the
+        last block's patch-token sequence (no [CLS]) at the backbone's
+        768-d width — the same space the pooled [CLS] path projects from.
+        """
+        tokens = self.backbone.get_intermediate_layers(x, n=1)[0]  # (B, M, 768)
+        return self.projection(tokens)
+
 
 class DINOv2Extractor(BaseExtractor):
     """Visual feature extractor based on DINOv2 ViT-B/14.
@@ -57,10 +67,16 @@ class DINOv2Extractor(BaseExtractor):
         Dimensionality of the output embedding.
     """
 
+    #: DINOv2 exposes its 256 patch tokens (get_intermediate_layers) for ACF.
+    supports_components = True
+
     def __init__(self, device: str = "cuda", output_dim: int = 128):
         super().__init__(device=device, output_dim=output_dim)
         self.model = self._build_model()
         self.transform = self._build_transform()
+
+    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_components(images)
 
     def _build_model(self) -> nn.Module:
         model = _DINOv2Backbone(output_dim=self.output_dim)

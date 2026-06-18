@@ -28,10 +28,14 @@ Dates are UTC.
   never leak into the profile.
 - **Component feature extraction**.  ``BaseExtractor`` gains
   ``supports_components`` / ``_forward_components`` /
-  ``extract_components_batch`` / ``save_components``; ResNet-50 exposes
-  its conv5 spatial grid (``M=49``).  Opt-in via ``extract_components:
-  true`` in ``configs/default.yaml`` — the pooled extraction path is
-  unchanged and byte-identical when the flag is off.
+  ``extract_components_batch`` / ``save_components``.  All eight
+  extractors expose their pre-pool components (``M`` per backbone):
+  ResNet-50 / ConvNeXt-Base / CoAtNet-0 / CLIP ViT-B/32 = 49,
+  ViT-B/16 / CvT-13 = 196, LeViT-256 = 16, DINOv2 ViT-B/14 = 256 — each
+  projected through the same trainable ``projection`` as the pooled
+  path.  Opt-in via ``extract_components: true`` in
+  ``configs/default.yaml`` — the pooled extraction path is unchanged and
+  byte-identical when the flag is off.
 - **Multi-seed runs with cross-seed aggregation**.  ``configs/default.yaml``
   now accepts ``seeds: [42, 99, 7]`` (or ``--seeds 42,99,7`` at the
   CLI) to run the pipeline once per seed under
