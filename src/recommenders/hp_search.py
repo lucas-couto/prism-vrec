@@ -289,21 +289,22 @@ def _iter_cells_optuna(
             hp = sample_hyperparams(trial, _cell.model_name, config)
             return objective(_cell, hp, trial)
 
-        try:
-            study.optimize(
-                _objective,
-                n_trials=n_trials,
-                timeout=timeout,
-                gc_after_trial=True,
-                show_progress_bar=False,
-            )
-        except KeyboardInterrupt:
-            raise
+        study.optimize(
+            _objective,
+            n_trials=n_trials,
+            timeout=timeout,
+            gc_after_trial=True,
+            show_progress_bar=False,
+        )
 
         for trial in study.trials:
             if trial.state != optuna.trial.TrialState.COMPLETE:
                 continue
-            yield cell, dict(trial.params), float(trial.value or 0.0)
+            # A completed trial always has a value; guard the None case
+            # explicitly rather than with ``or`` so a legitimate 0.0
+            # metric is not confused with a missing one.
+            value = 0.0 if trial.value is None else float(trial.value)
+            yield cell, dict(trial.params), value
 
 
 __all__ = [

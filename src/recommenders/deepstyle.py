@@ -48,7 +48,8 @@ class DeepStyle(BaseRecommender):
         k: int = config["latent_dim"]
         ks: int = config["style_dim"]
 
-        assert self.visual_features is not None, "DeepStyle requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("DeepStyle requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)

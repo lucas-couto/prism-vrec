@@ -51,7 +51,7 @@ def _derive_job_seed(
 
 
 class BPRDataset(Dataset):
-    """Dataset para amostragem BPR (user, pos_item, neg_item)."""
+    """Dataset yielding BPR triples (user, pos_item, neg_item)."""
 
     def __init__(self, train_interactions: dict, n_items: int):
         self.n_items = n_items

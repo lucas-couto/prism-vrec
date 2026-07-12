@@ -69,7 +69,8 @@ class VNPR(BaseRecommender):
         k: int = config["latent_dim"]
         hidden_layers: list[int] = config["hidden_layers"]
 
-        assert self.visual_features is not None, "VNPR requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("VNPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)  # u_u

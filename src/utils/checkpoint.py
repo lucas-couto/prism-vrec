@@ -174,8 +174,9 @@ class CheckpointManager:
     def clear_training_checkpoint(self, run_id: str) -> None:
         """Delete the training checkpoint for *run_id*, if it exists."""
         ckpt_path = self._training_dir() / f"{run_id}.pt"
-        if ckpt_path.exists():
-            ckpt_path.unlink()
+        # missing_ok avoids a TOCTOU FileNotFoundError when two processes
+        # clear the same run_id concurrently.
+        ckpt_path.unlink(missing_ok=True)
 
     def clear_all_training_checkpoints(self) -> int:
         """Delete every file in ``training/``. Returns the number removed.

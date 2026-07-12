@@ -8,6 +8,9 @@ from tqdm import tqdm
 
 from src.utils.amp_compat import cuda_autocast
 from src.utils.atomic_io import atomic_np_save
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class BaseExtractor(abc.ABC):
@@ -120,9 +123,10 @@ class BaseExtractor(abc.ABC):
                 all_embeddings = [ckpt["embeddings"]]
                 all_item_ids = ckpt["item_ids"]
                 start_batch = ckpt["last_batch_index"] + 1
-                print(
-                    f"Resuming from checkpoint: {len(all_item_ids)} items, "
-                    f"starting at batch {start_batch}"
+                logger.info(
+                    "Resuming from checkpoint: %d items, starting at batch %d",
+                    len(all_item_ids),
+                    start_batch,
                 )
 
         use_amp = self.device.type == "cuda"
@@ -158,7 +162,9 @@ class BaseExtractor(abc.ABC):
                         },
                         checkpoint_path,
                     )
-                    print(f"Checkpoint saved at batch {batch_idx} ({len(all_item_ids)} items)")
+                    logger.info(
+                        "Checkpoint saved at batch %d (%d items)", batch_idx, len(all_item_ids)
+                    )
 
         if len(all_embeddings) == 0:
             final_embeddings = np.empty((0, self.output_dim), dtype=np.float32)
@@ -265,7 +271,9 @@ class BaseExtractor(abc.ABC):
         atomic_np_save(components, npy_path)
         with open(json_path, "w") as f:
             json.dump(item_ids, f)
-        print(f"Saved {len(item_ids)} component features to {npy_path} ({components.shape})")
+        logger.info(
+            "Saved %d component features to %s (%s)", len(item_ids), npy_path, components.shape
+        )
 
     def save(self, embeddings: np.ndarray, item_ids: list, path: str):
         """Save embeddings as ``.npy`` and item_ids as ``.json``.
@@ -290,5 +298,5 @@ class BaseExtractor(abc.ABC):
         with open(json_path, "w") as f:
             json.dump(item_ids, f)
 
-        print(f"Saved {len(item_ids)} embeddings to {npy_path}")
-        print(f"Saved item ids to {json_path}")
+        logger.info("Saved %d embeddings to %s", len(item_ids), npy_path)
+        logger.info("Saved item ids to %s", json_path)

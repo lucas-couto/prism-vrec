@@ -45,7 +45,8 @@ class VBPR(BaseRecommender):
         k: int = config["latent_dim"]
         kv: int = config["visual_dim"]
 
-        assert self.visual_features is not None, "VBPR requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("VBPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)

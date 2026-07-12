@@ -50,7 +50,8 @@ class AVBPR(BaseRecommender):
         kv: int = config.get("visual_dim", k)
         att_hidden: int = config["att_hidden"]
 
-        assert self.visual_features is not None, "AVBPR requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("AVBPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)
