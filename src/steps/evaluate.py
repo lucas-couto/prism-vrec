@@ -232,7 +232,19 @@ def _evaluate_cell(
         **ctor_kwargs,
     ).to(device)
     model.load_state_dict(state_dict)
-    return evaluator.evaluate_per_user(model, device=device)
+    per_user = evaluator.evaluate_per_user(model, device=device)
+
+    # Provenance columns required by the v2 protocol: every recorded
+    # result must say which evaluation protocol produced it, the visual
+    # input dimensionality the model consumed, and the trainable-param
+    # count (E scales with the backbone's native dim — an expected
+    # second-order effect that must be reported, not hidden).
+    n_trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    return per_user.assign(
+        protocol=evaluator.protocol,
+        visual_input_dim=int(getattr(model, "visual_dim_raw", 0)),
+        n_trainable_params=n_trainable,
+    )
 
 
 def run(condition: str = "frozen") -> None:

@@ -50,11 +50,16 @@ def test_evaluate_cell_passes_train_only_history_to_history_model(tmp_path, monk
         def to(self, device):  # noqa: ANN001
             return self
 
+        def parameters(self):
+            return iter(())
+
     class _FakeSpec:
         cls = _FakeModel
         requires_visual = False
 
     class _FakeEvaluator:
+        protocol = "full_ranking"
+
         def evaluate_per_user(self, model, device):  # noqa: ANN001
             return pd.DataFrame({"user_id": [0], "ndcg@10": [0.5]})
 
