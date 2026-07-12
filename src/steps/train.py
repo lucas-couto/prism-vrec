@@ -8,8 +8,10 @@ Two strategies are supported, selected by
   :class:`TrainingOrchestrator`.
 * ``optuna``, Bayesian search via :mod:`optuna`, sequential within
   each ``(dataset, model, embedding)`` cell with median-pruner
-  stopping bad trials early.  Cells are processed one after another
-  (no inter-cell parallelism in the MVP).
+  stopping bad trials early.  Independent cells are dispatched to a
+  small pool of worker processes (B7); trials inside a cell stay
+  sequential so the TPE sampler always conditions on every previous
+  trial of its own study.
 
 Both backends share the same per-trial entry point, so the actual
 training loop in :mod:`src.utils.training` is unchanged.
@@ -270,8 +272,8 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
         are eligible for the search.
     workers:
         Number of parallel workers (``0`` = auto-detect via VRAM).
-        Honoured by the ``grid`` strategy only; ``optuna`` runs each
-        cell sequentially.
+        Grid parallelises over jobs; ``optuna`` parallelises over
+        cells (capped at 3 — see :func:`_resolve_optuna_workers`).
     sequential:
         Force a single worker regardless of ``workers``.
     """
@@ -301,7 +303,7 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     logger.info("Hyperparameter-search strategy: %s", strategy)
 
     if strategy == "optuna":
-        _run_optuna(condition, config)
+        _run_optuna(condition, config, workers=workers, sequential=sequential)
     else:
         _run_grid(condition, config, workers=workers, sequential=sequential)
 
@@ -351,77 +353,245 @@ def _legit_trial_count(study) -> int:
     return sum(1 for t in study.trials if t.state.name in ("COMPLETE", "PRUNED"))
 
 
-def _run_optuna(condition: str, config: dict) -> None:
-    """Per-cell Optuna search with median pruning.
+def _resolve_optuna_workers(workers: int, device: str, n_cells: int) -> int:
+    """Worker count for inter-cell Optuna parallelism.
 
-    For each ``(dataset, model, embedding)`` cell we create (or load)
-    an Optuna study and run ``hp_search.optuna.n_trials`` trials.  The
-    training loop reports the validation metric after every
-    ``eval_every_epochs`` epochs; pruned trials raise and are skipped
-    without persisting a checkpoint.
+    Reuses the VRAM heuristic of the grid orchestrator but caps the pool
+    at 3: an Optuna worker holds a full study (data + model + evaluator)
+    for the whole cell, and 3 concurrent training processes is the
+    empirically verified ceiling on the reference 24 GB pod.  Never more
+    workers than cells.
+    """
+    from src.utils.parallel import detect_max_workers
+
+    n = detect_max_workers(device) if workers <= 0 else workers
+    return max(1, min(n, 3, n_cells))
+
+
+def _optimize_one_cell(
+    cell: CellKey,
+    n_users: int,
+    n_items: int,
+    emb_path: str | None,
+    *,
+    config: dict,
+    processed_dir: str,
+    device: str,
+    log=logger,
+) -> dict:
+    """Create/load the study for *cell* and run its remaining trials.
+
+    Runs in the parent (sequential mode) or inside a worker process
+    (parallel mode); the study is always created in the executing
+    process so in-memory storage never crosses a process boundary.
     """
     import optuna
 
-    device = resolve_device(config["device"])
-    processed_dir = config["paths"]["data_processed"]
-    embeddings_dir = config["paths"]["embeddings"]
     optuna_cfg = config["hp_search"]["optuna"]
     n_trials = int(optuna_cfg["n_trials"])
     timeout = optuna_cfg.get("timeout_seconds")
 
-    cells = _list_cells(condition, config, processed_dir, embeddings_dir)
-    logger.info("Optuna cells to process: %d (n_trials=%d)", len(cells), n_trials)
+    log.info("=== Optuna cell: %s ===", cell.study_name())
+    study = create_study(cell, config)
 
-    for cell, n_users, n_items, emb_path in cells:
-        logger.info("=== Optuna cell: %s ===", cell.study_name())
-        study = create_study(cell, config)
+    def _objective(trial):
+        hp = sample_hyperparams(trial, cell.model_name, config)
+        return _train_one_optuna_trial(
+            cell=cell,
+            hyperparams=hp,
+            n_users=n_users,
+            n_items=n_items,
+            embeddings_path=emb_path,
+            processed_dir=processed_dir,
+            device=device,
+            config=config,
+            trial=trial,
+        )
 
-        def _objective(trial, _cell=cell, _users=n_users, _items=n_items, _emb=emb_path):
-            hp = sample_hyperparams(trial, _cell.model_name, config)
-            return _train_one_optuna_trial(
-                cell=_cell,
-                hyperparams=hp,
-                n_users=_users,
-                n_items=_items,
-                embeddings_path=_emb,
+    existing = _legit_trial_count(study)
+    remaining = max(0, n_trials - existing)
+    if remaining == 0:
+        log.info(
+            "  cell %s: already has %d legit trials >= n_trials=%d, skipping",
+            cell.study_name(),
+            existing,
+            n_trials,
+        )
+    else:
+        study.optimize(
+            _objective,
+            n_trials=remaining,
+            timeout=timeout,
+            gc_after_trial=True,
+            show_progress_bar=False,
+        )
+
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    summary = {
+        "cell": cell.study_name(),
+        "status": "ok",
+        "completed": len(completed),
+        "pruned": len(pruned),
+        "best_value": study.best_value if completed else 0.0,
+        "best_params": study.best_params if completed else {},
+    }
+    log.info(
+        "  cell %s: %d completed, %d pruned. best_value=%.4f best_params=%s",
+        summary["cell"],
+        summary["completed"],
+        summary["pruned"],
+        summary["best_value"],
+        summary["best_params"],
+    )
+    return summary
+
+
+def _optuna_cell_worker(
+    worker_id: int,
+    cell_queue,
+    result_queue,
+    n_workers: int,
+    config: dict,
+    processed_dir: str,
+    device: str,
+) -> None:
+    """Worker process: pulls whole cells and runs their studies.
+
+    Mirrors :func:`src.utils.parallel._worker_fn` (memory fraction,
+    isolation of failures per unit of work) at cell granularity.
+    """
+    from queue import Empty as _Empty
+
+    import torch as _torch
+
+    from src.utils.logging import get_logger as _get_logger
+
+    wlog = _get_logger(f"optuna_worker_{worker_id}")
+
+    if _torch.cuda.is_available() and n_workers > 1:
+        fraction = min(0.95, 1.0 / n_workers + 0.05)
+        _torch.cuda.set_per_process_memory_fraction(fraction)
+
+    while True:
+        try:
+            item = cell_queue.get(timeout=5)
+        except _Empty:
+            break
+        if item is None:
+            break
+
+        cell, n_users, n_items, emb_path = item
+        try:
+            summary = _optimize_one_cell(
+                cell,
+                n_users,
+                n_items,
+                emb_path,
+                config=config,
                 processed_dir=processed_dir,
                 device=device,
-                config=config,
-                trial=trial,
+                log=wlog,
+            )
+            result_queue.put(summary)
+        except Exception as exc:  # noqa: BLE001, isolate failures per cell
+            wlog.error("  Error on cell %s: %s", cell.study_name(), exc, exc_info=True)
+            result_queue.put(
+                {"cell": cell.study_name(), "status": "error", "error": str(exc)},
             )
 
+
+def _run_optuna(
+    condition: str,
+    config: dict,
+    *,
+    workers: int = 0,
+    sequential: bool = False,
+) -> None:
+    """Per-cell Optuna search with median pruning (parallel across cells).
+
+    For each ``(dataset, model, embedding)`` cell we create (or load)
+    an Optuna study and run ``hp_search.optuna.n_trials`` trials.
+    Cells are independent studies, so they are dispatched to worker
+    processes (B7); trials WITHIN a cell remain sequential, keeping the
+    TPE sampler conditioned on every prior trial of its study.  Cells
+    whose studies already hold ``n_trials`` legitimate outcomes are
+    skipped, so a killed run resumes where it stopped (requires a
+    persistent ``hp_search.optuna.storage``).
+    """
+    device = resolve_device(config["device"])
+    processed_dir = config["paths"]["data_processed"]
+    embeddings_dir = config["paths"]["embeddings"]
+    n_trials = int(config["hp_search"]["optuna"]["n_trials"])
+
+    cells = _list_cells(condition, config, processed_dir, embeddings_dir)
+    logger.info("Optuna cells to process: %d (n_trials=%d)", len(cells), n_trials)
+    if not cells:
+        return
+
+    n_workers = 1 if sequential else _resolve_optuna_workers(workers, device, len(cells))
+
+    if n_workers == 1:
         try:
-            existing = _legit_trial_count(study)
-            remaining = max(0, n_trials - existing)
-            if remaining == 0:
-                logger.info(
-                    "  cell %s: already has %d legit trials >= n_trials=%d, skipping",
-                    cell.study_name(),
-                    existing,
-                    n_trials,
-                )
-            else:
-                study.optimize(
-                    _objective,
-                    n_trials=remaining,
-                    timeout=timeout,
-                    gc_after_trial=True,
-                    show_progress_bar=False,
+            for cell, n_users, n_items, emb_path in cells:
+                _optimize_one_cell(
+                    cell,
+                    n_users,
+                    n_items,
+                    emb_path,
+                    config=config,
+                    processed_dir=processed_dir,
+                    device=device,
                 )
         except KeyboardInterrupt:
             logger.warning("Optuna study interrupted by user.")
             raise
+        return
 
-        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-        pruned = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
-        logger.info(
-            "  cell %s: %d completed, %d pruned. best_value=%.4f best_params=%s",
-            cell.study_name(),
-            len(completed),
-            len(pruned),
-            study.best_value if completed else 0.0,
-            study.best_params if completed else {},
+    if config["hp_search"]["optuna"].get("storage") is None:
+        logger.warning(
+            "hp_search.optuna.storage is null: studies live in worker memory "
+            "and completed-cell skip will not survive a restart. Set a "
+            "sqlite storage for resumable parallel search.",
         )
+
+    import torch.multiprocessing as mp
+
+    logger.info("Optuna inter-cell parallelism: %d workers", n_workers)
+    ctx = mp.get_context("spawn")
+    cell_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    for item in cells:
+        cell_queue.put(item)
+    for _ in range(n_workers):
+        cell_queue.put(None)
+
+    procs = []
+    for i in range(n_workers):
+        p = ctx.Process(
+            target=_optuna_cell_worker,
+            args=(i, cell_queue, result_queue, n_workers, config, processed_dir, device),
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
+
+    results: list[dict] = []
+    while len(results) < len(cells):
+        try:
+            results.append(result_queue.get(timeout=30))
+        except Exception:  # noqa: BLE001, queue.Empty from a spawn context
+            if not any(p.is_alive() for p in procs):
+                logger.warning("All Optuna workers exited early.")
+                break
+    for p in procs:
+        p.join(timeout=30)
+
+    ok = sum(1 for r in results if r.get("status") == "ok")
+    logger.info("Optuna search complete: %d/%d cells succeeded.", ok, len(cells))
+    for r in results:
+        if r.get("status") != "ok":
+            logger.error("  cell %s failed: %s", r.get("cell"), r.get("error"))
 
 
 def _list_cells(

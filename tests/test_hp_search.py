@@ -182,3 +182,27 @@ def test_sample_hyperparams_falls_back_to_lists() -> None:
 def test_cell_key_study_name_is_stable() -> None:
     cell = CellKey("amazon_fashion", "vbpr", "resnet50_D128")
     assert cell.study_name() == "amazon_fashion__vbpr__resnet50_D128"
+
+
+class TestResolveOptunaWorkers:
+    """Inter-cell parallelism sizing (B7): VRAM heuristic, hard cap of 3."""
+
+    def test_explicit_workers_respected_below_cap(self) -> None:
+        from src.steps.train import _resolve_optuna_workers
+
+        assert _resolve_optuna_workers(2, "cpu", n_cells=10) == 2
+
+    def test_capped_at_three(self) -> None:
+        from src.steps.train import _resolve_optuna_workers
+
+        assert _resolve_optuna_workers(8, "cpu", n_cells=10) == 3
+
+    def test_never_more_workers_than_cells(self) -> None:
+        from src.steps.train import _resolve_optuna_workers
+
+        assert _resolve_optuna_workers(3, "cpu", n_cells=1) == 1
+
+    def test_auto_detect_is_at_least_one(self) -> None:
+        from src.steps.train import _resolve_optuna_workers
+
+        assert _resolve_optuna_workers(0, "cpu", n_cells=4) >= 1
