@@ -866,13 +866,13 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.0.0},
-  doi     = {10.5281/zenodo.21325967},
-  url     = {https://doi.org/10.5281/zenodo.21325967}
+  version = {2.0.1},
+  doi     = {10.5281/zenodo.20357510},
+  url     = {https://doi.org/10.5281/zenodo.20357510}
 }
 ```
 
-The archived v2.0.0 release is available on Zenodo: [10.5281/zenodo.21325967](https://doi.org/10.5281/zenodo.21325967); the concept DOI [10.5281/zenodo.20357510](https://doi.org/10.5281/zenodo.20357510) always resolves to the latest archived version. A companion tool paper is planned and this section will be updated when it is available. See `CITATION.cff` for the canonical software citation metadata.
+Every release is archived on Zenodo with its own version DOI (v2.0.0: [10.5281/zenodo.21325967](https://doi.org/10.5281/zenodo.21325967)); the concept DOI [10.5281/zenodo.20357510](https://doi.org/10.5281/zenodo.20357510) always resolves to the latest archived version — cite it unless you need to pin an exact version. A companion tool paper is planned and this section will be updated when it is available. See `CITATION.cff` for the canonical software citation metadata.
 
 ### Citing a reported use of the framework
 

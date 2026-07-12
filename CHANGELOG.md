@@ -8,6 +8,25 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-12
+
+Documentation-only release so the Zenodo archive carries README/docs
+that match the v2 protocol. No code changes.
+
+### Changed
+
+- README synced with the v2 protocol: native-dim extraction
+  (``raw_dim`` table including ConvNeXt-Base), ``projection_dims`` /
+  ``embedding_dims`` removed from config examples, fusion ``alignment``
+  block documented, DeepStyle paper formula, ACF component artifact
+  naming (``<extractor>_comp.npy``), ``eval_sample_size`` example.
+- ``docs/hp_search.md`` describes inter-cell Optuna parallelism (B7);
+  ``docs/learned_fusion.md`` uses v2 sidecar naming and mentions
+  ``RaggedSources``.
+- Citation policy: ``CITATION.cff`` and the README bibtex cite the
+  concept DOI (always the latest version); per-version DOIs remain
+  available on Zenodo (v2.0.0: 10.5281/zenodo.21325967).
+
 ## [2.0.0] - 2026-07-12
 
 **Breaking: new experimental protocol.** Every 1.x embedding, checkpoint
