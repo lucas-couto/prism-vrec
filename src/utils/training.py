@@ -5,6 +5,7 @@ import hashlib
 import json
 import multiprocessing
 import random
+import time
 from pathlib import Path
 
 import torch
@@ -263,6 +264,7 @@ def train_single_run(
             total_loss = torch.zeros((), device=loss_device)
             n_batches = 0
 
+            train_t0 = time.perf_counter()
             for users, pos_items, neg_items in train_loader:
                 users = users.to(device, non_blocking=True)
                 pos_items = pos_items.to(device, non_blocking=True)
@@ -281,10 +283,22 @@ def train_single_run(
                 n_batches += 1
 
             avg_loss = (total_loss / max(n_batches, 1)).item()
+            train_seconds = time.perf_counter() - train_t0
             logger.debug("epoch=%d avg_loss=%.6f", epoch, avg_loss)
 
             if (epoch + 1) % eval_every_epochs == 0 or epoch == epochs - 1:
+                eval_t0 = time.perf_counter()
                 metrics = evaluator.evaluate(model, device=device)
+                eval_seconds = time.perf_counter() - eval_t0
+                # Train-vs-eval split per model: the number the efficiency
+                # audit could not answer without instrumentation.
+                logger.info(
+                    "timing model=%s epoch=%d train_s=%.2f eval_s=%.2f",
+                    model_name,
+                    epoch,
+                    train_seconds,
+                    eval_seconds,
+                )
                 current_metric = metrics.get(es_metric, 0.0)
 
                 if current_metric > best_metric:
