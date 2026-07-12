@@ -120,8 +120,8 @@ class LearnedAlignmentFusion(nn.Module):
         weights: list[float] | None = None,
     ) -> None:
         super().__init__()
-        if len(source_dims) < 2:
-            raise ValueError(f"LearnedAlignmentFusion needs >=2 sources, got {source_dims}.")
+        if not source_dims:
+            raise ValueError("LearnedAlignmentFusion needs at least 1 source.")
         self.source_dims = list(source_dims)
         self.strategy = strategy
         self.normalize = normalize
@@ -341,10 +341,21 @@ def load_embedding(path: str | Path):
     if p.suffix == ".json":
         sidecar = json.loads(p.read_text(encoding="utf-8"))
         components = sidecar.get("components") or []
-        if len(components) < 2:
+        if not components:
             raise ValueError(
-                f"online sidecar {p} has fewer than 2 components "
-                f"(got {len(components)}); cannot stack.",
+                f"online sidecar {p} lists no components; cannot stack.",
+            )
+        if len(components) == 1:
+            # Degenerate but well-defined: a single-source fusion (e.g. the
+            # smoke profile) reduces to one learned projection / an M=1
+            # stack. Real grids always fuse >= 2 sources.
+            from src.utils.logging import get_logger
+
+            get_logger(__name__).warning(
+                "online sidecar %s has a single component (%s); "
+                "fusion degenerates to a passthrough of that source.",
+                p,
+                components[0],
             )
         loaded = []
         for fname in components:

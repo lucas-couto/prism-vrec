@@ -114,6 +114,40 @@ class TestLoadEmbeddingSidecars:
         assert arr.aligned_dim == 6
         assert arr.strategy == "mean"
 
+    def test_single_component_sidecar_degenerates_to_passthrough(self, tmp_path) -> None:
+        # The smoke profile fuses a single extractor by design; the loader
+        # must accept the M=1 sidecar (warning, not error).
+        sources = _sources()
+        np.save(tmp_path / "resnet50.npy", sources[0])
+        sidecar = {
+            "strategy": "mean",
+            "online": True,
+            "alignment": "learned",
+            "dim": 6,
+            "components": ["resnet50.npy"],
+            "normalize": True,
+            "fusion_kwargs": {},
+        }
+        path = tmp_path / "hybrid_mean_learned_D6.json"
+        path.write_text(json.dumps(sidecar))
+
+        arr = load_embedding(path)
+
+        assert isinstance(arr, RaggedSources)
+        assert arr.shape == (N_ITEMS, D1)
+        assert arr.source_dims == [D1]
+
+        fusion = LearnedAlignmentFusion([D1], dim=6, strategy="mean")
+        out = fusion(torch.from_numpy(sources[0]))
+        assert out.shape == (N_ITEMS, 6)
+
+    def test_empty_sidecar_fails_loudly(self, tmp_path) -> None:
+        path = tmp_path / "hybrid_mean_learned_D6.json"
+        path.write_text(json.dumps({"strategy": "mean", "components": []}))
+
+        with pytest.raises(ValueError, match="no components"):
+            load_embedding(path)
+
     def test_equal_dim_sidecar_still_stacks_3d(self, tmp_path) -> None:
         rng = np.random.default_rng(1)
         a = rng.standard_normal((N_ITEMS, 5)).astype("float32")
