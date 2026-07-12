@@ -219,10 +219,18 @@ def _evaluate_cell(
         logger.warning("    Legacy checkpoint (no hyperparams): %s", model_info["path"])
 
     # History-consuming models (ACF) need the pure-train interactions at
-    # construction; other models keep the original 4-argument constructor.
+    # construction; category-consuming models (DeepStyle) need the item→
+    # category index array; other models keep the 4-argument constructor.
     ctor_kwargs: dict = {}
     if getattr(model_cls, "wants_history", False):
         ctor_kwargs["train_interactions"] = train_interactions
+    if getattr(model_cls, "wants_categories", False):
+        from src.data.categories import item_category_array
+
+        config_paths = load_config()["paths"]
+        ctor_kwargs["item_categories"] = item_category_array(
+            dataset_name, config_paths["data_processed"]
+        )
 
     model = model_cls(
         n_users=n_users,

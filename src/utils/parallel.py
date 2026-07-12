@@ -180,7 +180,15 @@ def _worker_fn(
         for _, row in val_df.iterrows():
             u, i = int(row["user_idx"]), int(row["item_idx"])
             val_inter.setdefault(u, set()).add(i)
-        result = (n_users, n_items, train_inter, val_inter)
+
+        # Item→category indices for wants_categories models (DeepStyle).
+        # Built once per dataset per worker; None when the dataset ships
+        # no labels (DeepStyle then degenerates to VBPR by design).
+        from src.data.categories import item_category_array
+
+        item_cats = item_category_array(dataset_name, processed_dir)
+
+        result = (n_users, n_items, train_inter, val_inter, item_cats)
         _data_cache[dataset_name] = result
         return result
 
@@ -206,7 +214,7 @@ def _worker_fn(
             torch.cuda.empty_cache()
             model_cls = get_recommender_class(job.model_name)
 
-            n_users, n_items, train_inter, val_inter = _load_data(
+            n_users, n_items, train_inter, val_inter, item_cats = _load_data(
                 job.processed_dir,
                 job.dataset_name,
             )
@@ -236,6 +244,7 @@ def _worker_fn(
                 dataset_name=job.dataset_name,
                 embedding_name=job.embedding_name,
                 device=job.device,
+                item_categories=item_cats,
             )
 
             experiment_key = f"{job.dataset_name}_{job.embedding_name}_{job.model_name}"

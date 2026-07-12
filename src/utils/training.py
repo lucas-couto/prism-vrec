@@ -157,6 +157,7 @@ def train_single_run(
     embedding_name: str,
     device: str,
     optuna_trial=None,
+    item_categories=None,
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -197,11 +198,15 @@ def train_single_run(
     model_config = {**hyperparams, "l2_reg": hyperparams.get("l2_reg", 0.0001)}
 
     # Only models that declare ``wants_history`` accept the
-    # ``train_interactions`` keyword (e.g. ACF item-level attention); every
-    # other recommender keeps the original 4-argument constructor untouched.
+    # ``train_interactions`` keyword (e.g. ACF item-level attention), and
+    # only ``wants_categories`` models (DeepStyle) receive the item→category
+    # index array; every other recommender keeps the original 4-argument
+    # constructor untouched.
     ctor_kwargs: dict = {}
     if getattr(model_cls, "wants_history", False):
         ctor_kwargs["train_interactions"] = train_interactions
+    if getattr(model_cls, "wants_categories", False):
+        ctor_kwargs["item_categories"] = item_categories
 
     model = model_cls(
         n_users=n_users,

@@ -15,8 +15,9 @@ that need to persist the result can call :func:`write_categories_csv`.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
@@ -116,11 +117,7 @@ def derive_categories(
         return None
 
     label_remap = {lbl: idx for idx, lbl in enumerate(sorted(kept_labels))}
-    mapping = {
-        item_id: label_remap[label]
-        for item_id, label in raw_pairs
-        if label in kept_labels
-    }
+    mapping = {item_id: label_remap[label] for item_id, label in raw_pairs if label in kept_labels}
 
     logger.info(
         "Derived %d categories from taxonomy level %d (kept %d/%d labels, "
@@ -148,3 +145,52 @@ def write_categories_csv(mapping: dict[str, int], path: str | Path) -> None:
     payload = "".join(lines)
     atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), target)
     logger.info("Wrote %d category rows to %s", len(mapping), target)
+
+
+def item_category_array(dataset_name: str, processed_dir: str | Path):
+    """Build the ``(n_items,)`` category-index array for a dataset.
+
+    Reuses the same category labels the fine-tuning step consumes
+    (``DatasetProvider.load_categories``) and the canonical
+    ``item2idx.json`` mapping — built ONCE before training, so the
+    recommender does a plain batched tensor lookup at train time.
+
+    Returns ``None`` when the dataset ships no category labels (e.g.
+    Tradesy): the caller (DeepStyle) then uses a single null category,
+    which analytically degenerates the model to VBPR — an expected,
+    declared property, not an error.
+
+    Items present in the catalogue but absent from the labels get a
+    dedicated extra index (``n_categories``), a learned "unlabelled"
+    bucket, so no item silently shares a real category.
+    """
+    import json
+
+    import numpy as np
+
+    from src.data.base import get_dataset_provider
+
+    provider = get_dataset_provider(dataset_name)
+    categories = provider.load_categories()
+    if not categories:
+        return None
+
+    with open(Path(processed_dir) / dataset_name / "item2idx.json", encoding="utf-8") as fh:
+        item2idx = json.load(fh)
+
+    n_items = len(item2idx)
+    n_categories = max(categories.values()) + 1
+    arr = np.full(n_items, n_categories, dtype=np.int64)  # default: unlabelled bucket
+    for external_id, idx in item2idx.items():
+        label = categories.get(str(external_id))
+        if label is not None:
+            arr[int(idx)] = int(label)
+    n_unlabelled = int((arr == n_categories).sum())
+    if n_unlabelled:
+        logger.info(
+            "%s: %d/%d items without a category label -> learned 'unlabelled' bucket.",
+            dataset_name,
+            n_unlabelled,
+            n_items,
+        )
+    return arr

@@ -487,6 +487,12 @@ def _train_one_optuna_trial(
     model_cls = get_recommender_class(cell.model_name)
     checkpoint_mgr = CheckpointManager()
 
+    item_categories = None
+    if getattr(model_cls, "wants_categories", False):
+        from src.data.categories import item_category_array
+
+        item_categories = item_category_array(dataset_name, processed_dir)
+
     return train_single_run(
         model_cls=model_cls,
         model_name=cell.model_name,
@@ -502,4 +508,5 @@ def _train_one_optuna_trial(
         embedding_name=cell.embedding_name,
         device=device,
         optuna_trial=trial,
+        item_categories=item_categories,
     )
