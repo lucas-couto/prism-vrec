@@ -96,6 +96,7 @@ def test_save_components_writes_3d_npy_and_ids(tmp_path: Path) -> None:
     assert ids == [10, 11, 12]
 
 
+@pytest.mark.slow
 def test_resnet50_exposes_49_components() -> None:
     pytest.importorskip("torchvision")
     from src.extractors.resnet import ResNet50Extractor

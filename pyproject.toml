@@ -75,6 +75,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-ra --strict-markers"
+markers = [
+    "slow: instantiates a real backbone and downloads pretrained weights on first run",
+]
 
 [tool.ruff]
 target-version = "py311"

@@ -27,6 +27,7 @@ CASES = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(("name", "backend", "expected_m"), CASES)
 def test_component_shape_is_n_m_output_dim(name, backend, expected_m) -> None:
     pytest.importorskip(backend)

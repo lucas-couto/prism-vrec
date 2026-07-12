@@ -33,6 +33,7 @@ def test_convnext_unfreeze_prefixes_match_real_params():
     assert list(cls.unfreeze_prefixes) == ["backbone.stages.3"]
 
 
+@pytest.mark.slow
 def test_convnext_extract_returns_correct_shape(extractor):
     image = Image.new("RGB", (224, 224))
     embedding = extractor.extract(image)
@@ -42,6 +43,7 @@ def test_convnext_extract_returns_correct_shape(extractor):
     assert embedding.dtype == np.float32
 
 
+@pytest.mark.slow
 def test_convnext_unfreeze_prefix_is_present_in_model(extractor):
     matches = [
         name
