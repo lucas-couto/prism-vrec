@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -111,12 +112,34 @@ class FineTuner:
             param.requires_grad = False
 
         for name, param in self.model.named_parameters():
-            if any(name.startswith(p) for p in self.unfreeze_prefixes) or "projection" in name:
+            if self._is_unfrozen_name(name):
                 param.requires_grad = True
 
         # Always unfreeze the classification head
         for param in self.model.projection.parameters():
             param.requires_grad = True
+
+        # BatchNorm modules OUTSIDE the unfrozen prefixes must not update
+        # their running statistics: ``model.train()`` alone would let
+        # every BN layer re-estimate running_mean/var on the fine-tuning
+        # data even though its affine weights are frozen, silently
+        # rewriting the "frozen" part of the backbone (measured drift on
+        # LeViT-256 stem BN: >12 sigma after a single epoch).  BN-dense
+        # backbones (LeViT, ResNet, CoAtNet) are corrupted the most;
+        # LayerNorm backbones are unaffected (LN has no running stats).
+        self._frozen_norms = [
+            module
+            for name, module in self.model.named_modules()
+            if isinstance(module, _BatchNorm)
+            and module.track_running_stats
+            and not self._is_unfrozen_name(name)
+        ]
+        if self._frozen_norms:
+            logger.info(
+                "FineTuner: %d frozen BatchNorm layers pinned to eval mode "
+                "(running stats preserved).",
+                len(self._frozen_norms),
+            )
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
@@ -128,6 +151,20 @@ class FineTuner:
             total,
             100 * trainable / total,
         )
+
+    def _is_unfrozen_name(self, name: str) -> bool:
+        """Whether a parameter/module qualified name is in the trainable set."""
+        return any(name.startswith(p) for p in self.unfreeze_prefixes) or "projection" in name
+
+    def _set_train_mode(self) -> None:
+        """Enter train mode while keeping frozen BatchNorm layers in eval.
+
+        Must be used instead of a bare ``self.model.train()`` — see the
+        ``_frozen_norms`` comment in ``__init__``.
+        """
+        self.model.train()
+        for module in self._frozen_norms:
+            module.eval()
 
     def train(
         self,
@@ -206,7 +243,7 @@ class FineTuner:
                 )
 
         for epoch in range(start_epoch, epochs_max):
-            self.model.train()
+            self._set_train_mode()
             train_loss = 0.0
             train_correct = 0
             train_total = 0

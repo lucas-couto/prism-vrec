@@ -47,6 +47,21 @@ from src.utils.timing import time_cell
 logger = get_logger(__name__)
 
 
+def drop_degenerate_tail(n_items: int, batch_size: int) -> bool:
+    """Whether the *train* DataLoader should drop its final batch.
+
+    A final batch of exactly 1 sample is degenerate for BatchNorm-bearing
+    backbones in train mode: a BatchNorm over ``(B, C)`` activations
+    raises on a single sample, and token/spatial BatchNorm silently
+    injects extreme single-image statistics into the running averages
+    (momentum 0.1 — 10% of the running stat from one image).  The tail
+    is dropped only when it is exactly 1 sample and the dataset spans
+    more than one batch, so no configuration ever yields an empty epoch.
+    Validation loaders never need this (eval mode uses running stats).
+    """
+    return n_items > batch_size and n_items % batch_size == 1
+
+
 def _finetune_and_extract(
     extractor_name: str,
     dataset_name: str,
@@ -119,6 +134,7 @@ def _finetune_and_extract(
             train_ds,
             batch_size=batch_size,
             shuffle=True,
+            drop_last=drop_degenerate_tail(len(train_ds), batch_size),
             num_workers=num_workers,
             pin_memory=use_cuda,
             persistent_workers=num_workers > 0,
