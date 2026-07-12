@@ -14,12 +14,14 @@ that need to persist the result can call :func:`write_categories_csv`.
 
 from __future__ import annotations
 
-import logging
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-logger = logging.getLogger(__name__)
+from src.utils.atomic_io import atomic_write
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _decode(value: Any) -> str:
@@ -141,11 +143,8 @@ def write_categories_csv(mapping: dict[str, int], path: str | Path) -> None:
     silently misread.
     """
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write("item_id,category_label\n")
-        for item_id, label in mapping.items():
-            fh.write(f"{item_id},{label}\n")
-    tmp.rename(target)
+    lines = ["item_id,category_label\n"]
+    lines.extend(f"{item_id},{label}\n" for item_id, label in mapping.items())
+    payload = "".join(lines)
+    atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), target)
     logger.info("Wrote %d category rows to %s", len(mapping), target)

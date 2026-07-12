@@ -19,6 +19,7 @@ from queue import Empty
 import torch
 import torch.multiprocessing as mp
 
+from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -116,10 +117,12 @@ def _locked_append_grid_progress(path: Path, entry: dict) -> None:
                 with open(path) as f:
                     existing = json.load(f)
             existing.append(entry)
-            tmp = path.with_suffix(".json.tmp")
-            with open(tmp, "w") as f:
-                json.dump(existing, f, indent=2)
-            tmp.rename(path)
+            # fsync + retried replace (networked-FS dirent lag); the
+            # surrounding flock already serialises the read-modify-write.
+            atomic_write(
+                lambda tmp: Path(tmp).write_text(json.dumps(existing, indent=2)),
+                path,
+            )
         finally:
             _unlock_file(lf)
 

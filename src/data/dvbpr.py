@@ -364,6 +364,7 @@ class DVBPRDataLoader(DatasetProvider):
         extracted = 0
         skipped = 0
         no_image = 0
+        errors = 0
 
         first_item = items_raw[0]
         logger.info(
@@ -399,16 +400,23 @@ class DVBPRDataLoader(DatasetProvider):
 
                 dest.write_bytes(img_bytes)
                 extracted += 1
-            except Exception as exc:
-                if no_image == 0:
+            except Exception as exc:  # noqa: BLE001 — count and keep going
+                # A genuine extraction failure (corrupt bytes, disk full,
+                # permission) is distinct from an item that simply has no
+                # image; conflating them under-reports data loss.  Log the
+                # first few and always count them separately.
+                if errors < 5:
                     logger.warning("Error extracting item %d: %s", item_id, exc)
-                no_image += 1
+                errors += 1
 
+        if errors:
+            logger.warning("Image extraction hit %d errors (see warnings above).", errors)
         logger.info(
-            "Images: %d extracted, %d skipped (existing), %d without image",
+            "Images: %d extracted, %d skipped (existing), %d without image, %d errors",
             extracted,
             skipped,
             no_image,
+            errors,
         )
 
     def save_processed(self, processed_dir: str | Path) -> None:

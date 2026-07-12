@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from src.finetuning.checkpoint import split_state_dict
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
+from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -230,19 +231,15 @@ class FineTuner:
                 epochs_no_improve += 1
 
             if checkpoint_path is not None:
-                tmp = Path(checkpoint_path).with_suffix(".tmp")
-                torch.save(
-                    {
-                        "model_state": self.model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "scheduler_state": scheduler.state_dict(),
-                        "epoch": epoch,
-                        "best_acc": best_acc,
-                        "epochs_no_improve": epochs_no_improve,
-                    },
-                    tmp,
-                )
-                tmp.rename(checkpoint_path)
+                payload = {
+                    "model_state": self.model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "best_acc": best_acc,
+                    "epochs_no_improve": epochs_no_improve,
+                }
+                atomic_write(lambda tmp, p=payload: torch.save(p, tmp), checkpoint_path)
 
             if epochs_no_improve >= patience:
                 logger.info("  Early stopping at epoch %d", epoch + 1)

@@ -12,12 +12,16 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.evaluation.protocol import Evaluator
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
+from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import (
     CheckpointManager,
     capture_rng_states,
     restore_rng_states,
 )
+from src.utils.logging import get_logger
 from src.utils.seed import set_seed
+
+logger = get_logger(__name__)
 
 
 def _derive_job_seed(
@@ -116,24 +120,23 @@ def _save_best_model(
                     existing = torch.load(best_model_path, map_location="cpu", weights_only=False)
                     if existing.get("best_metric", 0.0) >= metric:
                         return
-                except (RuntimeError, EOFError, OSError):
-                    pass
+                except (RuntimeError, EOFError, OSError) as exc:
+                    logger.warning(
+                        "existing best model %s is unreadable (%r); overwriting it.",
+                        best_model_path,
+                        exc,
+                    )
 
-            # Atomic save: write a temp file in the same directory, then
-            # rename into place. Prevents leaving a half-written file
-            # behind if the process is killed mid-write.
-            tmp_path = best_model_path.with_suffix(".pt.tmp")
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "hyperparams": hyperparams,
-                    "best_metric": metric,
-                    "n_users": n_users,
-                    "n_items": n_items,
-                },
-                tmp_path,
-            )
-            tmp_path.rename(best_model_path)
+            payload = {
+                "model_state": model.state_dict(),
+                "hyperparams": hyperparams,
+                "best_metric": metric,
+                "n_users": n_users,
+                "n_items": n_items,
+            }
+            # atomic_write adds fsync + retried replace on top of the
+            # tmp+rename pattern (networked-FS dirent lag).
+            atomic_write(lambda tmp, p=payload: torch.save(p, tmp), best_model_path)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
@@ -166,8 +169,6 @@ def train_single_run(
         raises :class:`optuna.TrialPruned` whenever the configured
         Optuna pruner decides the trial is not promising.
     """
-    from src.utils.logging import get_logger
-
     logger = get_logger(f"train_{model_name}")
 
     run_id = checkpoint_mgr.get_run_id(dataset_name, embedding_name, model_name, hyperparams)

@@ -771,7 +771,8 @@ def _print_post_run_summary(run_dir: Path, exit_status: str) -> None:
 
     try:
         manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("skipping post-run summary; could not read %s (%r)", manifest_path, exc)
         return
 
     total = manifest.get("duration_seconds")

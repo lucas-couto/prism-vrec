@@ -36,6 +36,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -104,7 +105,12 @@ def _record_in_manifest(run_dir: Path, tracker: Any, emissions_kg: float) -> Non
 
     try:
         manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "could not read %s (%r); emissions measured this run are discarded.",
+            manifest_path,
+            exc,
+        )
         return
 
     data = tracker.final_emissions_data
@@ -119,7 +125,8 @@ def _record_in_manifest(run_dir: Path, tracker: Any, emissions_kg: float) -> Non
         "codecarbon_version": getattr(data, "codecarbon_version", None),
     }
 
+    payload = json.dumps(manifest, indent=2, default=str)
     try:
-        manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
+        atomic_write(lambda tmp: Path(tmp).write_text(payload), manifest_path)
     except OSError as exc:
         logger.warning("failed to persist carbon block to %s: %r", manifest_path, exc)

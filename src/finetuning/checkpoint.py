@@ -26,6 +26,8 @@ from typing import Any
 
 import torch
 
+from src.utils.atomic_io import atomic_write
+
 CHECKPOINT_FORMAT_VERSION = "v2"
 HEAD_PREFIX = "projection."
 
@@ -78,19 +80,16 @@ def save_finetuned(
 ) -> None:
     """Atomically write a fine-tuning checkpoint to *path*.
 
-    The file is first written to a sibling ``.tmp`` and then renamed, so
-    a crash mid-save never leaves a corrupt checkpoint behind.
+    Uses :func:`src.utils.atomic_io.atomic_write` (fsync + retried
+    replace) so a crash mid-save never leaves a corrupt checkpoint and
+    the rename survives networked-filesystem dirent lag.
     """
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "backbone": backbone_state,
         "head": head_state,
         "metadata": asdict(metadata),
     }
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    torch.save(payload, tmp)
-    tmp.rename(target)
+    atomic_write(lambda tmp: torch.save(payload, tmp), path)
 
 
 def load_finetuned(
