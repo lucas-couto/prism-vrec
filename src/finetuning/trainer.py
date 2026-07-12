@@ -13,6 +13,7 @@ from tqdm import tqdm
 from src.finetuning.checkpoint import split_state_dict
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
 from src.utils.atomic_io import atomic_write
+from src.utils.checkpoint import capture_rng_states, restore_rng_states
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -175,6 +176,18 @@ class FineTuner:
                 start_epoch = ckpt["epoch"] + 1
                 best_acc = ckpt["best_acc"]
                 epochs_no_improve = ckpt.get("epochs_no_improve", 0)
+                if "scaler_state" in ckpt:
+                    scaler.load_state_dict(ckpt["scaler_state"])
+                # Restore RNG states so a resumed run draws the same
+                # augmentation / shuffle sequence as an uninterrupted one
+                # (bit-identical resume). Absent in pre-1.1.2 checkpoints.
+                if "rng_states" in ckpt:
+                    restore_rng_states(ckpt["rng_states"])
+                else:
+                    logger.warning(
+                        "  Resume checkpoint has no RNG states (pre-1.1.2 format); "
+                        "resumed run is not bit-identical to an uninterrupted one."
+                    )
                 logger.info(
                     "  Resumed fine-tuning from epoch %d (best_acc=%.4f)",
                     start_epoch,
@@ -235,6 +248,8 @@ class FineTuner:
                     "model_state": self.model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict(),
+                    "rng_states": capture_rng_states(),
                     "epoch": epoch,
                     "best_acc": best_acc,
                     "epochs_no_improve": epochs_no_improve,
