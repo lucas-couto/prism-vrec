@@ -126,19 +126,22 @@ importance interactively — useful figures for theses.
 
 ### Parallelism
 
-In the current MVP, Optuna runs **sequentially within each cell**
-(within a `(dataset, model, embedding)` triplet).  Different cells
-are processed back-to-back rather than in parallel.
+Optuna runs **sequentially within each cell** (a
+`(dataset, model, embedding)` triplet) but **cells run in parallel**
+(v2): independent studies are dispatched to a spawn-based worker pool
+(capped at 3 workers — the verified ceiling for concurrent training
+processes on a 24 GB GPU — and sized by the same VRAM heuristic as the
+grid orchestrator). `--sequential` forces one worker.
 
-This is intentional: Bayesian sampling needs the previous trial's
-result to choose the next sample.  Running multiple trials in parallel
-inside the same cell weakens the surrogate signal.
+Keeping trials sequential inside a cell is intentional: Bayesian
+sampling needs the previous trial's result to choose the next sample,
+and parallel trials inside the same study weaken the surrogate signal.
 
-If you need parallelism inside a single cell — e.g. you have multiple
-GPUs and want concurrent trials — set
-`storage: "sqlite:///optuna.db"` and run two pods pointing at the
-same DB; Optuna handles concurrent trials safely via the storage
-backend.
+Set `storage: "sqlite:///optuna.db"` for parallel runs: with in-memory
+storage the completed-cell skip cannot survive a restart (the runner
+logs a warning). Cells whose studies already hold `n_trials` legitimate
+outcomes (COMPLETE + PRUNED) are skipped, so a killed run resumes where
+it stopped.
 
 ---
 

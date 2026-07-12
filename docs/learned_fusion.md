@@ -50,13 +50,15 @@ python main.py --from train       # the recommender picks up the
 
 ## On-disk artefacts
 
-* No ``hybrid_adaptive_gated_<dim>.npy`` is written.
-* Instead, ``data/embeddings/<dataset>/hybrid_adaptive_gated_<dim>.json``
+* No ``hybrid_adaptive_gated_*.npy`` is written.
+* Instead, ``data/embeddings/<dataset>/hybrid_adaptive_gated_<alignment>_D<dim>.json``
   is created — a small sidecar listing the component embeddings the
   trainer must stack.
 * At training time, ``src.fusions.load_embedding`` reads the sidecar,
-  loads each component (e.g. ``resnet50_D128.npy`` and
-  ``vit_b16_D128.npy``), and stacks them into ``(n_items, 2, D)``.
+  loads each component (e.g. ``resnet50.npy`` and ``vit_b16.npy``,
+  native dims), and stacks them into ``(n_items, 2, D)`` — for
+  learned-alignment sidecars it instead returns a ``RaggedSources``
+  concat carrying per-source dims.
 * The recommender (``BaseRecommender``) detects the 3-D buffer in its
   constructor, instantiates the matching online module, and exposes
   ``_resolve_visual(item_ids) -> (B, D)`` so concrete recommenders

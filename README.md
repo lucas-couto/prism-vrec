@@ -218,21 +218,24 @@ extractors_enabled:
   - levit_256
   - clip_vitb32
   - dinov2_vitb14
+  - convnext_base
 
 extractors:
-  resnet50: { ..., role: primary }
-  vit_b16: { ..., role: primary }
-  cvt_13: { ..., role: hybrid }
-  coatnet_0: { ..., role: hybrid }
-  levit_256: { ..., role: hybrid }
-  clip_vitb32: { ..., role: foundation }
-  dinov2_vitb14: { ..., role: foundation }
+  resnet50: { ..., raw_dim: 2048, role: primary }
+  vit_b16: { ..., raw_dim: 768, role: primary }
+  cvt_13: { ..., raw_dim: 384, role: hybrid }
+  coatnet_0: { ..., raw_dim: 768, role: hybrid }
+  levit_256: { ..., raw_dim: 512, role: hybrid }
+  clip_vitb32: { ..., raw_dim: 512, role: foundation }
+  dinov2_vitb14: { ..., raw_dim: 768, role: foundation }
+  convnext_base: { ..., raw_dim: 1024, role: hybrid }
 
 fusion_extractors: ["resnet50", "vit_b16"] # primary pair sent into fusion
-projection_dims: [64, 128, 256] # extractor projection-head outputs
 batch_size: 256 # extraction batch size
 checkpoint_every: 500 # save partial extraction every N batches
 ```
+
+Extraction is **native-dim** (v2 protocol): each extractor saves the backbone's own pooled feature. `raw_dim` is a declaration validated against a probe forward through the real model — a mismatch fails extraction loudly. The learned projection `E` inside each recommender maps the native feature to the shared latent dim (`common.visual_dim` in `recommenders.yaml`).
 
 To ablate an extractor, just remove its name from `extractors_enabled`, its block under `extractors:` stays as catalogue but the pipeline skips it (and the fine-tuning step skips it too).
 
@@ -253,6 +256,17 @@ fusion_strategies_enabled:
   - pca_per_model
 
 normalize_before_fusion: true
+
+# Equal-dim strategies fuse sources with DIFFERENT native dims, so an
+# alignment brings them to a common dimension first (v2 protocol):
+#   learned - per-source Linear(D_i -> dim) co-trained with the
+#             recommender via BPR (analogous to the projection E).
+#   pca     - per-source PCA to dim, fit ONLY on train items.
+# The concatenation family (concat/pca/pca_per_model) ignores this
+# block and operates on native dims.
+alignment:
+  method: learned
+  dim: 128
 
 strategies:
   mean: {}
@@ -276,8 +290,6 @@ strategies:
 # Which recommenders to actually run. Empty / missing = none run.
 recommenders_enabled: ["bpr", "vbpr", "vnpr", "deepstyle", "avbpr"]
 
-embedding_dims: ["D128"] # restrict training to selected dims (use [] for all)
-
 common: # shared by every recommender
   latent_dim: [64, 128]
   learning_rate: [0.001, 0.01]
@@ -288,7 +300,7 @@ common: # shared by every recommender
   early_stopping_patience: 20
   early_stopping_metric: "ndcg@10"
   eval_every_epochs: 10
-  eval_sample_size: null # null = full-ranking validation; integer = sampled
+  eval_sample_size: 2000 # training-time validation user subsample (final eval is always full ranking)
 
 vnpr:
   hidden_layers: [[256, 128], [512, 256, 128]]
@@ -516,8 +528,9 @@ A non-empty list reports schema violations.
 | 5   | **LeViT-256**       | Conv → Transformer (sequential)              | Hybrid     |        512 |
 | 6   | **CLIP ViT-B/32**   | ViT (LAION-2B pretrained)                    | Foundation |        512 |
 | 7   | **DINOv2 ViT-B/14** | ViT (self-supervised)                        | Foundation |        768 |
+| 8   | **ConvNeXt-Base**   | Modernised CNN (ImageNet-22k → 1k)           | Hybrid     |       1024 |
 
-Every extractor has a trainable `Linear → ReLU` projection head whose output dim is set by `projection_dims` in `configs/extractors.yaml` (defaults: `D ∈ {64, 128, 256}`).
+Extraction saves each backbone's **native** pooled feature (v2 protocol) with the backbone's canonical preprocessing, resolved from the library that ships the weights. There is no shared projection head at extraction time: the learned projection `E` inside each recommender maps the native dim to the common latent dim (`common.visual_dim`), trained jointly by the BPR loss. Every artifact carries a `.meta.json` sidecar (backbone, native dim, extraction point, exact weights id, transform recipe) that the loader cross-checks on read. See `docs/protocol_v2.md` for every methodological declaration.
 
 ---
 
@@ -540,6 +553,8 @@ Applied to the primary pair declared in `fusion_extractors` (default: ResNet50 +
 
 Optional L2 normalisation before fusion (`normalize_before_fusion` in `configs/fusion.yaml`).
 
+Because sources keep their native dims in v2, the equal-dim family (1-7 plus `adaptive_gated`) first brings them to a common dimension via the configured `alignment`: `learned` (per-source `Linear(D_i → D)` co-trained with the recommender by BPR) or `pca` (offline per-source PCA, fit only on items with a training interaction). The concatenation family (8-10) operates directly on native dims.
+
 ---
 
 ## 8. Recommender models
@@ -549,13 +564,13 @@ Optional L2 normalisation before fusion (`normalize_before_fusion` in `configs/f
 | **BPR**       | γ_u^T γ_i + β_i                                              | None (CF baseline)  |
 | **VBPR**      | γ_u^T γ_i + α_u^T (W · f_i) + β_i                            | Linear projection   |
 | **VNPR**      | MLP(concat(u, q, v))                                         | Fully neural        |
-| **DeepStyle** | γ_u^T γ_i + s_u^T MLP(f_i) + β_i                             | Learned style space |
+| **DeepStyle** | γ_u^T γ_i + s_u^T (E f_i − c_{cat(i)}) + β_i                 | Style = linear E minus learned category embedding (Liu et al., SIGIR 2017) |
 | **AVBPR**     | γ_u^T γ_i + α_u^T (a ⊙ W · f_i) + β_i, a = softmax(g(W·f_i)) | Attention-weighted  |
 | **ACF**       | p̂_u^T (γ_l + v_l) + β_l, with component- and item-level attention | Component + history attention (Chen et al., SIGIR 2017) |
 
 All trained with BPR loss, Adam optimiser, mixed-precision (FP16 via `torch.amp`), and early stopping on validation NDCG@10.
 
-**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, D)` written as `<extractor>_D<dim>_comp.npy` when `extract_components: true` is set. All eight extractors expose components (`M`: ResNet-50 / ConvNeXt / CoAtNet / CLIP = 49, ViT-B/16 / CvT = 196, LeViT = 16, DINOv2 = 256). ACF's two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
+**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, native_dim)` written as `<extractor>_comp.npy` when `extract_components: true` is set. All eight extractors expose components (`M`: ResNet-50 / ConvNeXt / CoAtNet / CLIP = 49, ViT-B/16 / CvT = 196, LeViT = 16, DINOv2 = 256). ACF's two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
 
 ---
 
@@ -695,7 +710,7 @@ What runs:
 | Extractor                  | `resnet50` only                                        |
 | Fusion                     | `mean` only                                            |
 | Recommenders               | `bpr`, `vbpr`                                          |
-| Projection dim             | `D64` only                                             |
+| Fusion alignment dim       | `learned`, `D32`                                       |
 | Optuna trials per cell     | 1                                                      |
 | Epochs                     | 2                                                      |
 | Condition                  | `frozen` only (skips fine-tuning)                      |
@@ -852,12 +867,12 @@ If you use this framework in your work, please cite the software:
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
   version = {2.0.0},
-  doi     = {10.5281/zenodo.20357510},
-  url     = {https://doi.org/10.5281/zenodo.20357510}
+  doi     = {10.5281/zenodo.21325967},
+  url     = {https://doi.org/10.5281/zenodo.21325967}
 }
 ```
 
-The archived release is available on Zenodo: [10.5281/zenodo.20357510](https://doi.org/10.5281/zenodo.20357510). A companion tool paper is planned and this section will be updated when it is available. See `CITATION.cff` for the canonical software citation metadata.
+The archived v2.0.0 release is available on Zenodo: [10.5281/zenodo.21325967](https://doi.org/10.5281/zenodo.21325967); the concept DOI [10.5281/zenodo.20357510](https://doi.org/10.5281/zenodo.20357510) always resolves to the latest archived version. A companion tool paper is planned and this section will be updated when it is available. See `CITATION.cff` for the canonical software citation metadata.
 
 ### Citing a reported use of the framework
 
