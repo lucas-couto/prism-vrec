@@ -87,9 +87,11 @@ class ACF(BaseRecommender):
 
         self._build_history(train_interactions)
         self._comp_cache: torch.Tensor | None = None
+        self._comp_hidden_cache: torch.Tensor | None = None
 
     def train(self, mode: bool = True) -> ACF:
         self._comp_cache = None
+        self._comp_hidden_cache = None
         return super().train(mode)
 
     def _build_history(self, interactions: dict[int, set[int]]) -> None:
@@ -169,5 +171,62 @@ class ACF(BaseRecommender):
         beta_l = self.item_bias(item_ids).squeeze(-1)
         return (p_hat * r_l).sum(-1) + beta_l
 
+    #: Element budget per evaluation tile (users × items × M × hidden).
+    #: A deterministic constant (no device query) — chunking only bounds
+    #: peak memory, it never changes the scores.  2**27 fp32 ≈ 0.5 GB for
+    #: the dominant ``relu(query + comp_hidden)`` intermediate.
+    _EVAL_TILE_ELEMENTS = 2**27
+
     def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
-        return torch.stack([self.predict(int(uid), item_ids) for uid in user_ids])
+        """Score every (user, item) pair, tiled over users × items.
+
+        Replaces the former per-user Python loop (one GPU→CPU sync per
+        user, ~20k iterations on Tradesy).  The math per user is
+        identical: the user profile ``p_hat`` is computed once per user,
+        and the user-independent attention term ``comp_proj(components)``
+        is computed once per evaluation (cached, invalidated by
+        ``train()``) instead of once per user.  Tiling bounds the
+        ``(U_c, N_c, M, hidden)`` attention intermediate.
+        """
+        n_users_b = user_ids.shape[0]
+        n_items_b = item_ids.shape[0]
+
+        gamma_u = self.user_embedding(user_ids)  # (B, k)
+        p_hat = self._augmented_user(user_ids, gamma_u)  # (B, k)
+
+        comps = self._projected_components(item_ids)  # (N, M, kv)
+        all_items = item_ids.shape[0] == self.n_items
+        if all_items and self._comp_hidden_cache is not None:
+            comp_hidden = self._comp_hidden_cache
+        else:
+            comp_hidden = self.component_attention.precompute_components(comps)
+            if all_items:
+                self._comp_hidden_cache = comp_hidden
+
+        gamma_items = self.item_embedding(item_ids)  # (N, k)
+        beta = self.item_bias(item_ids).squeeze(-1)  # (N,)
+        queries = self.component_attention.user_proj(gamma_u)  # (B, hidden)
+
+        hidden = comp_hidden.shape[-1]
+        users_per_tile = min(n_users_b, 16)
+        items_per_tile = max(
+            1, self._EVAL_TILE_ELEMENTS // (users_per_tile * self.n_components * hidden)
+        )
+
+        out = torch.empty(n_users_b, n_items_b, device=gamma_u.device, dtype=p_hat.dtype)
+        for u_start in range(0, n_users_b, users_per_tile):
+            u_end = min(u_start + users_per_tile, n_users_b)
+            query_tile = queries[u_start:u_end].unsqueeze(1).unsqueeze(2)  # (Uc,1,1,h)
+            p_hat_tile = p_hat[u_start:u_end].unsqueeze(1)  # (Uc,1,k)
+            for i_start in range(0, n_items_b, items_per_tile):
+                i_end = min(i_start + items_per_tile, n_items_b)
+                ch = comp_hidden[i_start:i_end].unsqueeze(0)  # (1,Nc,M,h)
+                energy = self.component_attention.score(torch.relu(query_tile + ch))  # (Uc,Nc,M,1)
+                alpha = torch.softmax(energy, dim=-2)
+                attended = (alpha * comps[i_start:i_end].unsqueeze(0)).sum(dim=-2)  # (Uc,Nc,kv)
+                v_l = self.visual_to_latent(attended)  # (Uc,Nc,k)
+                r_l = gamma_items[i_start:i_end].unsqueeze(0) + v_l
+                out[u_start:u_end, i_start:i_end] = (p_hat_tile * r_l).sum(-1) + beta[
+                    i_start:i_end
+                ].unsqueeze(0)
+        return out

@@ -35,16 +35,33 @@ class ComponentAttention(nn.Module):
         for layer in (self.user_proj, self.comp_proj, self.score):
             _init_linear(layer)
 
-    def forward(self, gamma_u: torch.Tensor, components: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        gamma_u: torch.Tensor,
+        components: torch.Tensor,
+        comp_hidden: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return the attended visual vector ``(..., visual_dim)``.
 
         ``gamma_u`` has shape ``(..., latent_dim)`` and ``components`` has
         shape ``(..., M, visual_dim)`` with matching leading dims.
+
+        ``comp_hidden`` is the optional precomputed ``comp_proj(components)``
+        — this term does NOT depend on the user, so evaluation over many
+        users can compute it once per catalogue instead of once per user
+        (see :meth:`precompute_components`).  Passing it changes nothing
+        numerically: it is the same tensor the un-precomputed path builds.
         """
         query = self.user_proj(gamma_u).unsqueeze(-2)  # (..., 1, hidden)
-        energy = self.score(torch.relu(query + self.comp_proj(components)))  # (..., M, 1)
+        if comp_hidden is None:
+            comp_hidden = self.comp_proj(components)
+        energy = self.score(torch.relu(query + comp_hidden))  # (..., M, 1)
         alpha = torch.softmax(energy, dim=-2)
         return (alpha * components).sum(dim=-2)
+
+    def precompute_components(self, components: torch.Tensor) -> torch.Tensor:
+        """User-independent half of the attention: ``comp_proj(components)``."""
+        return self.comp_proj(components)
 
 
 class ItemAttention(nn.Module):
