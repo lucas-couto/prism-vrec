@@ -115,10 +115,11 @@ def test_resnet50_exposes_49_components() -> None:
     pytest.importorskip("torchvision")
     from src.extractors.resnet import ResNet50Extractor
 
-    extractor = ResNet50Extractor(device="cpu", output_dim=16)
+    extractor = ResNet50Extractor(device="cpu")
     assert extractor.supports_components is True
 
     with torch.no_grad():
         components = extractor._forward_components(torch.randn(2, 3, 224, 224))
 
-    assert components.shape == (2, 49, 16)
+    assert components.shape == (2, 49, extractor.native_dim)
+    assert extractor.native_dim == 2048

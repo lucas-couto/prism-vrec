@@ -1,9 +1,11 @@
 """Per-extractor component-feature shape contract for ACF.
 
-Each component-capable extractor must return ``(N, M, output_dim)`` from
+Each component-capable extractor must return ``(N, M, native_dim)`` from
 ``_forward_components`` (``M`` = spatial cells / patch tokens, confirmed
-per backbone).  Import-guarded and instantiation-based, mirroring
-``tests/test_convnext_extractor.py`` (weights are downloaded on first run).
+per backbone; under the v2 protocol the last dim is the backbone's NATIVE
+dim — the shared projection is gone).  Import-guarded and
+instantiation-based, mirroring ``tests/test_convnext_extractor.py``
+(weights are downloaded on first run).
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-OUTPUT_DIM = 8
 BATCH = 2
 
 # (extractor name, backend module to importorskip, expected component count M)
@@ -29,18 +30,18 @@ CASES = [
 
 @pytest.mark.slow
 @pytest.mark.parametrize(("name", "backend", "expected_m"), CASES)
-def test_component_shape_is_n_m_output_dim(name, backend, expected_m) -> None:
+def test_component_shape_is_n_m_native_dim(name, backend, expected_m) -> None:
     pytest.importorskip(backend)
     from src.extractors.registry import get_extractor_class
 
-    extractor = get_extractor_class(name)(device="cpu", output_dim=OUTPUT_DIM)
+    extractor = get_extractor_class(name)(device="cpu")
     assert extractor.supports_components is True
 
     images = torch.randn(BATCH, 3, 224, 224)
     with torch.no_grad():
         components = extractor._forward_components(images)
 
-    assert components.shape == (BATCH, expected_m, OUTPUT_DIM)
+    assert components.shape == (BATCH, expected_m, extractor.native_dim)
     assert components.dtype == torch.float32
 
 
