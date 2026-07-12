@@ -397,18 +397,84 @@ def fuse_concat(
     return np.concatenate(embeddings, axis=1)
 
 
+def _fit_pca_train_only(
+    matrix: np.ndarray,
+    n_components: int,
+    random_state: int | None,
+    train_items: np.ndarray | None,
+    label: str,
+) -> np.ndarray:
+    """Fit PCA on train-item rows only, transform every row.
+
+    Fitting on the full item matrix would leak information from items
+    that only appear in validation/test interactions into the learned
+    components.  ``train_items`` is the array of item indices with at
+    least one *training* interaction; when ``None`` (e.g. unit tests on
+    synthetic matrices) the fit falls back to all rows with a warning.
+    Logs the cumulative explained variance for the chosen ``k``.
+    """
+    n_components = min(n_components, *matrix.shape)
+    pca = PCA(n_components=n_components, random_state=random_state)
+    if train_items is None:
+        logger.warning(
+            "%s: no train_items provided — PCA fit on ALL rows "
+            "(transductive). Pass train item indices for a train-only fit.",
+            label,
+        )
+        fit_rows = matrix
+    else:
+        fit_rows = matrix[np.asarray(train_items)]
+        n_components = min(n_components, *fit_rows.shape)
+        pca = PCA(n_components=n_components, random_state=random_state)
+    pca.fit(fit_rows)
+    explained = float(np.sum(pca.explained_variance_ratio_))
+    logger.info(
+        "%s: PCA k=%d fit on %d rows, cumulative explained variance %.4f",
+        label,
+        n_components,
+        fit_rows.shape[0],
+        explained,
+    )
+    return pca.transform(matrix)
+
+
+def pca_align(
+    embeddings: list[np.ndarray],
+    dim: int,
+    *,
+    train_items: np.ndarray | None = None,
+    random_state: int | None = 42,
+) -> list[np.ndarray]:
+    """Align sources of differing native dims to *dim* via per-source PCA.
+
+    The PCA alignment used by the element-wise fusion family when
+    ``alignment.method = pca``: each native matrix is independently
+    reduced to ``dim`` (fit on train items only), so equal-dim
+    operations become applicable.  The learned counterpart is
+    :class:`src.fusions.online.LearnedAlignmentFusion`.
+    """
+    return [
+        _fit_pca_train_only(emb, dim, random_state, train_items, f"pca_align[src{i}]")
+        for i, emb in enumerate(embeddings)
+    ]
+
+
 def fuse_pca(
     embeddings: list[np.ndarray],
     normalize: bool = True,
     *,
     n_components: int = 128,
     random_state: int | None = 42,
+    train_items: np.ndarray | None = None,
     **kwargs,
 ) -> np.ndarray:
     """PCA on the concatenation of all embeddings.
 
     First concatenates along the feature axis, then applies PCA to reduce
-    dimensionality to *n_components*.
+    dimensionality to *n_components*.  The PCA is fit ONLY on rows of
+    items with at least one training interaction (``train_items``) and
+    applied to every row — fitting on all items would leak test-item
+    structure into the components.
 
     Parameters
     ----------
@@ -420,6 +486,9 @@ def fuse_pca(
         Number of principal components to keep.
     random_state:
         Seed for reproducibility.
+    train_items:
+        Indices of items appearing in the training split; the PCA fit
+        set.
 
     Returns
     -------
@@ -431,9 +500,7 @@ def fuse_pca(
     embeddings = _maybe_normalize(embeddings, normalize)
     concatenated = np.concatenate(embeddings, axis=1)
 
-    n_components = min(n_components, *concatenated.shape)
-    pca = PCA(n_components=n_components, random_state=random_state)
-    return pca.fit_transform(concatenated)
+    return _fit_pca_train_only(concatenated, n_components, random_state, train_items, "pca")
 
 
 def fuse_pca_per_model(
@@ -442,13 +509,15 @@ def fuse_pca_per_model(
     *,
     n_components: int = 64,
     random_state: int | None = 42,
+    train_items: np.ndarray | None = None,
     **kwargs,
 ) -> np.ndarray:
-    """Separate PCA per source, then concatenate.
+    """Separate PCA per source, then **concatenate**.
 
     Each embedding matrix is independently reduced to *n_components*
-    dimensions via PCA.  The reduced representations are then
-    concatenated, yielding a final dimensionality of
+    dimensions via PCA (fit on train items only, see :func:`fuse_pca`).
+    The reduced representations are then concatenated — NOT combined
+    element-wise — yielding a final dimensionality of
     ``M * n_components``.
 
     Parameters
@@ -461,6 +530,9 @@ def fuse_pca_per_model(
         Number of components to keep per source.
     random_state:
         Seed for reproducibility.
+    train_items:
+        Indices of items appearing in the training split; the PCA fit
+        set.
 
     Returns
     -------
@@ -471,12 +543,10 @@ def fuse_pca_per_model(
     _validate_embeddings(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
 
-    reduced: list[np.ndarray] = []
-    for emb in embeddings:
-        nc = min(n_components, *emb.shape)
-        pca = PCA(n_components=nc, random_state=random_state)
-        reduced.append(pca.fit_transform(emb))
-
+    reduced = [
+        _fit_pca_train_only(emb, n_components, random_state, train_items, f"pca_per_model[src{i}]")
+        for i, emb in enumerate(embeddings)
+    ]
     return np.concatenate(reduced, axis=1)
 
 

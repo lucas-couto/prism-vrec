@@ -3,12 +3,10 @@
 import fcntl
 import hashlib
 import json
-import multiprocessing
-import random
+import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset
 
 from src.evaluation.protocol import Evaluator
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
@@ -50,26 +48,75 @@ def _derive_job_seed(
     return (int(digest, 16) ^ base_seed) & 0x7FFFFFFF
 
 
-class BPRDataset(Dataset):
-    """Dataset yielding BPR triples (user, pos_item, neg_item)."""
+class BPRBatchSampler:
+    """Vectorized in-process BPR triple batching (v2 training protocol).
 
-    def __init__(self, train_interactions: dict, n_items: int):
+    Replaces the former ``Dataset`` + ``DataLoader`` pair whose
+    ``__getitem__`` rejection-sampled ONE negative at a time in pure
+    Python — with ``num_workers=0`` in the parallel regime, every
+    4096-sample batch was generated serially on the CPU, dominating
+    the epoch time of shallow models (efficiency-audit bottleneck #4).
+
+    Per epoch (deterministic given ``(seed, epoch)``): the interaction
+    list is shuffled with a dedicated ``torch.Generator``; negatives are
+    drawn per batch in bulk and collisions with the user's training set
+    are re-drawn vectorized (membership via ``torch.isin`` on the sorted
+    ``user * n_items + item`` key array — a C++ binary search, no Python
+    loop).  This CHANGES the negative-sample sequence relative to v1.x
+    (accepted: the v2 protocol re-runs every battery).
+    """
+
+    def __init__(self, train_interactions: dict, n_items: int, batch_size: int, seed: int):
         self.n_items = n_items
-        self.interactions = []
-        self.user_items = train_interactions
-        for user, items in train_interactions.items():
-            for item in items:
-                self.interactions.append((user, item))
+        self.batch_size = batch_size
+        self.seed = seed
 
-    def __len__(self):
-        return len(self.interactions)
+        users: list[int] = []
+        items: list[int] = []
+        for user, item_set in train_interactions.items():
+            for item in item_set:
+                users.append(user)
+                items.append(item)
+        self.users = torch.tensor(users, dtype=torch.long)
+        self.pos_items = torch.tensor(items, dtype=torch.long)
+        # Sorted composite keys for vectorized membership tests.
+        self._keys = torch.sort(self.users * n_items + self.pos_items).values
 
-    def __getitem__(self, idx):
-        user, pos_item = self.interactions[idx]
-        neg_item = random.randint(0, self.n_items - 1)
-        while neg_item in self.user_items[user]:
-            neg_item = random.randint(0, self.n_items - 1)
-        return user, pos_item, neg_item
+    def __len__(self) -> int:
+        return self.users.shape[0]
+
+    def n_batches(self) -> int:
+        return (len(self) + self.batch_size - 1) // self.batch_size
+
+    def epoch(self, epoch: int):
+        """Yield ``(users, pos, neg)`` batches for *epoch*, deterministically.
+
+        The WHOLE epoch is drawn in one vectorized pass (single shuffle,
+        single bulk negative draw, collision redraws over the shrinking
+        collision set) and then sliced into batches — per-batch tensor-op
+        launch overhead would otherwise dominate at small batch counts.
+        """
+        generator = torch.Generator()
+        generator.manual_seed((self.seed * 1_000_003 + epoch) & 0x7FFF_FFFF_FFFF_FFFF)
+        perm = torch.randperm(len(self), generator=generator)
+
+        users = self.users[perm]
+        pos = self.pos_items[perm]
+        neg = torch.randint(0, self.n_items, (len(self),), generator=generator)
+        user_keys = users * self.n_items
+        collides = torch.isin(user_keys + neg, self._keys)
+        while bool(collides.any()):
+            n_bad = int(collides.sum())
+            redraw = torch.randint(0, self.n_items, (n_bad,), generator=generator)
+            neg[collides] = redraw
+            still = torch.isin(user_keys[collides] + redraw, self._keys)
+            new_collides = torch.zeros_like(collides)
+            new_collides[collides] = still
+            collides = new_collides
+
+        for start in range(0, len(self), self.batch_size):
+            end = start + self.batch_size
+            yield users[start:end], pos[start:end], neg[start:end]
 
 
 def _best_effort_resume_checkpoint(checkpoint_mgr, logger, **kwargs) -> None:
@@ -156,6 +203,7 @@ def train_single_run(
     embedding_name: str,
     device: str,
     optuna_trial=None,
+    item_categories=None,
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -196,11 +244,15 @@ def train_single_run(
     model_config = {**hyperparams, "l2_reg": hyperparams.get("l2_reg", 0.0001)}
 
     # Only models that declare ``wants_history`` accept the
-    # ``train_interactions`` keyword (e.g. ACF item-level attention); every
-    # other recommender keeps the original 4-argument constructor untouched.
+    # ``train_interactions`` keyword (e.g. ACF item-level attention), and
+    # only ``wants_categories`` models (DeepStyle) receive the item→category
+    # index array; every other recommender keeps the original 4-argument
+    # constructor untouched.
     ctor_kwargs: dict = {}
     if getattr(model_cls, "wants_history", False):
         ctor_kwargs["train_interactions"] = train_interactions
+    if getattr(model_cls, "wants_categories", False):
+        ctor_kwargs["item_categories"] = item_categories
 
     model = model_cls(
         n_users=n_users,
@@ -226,22 +278,12 @@ def train_single_run(
         if "rng_states" in ckpt:
             restore_rng_states(ckpt["rng_states"])
 
-    train_dataset = BPRDataset(train_interactions, n_items)
     use_cuda = device != "cpu" and torch.cuda.is_available()
-    is_daemon = getattr(multiprocessing.current_process(), "daemon", False)
-    # Workers are respawned every epoch on purpose: BPRDataset.__getitem__
-    # uses Python's `random` module for negative sampling, and respawning
-    # resets each worker's RNG state so the same epoch always sees the
-    # same sequence of negative samples.  Switching to persistent_workers
-    # would change that sequence and break consistency with previously
-    # completed runs.
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0 if is_daemon else 2,
-        pin_memory=use_cuda,
-    )
+    # In-process vectorized sampler: no DataLoader workers to spawn, no
+    # per-sample Python rejection loop.  Seeded from the job seed so the
+    # negative sequence is deterministic and independent of parallel
+    # execution order (each epoch draws from Generator(seed, epoch)).
+    sampler = BPRBatchSampler(train_interactions, n_items, batch_size, seed=job_seed)
 
     scaler = get_grad_scaler(enabled=use_cuda)
     evaluator = Evaluator(
@@ -263,7 +305,8 @@ def train_single_run(
             total_loss = torch.zeros((), device=loss_device)
             n_batches = 0
 
-            for users, pos_items, neg_items in train_loader:
+            train_t0 = time.perf_counter()
+            for users, pos_items, neg_items in sampler.epoch(epoch):
                 users = users.to(device, non_blocking=True)
                 pos_items = pos_items.to(device, non_blocking=True)
                 neg_items = neg_items.to(device, non_blocking=True)
@@ -281,10 +324,22 @@ def train_single_run(
                 n_batches += 1
 
             avg_loss = (total_loss / max(n_batches, 1)).item()
+            train_seconds = time.perf_counter() - train_t0
             logger.debug("epoch=%d avg_loss=%.6f", epoch, avg_loss)
 
             if (epoch + 1) % eval_every_epochs == 0 or epoch == epochs - 1:
+                eval_t0 = time.perf_counter()
                 metrics = evaluator.evaluate(model, device=device)
+                eval_seconds = time.perf_counter() - eval_t0
+                # Train-vs-eval split per model: the number the efficiency
+                # audit could not answer without instrumentation.
+                logger.info(
+                    "timing model=%s epoch=%d train_s=%.2f eval_s=%.2f",
+                    model_name,
+                    epoch,
+                    train_seconds,
+                    eval_seconds,
+                )
                 current_metric = metrics.get(es_metric, 0.0)
 
                 if current_metric > best_metric:

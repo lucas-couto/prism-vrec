@@ -4,8 +4,6 @@ recommenders_enabled:
   - bpr
   - vbpr
 
-embedding_dims: ["D64"]
-
 common:
   latent_dim: [32]
   learning_rate: [0.01]

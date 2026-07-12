@@ -153,6 +153,11 @@ def evaluation_to_long(
         "metric",
         "k",
         "value",
+        # v2 provenance: evaluation protocol, visual input dim consumed by
+        # the model's E, and trainable-parameter count.
+        "protocol",
+        "visual_input_dim",
+        "n_trainable_params",
     ]
     return melted.loc[:, [c for c in keep if c in melted.columns]]
 

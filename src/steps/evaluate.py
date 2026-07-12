@@ -219,10 +219,18 @@ def _evaluate_cell(
         logger.warning("    Legacy checkpoint (no hyperparams): %s", model_info["path"])
 
     # History-consuming models (ACF) need the pure-train interactions at
-    # construction; other models keep the original 4-argument constructor.
+    # construction; category-consuming models (DeepStyle) need the item→
+    # category index array; other models keep the 4-argument constructor.
     ctor_kwargs: dict = {}
     if getattr(model_cls, "wants_history", False):
         ctor_kwargs["train_interactions"] = train_interactions
+    if getattr(model_cls, "wants_categories", False):
+        from src.data.categories import item_category_array
+
+        config_paths = load_config()["paths"]
+        ctor_kwargs["item_categories"] = item_category_array(
+            dataset_name, config_paths["data_processed"]
+        )
 
     model = model_cls(
         n_users=n_users,
@@ -232,7 +240,19 @@ def _evaluate_cell(
         **ctor_kwargs,
     ).to(device)
     model.load_state_dict(state_dict)
-    return evaluator.evaluate_per_user(model, device=device)
+    per_user = evaluator.evaluate_per_user(model, device=device)
+
+    # Provenance columns required by the v2 protocol: every recorded
+    # result must say which evaluation protocol produced it, the visual
+    # input dimensionality the model consumed, and the trainable-param
+    # count (E scales with the backbone's native dim — an expected
+    # second-order effect that must be reported, not hidden).
+    n_trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    return per_user.assign(
+        protocol=evaluator.protocol,
+        visual_input_dim=int(getattr(model, "visual_dim_raw", 0)),
+        n_trainable_params=n_trainable,
+    )
 
 
 def run(condition: str = "frozen") -> None:

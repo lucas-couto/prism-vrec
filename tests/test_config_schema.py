@@ -126,9 +126,14 @@ def test_inverted_step_range_raises() -> None:
     assert "cannot come after" in str(excinfo.value)
 
 
-def test_negative_projection_dim_raises() -> None:
+def test_invalid_alignment_method_raises() -> None:
     with pytest.raises(ValidationError):
-        validate_config({**_minimal(), "projection_dims": [64, -1, 256]})
+        validate_config({**_minimal(), "alignment": {"method": "magic", "dim": 128}})
+
+
+def test_negative_alignment_dim_raises() -> None:
+    with pytest.raises(ValidationError):
+        validate_config({**_minimal(), "alignment": {"method": "pca", "dim": -1}})
 
 
 def test_finetuning_invalid_lr_raises() -> None:

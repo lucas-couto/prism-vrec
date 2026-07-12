@@ -22,6 +22,20 @@ fusion_strategies_enabled:
 # L2-normalise before fusion
 normalize_before_fusion: true
 
+# Alignment for the equal-dim strategy family (mean/sum/prod/max_pool/
+# weighted_mean/attention_weighted/gated/adaptive_gated). The fusion
+# sources keep their NATIVE dims (resnet50=2048, vit_b16=768), so these
+# strategies need the sources brought to a common dimension first. The
+# alignment method is itself an experimental variable:
+#   learned - per-source Linear(D_i -> dim) co-trained with the
+#             recommender via BPR (analogous to the projection E).
+#   pca     - per-source PCA to dim, fit ONLY on train items.
+# The concatenation family (concat/pca/pca_per_model) ignores this
+# block and operates on native dims.
+alignment:
+  method: learned
+  dim: 128
+
 strategies:
   # Strategies that require equal dims
   mean: {}

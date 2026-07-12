@@ -242,6 +242,19 @@ class HpSpaceEntry(BaseModel):
         return self
 
 
+class AlignmentConfig(BaseModel):
+    """Dimensionality alignment for equal-dim fusion strategies (v2).
+
+    ``learned`` — per-source projections co-trained with the recommender
+    via BPR.  ``pca`` — offline per-source PCA (fit on train items only).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["learned", "pca"] = "learned"
+    dim: int = Field(128, ge=1)
+
+
 class CommonTrainingConfig(BaseModel):
     """Shared recommender-training block (``common:`` in recommenders.yaml).
 
@@ -301,16 +314,8 @@ class FrameworkConfig(BaseModel):
     extractors_enabled: list[str] = Field(default_factory=list)
     extractors: dict[str, dict[str, Any]] = Field(default_factory=dict)
     fusion_extractors: list[str] = Field(default_factory=list)
-    projection_dims: list[int] = Field(default_factory=lambda: [64, 128, 256])
     batch_size: int = Field(256, ge=1)
     checkpoint_every: int = Field(500, ge=1)
-
-    @field_validator("projection_dims")
-    @classmethod
-    def _projection_dims_positive(cls, value: list[int]) -> list[int]:
-        if not all(isinstance(d, int) and d > 0 for d in value):
-            raise ValueError("projection_dims must be a list of positive integers.")
-        return value
 
     @field_validator("seeds")
     @classmethod
@@ -330,6 +335,7 @@ class FrameworkConfig(BaseModel):
     fusion: dict[str, Any] = Field(default_factory=dict)
     strategies: dict[str, Any] | None = None
     normalize_before_fusion: bool = True
+    alignment: AlignmentConfig = Field(default_factory=lambda: AlignmentConfig())
 
     recommenders_enabled: list[str] = Field(default_factory=list)
     common: CommonTrainingConfig = Field(default_factory=CommonTrainingConfig)

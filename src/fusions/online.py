@@ -37,8 +37,149 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+
+
+class RaggedSources(np.ndarray):
+    """Concatenated native sources ``(n_items, sum(D_i))`` + metadata.
+
+    Produced by :func:`load_embedding` for learned-alignment fusion
+    sidecars.  The array itself is the axis-1 concatenation of the M
+    native source matrices; the attached attributes let the recommender
+    build a :class:`LearnedAlignmentFusion` that splits, projects and
+    combines them at every forward pass:
+
+    * ``source_dims`` — the native dim of each source, in concat order.
+    * ``strategy`` — the element-wise fusion op to apply after
+      projection (``mean``/``sum``/.../``adaptive_gated``).
+    * ``aligned_dim`` — the target dimension D of the learned alignment.
+    * ``normalize`` — whether projected sources are L2-normalised
+      before the op (mirrors ``normalize_before_fusion``).
+    * ``fusion_kwargs`` — strategy hyperparameters (e.g. fixed
+      ``weights`` for weighted_mean).
+    """
+
+    def __new__(
+        cls,
+        arr: np.ndarray,
+        *,
+        source_dims: list[int],
+        strategy: str,
+        aligned_dim: int,
+        normalize: bool = True,
+        fusion_kwargs: dict | None = None,
+    ) -> RaggedSources:
+        obj = np.asarray(arr).view(cls)
+        obj.source_dims = list(source_dims)
+        obj.strategy = str(strategy)
+        obj.aligned_dim = int(aligned_dim)
+        obj.normalize = bool(normalize)
+        obj.fusion_kwargs = dict(fusion_kwargs or {})
+        return obj
+
+    def __array_finalize__(self, obj) -> None:
+        if obj is None:
+            return
+        self.source_dims = getattr(obj, "source_dims", [])
+        self.strategy = getattr(obj, "strategy", "")
+        self.aligned_dim = getattr(obj, "aligned_dim", 0)
+        self.normalize = getattr(obj, "normalize", True)
+        self.fusion_kwargs = getattr(obj, "fusion_kwargs", {})
+
+
+class LearnedAlignmentFusion(nn.Module):
+    """Learned alignment + element-wise fusion of differing-dim sources.
+
+    The v2 fusion analogue of the recommender's projection ``E``: each
+    native source (e.g. ResNet-50 2048-d, ViT-B/16 768-d) gets its own
+    learned ``Linear(D_i -> D)`` trained jointly with the recommender by
+    the BPR loss; the configured element-wise op then combines the
+    aligned sources.  This is the ``alignment.method = learned`` path;
+    the non-supervised counterpart is offline
+    :func:`src.fusions.strategies.pca_align`.
+
+    Supported ops mirror the offline equal-dim family: ``mean``,
+    ``sum``, ``prod``, ``max_pool``, ``weighted_mean`` (fixed weights
+    from config), ``attention_weighted`` (softmax over learnable
+    logits), ``gated`` (normalised sigmoids over learnable logits) and
+    ``adaptive_gated`` (per-item gate MLP; 2 sources only).
+    """
+
+    _SIMPLE_OPS = ("mean", "sum", "prod", "max_pool")
+    _LOGIT_OPS = ("attention_weighted", "gated")
+
+    def __init__(
+        self,
+        source_dims: list[int],
+        dim: int,
+        strategy: str = "mean",
+        *,
+        normalize: bool = True,
+        weights: list[float] | None = None,
+    ) -> None:
+        super().__init__()
+        if not source_dims:
+            raise ValueError("LearnedAlignmentFusion needs at least 1 source.")
+        self.source_dims = list(source_dims)
+        self.strategy = strategy
+        self.normalize = normalize
+        self.projections = nn.ModuleList(nn.Linear(d, dim) for d in source_dims)
+        for proj in self.projections:
+            nn.init.xavier_uniform_(proj.weight)
+            nn.init.zeros_(proj.bias)
+
+        m = len(source_dims)
+        if strategy == "weighted_mean":
+            w = weights if weights is not None else [1.0 / m] * m
+            if len(w) != m:
+                raise ValueError(f"weighted_mean needs {m} weights, got {len(w)}.")
+            total = float(sum(w))
+            self.register_buffer("fixed_weights", torch.tensor([x / total for x in w]))
+        elif strategy in self._LOGIT_OPS:
+            # Uniform at init (logits 0), co-trained with the recommender.
+            self.logits = nn.Parameter(torch.zeros(m))
+        elif strategy == "adaptive_gated":
+            if m != 2:
+                raise ValueError("adaptive_gated supports exactly 2 sources.")
+            self.gate = AdaptiveGatedFusion(dim=dim)
+        elif strategy not in self._SIMPLE_OPS:
+            raise ValueError(f"Unknown learned-alignment fusion op: {strategy!r}.")
+
+    def _aligned(self, concat: torch.Tensor) -> list[torch.Tensor]:
+        parts = torch.split(concat, self.source_dims, dim=-1)
+        aligned = [proj(part) for proj, part in zip(self.projections, parts, strict=True)]
+        if self.normalize:
+            aligned = [nn.functional.normalize(a, p=2, dim=-1, eps=1e-12) for a in aligned]
+        return aligned
+
+    def forward(self, concat: torch.Tensor) -> torch.Tensor:
+        aligned = self._aligned(concat)
+
+        if self.strategy == "adaptive_gated":
+            return self.gate(aligned[0], aligned[1])
+
+        stacked = torch.stack(aligned, dim=0)  # (M, B, D)
+        if self.strategy == "mean":
+            return stacked.mean(dim=0)
+        if self.strategy == "sum":
+            return stacked.sum(dim=0)
+        if self.strategy == "prod":
+            return stacked.prod(dim=0)
+        if self.strategy == "max_pool":
+            return stacked.max(dim=0).values
+        if self.strategy == "weighted_mean":
+            w = self.fixed_weights.view(-1, 1, 1)
+            return (stacked * w).sum(dim=0)
+        if self.strategy == "attention_weighted":
+            alphas = torch.softmax(self.logits, dim=0).view(-1, 1, 1)
+            return (stacked * alphas).sum(dim=0)
+        if self.strategy == "gated":
+            gates = torch.sigmoid(self.logits)
+            gates = (gates / gates.sum()).view(-1, 1, 1)
+            return (stacked * gates).sum(dim=0)
+        raise RuntimeError(f"unreachable op {self.strategy!r}")
 
 
 class AdaptiveGatedFusion(nn.Module):
@@ -200,35 +341,101 @@ def load_embedding(path: str | Path):
     if p.suffix == ".json":
         sidecar = json.loads(p.read_text(encoding="utf-8"))
         components = sidecar.get("components") or []
-        if len(components) < 2:
+        if not components:
             raise ValueError(
-                f"online sidecar {p} has fewer than 2 components "
-                f"(got {len(components)}); cannot stack.",
+                f"online sidecar {p} lists no components; cannot stack.",
+            )
+        if len(components) == 1:
+            # Degenerate but well-defined: a single-source fusion (e.g. the
+            # smoke profile) reduces to one learned projection / an M=1
+            # stack. Real grids always fuse >= 2 sources.
+            from src.utils.logging import get_logger
+
+            get_logger(__name__).warning(
+                "online sidecar %s has a single component (%s); "
+                "fusion degenerates to a passthrough of that source.",
+                p,
+                components[0],
             )
         loaded = []
-        first_shape = None
         for fname in components:
             comp_path = p.parent / fname
             if not comp_path.exists():
                 raise FileNotFoundError(
                     f"sidecar {p} references missing component {comp_path}",
                 )
-            arr = np.load(comp_path)
-            if first_shape is None:
-                first_shape = arr.shape
-            elif arr.shape != first_shape:
+            loaded.append(np.load(comp_path))
+
+        if sidecar.get("alignment") == "learned":
+            # Native sources with differing dims: concatenate along the
+            # feature axis and attach the metadata the recommender needs
+            # to build a LearnedAlignmentFusion (per-source learned
+            # projections co-trained via BPR).
+            n_rows = {arr.shape[0] for arr in loaded}
+            if len(n_rows) != 1:
+                raise ValueError(
+                    f"sidecar {p}: components disagree on n_items ({sorted(n_rows)}).",
+                )
+            return RaggedSources(
+                np.concatenate(loaded, axis=1),
+                source_dims=[int(arr.shape[1]) for arr in loaded],
+                strategy=sidecar["strategy"],
+                aligned_dim=int(sidecar["dim"]),
+                normalize=bool(sidecar.get("normalize", True)),
+                fusion_kwargs=sidecar.get("fusion_kwargs") or {},
+            )
+
+        first_shape = loaded[0].shape
+        for fname, arr in zip(components, loaded, strict=True):
+            if arr.shape != first_shape:
                 raise ValueError(
                     f"sidecar {p}: component {fname} has shape "
                     f"{arr.shape}, expected {first_shape}.",
                 )
-            loaded.append(arr)
         return np.stack(loaded, axis=1)  # (n_items, M, D)
 
-    return np.load(p)
+    arr = np.load(p)
+    _validate_against_meta(p, arr)
+    return arr
+
+
+def _validate_against_meta(npy_path, arr) -> None:
+    """Cross-check a feature file against its ``.meta.json`` sidecar.
+
+    Fails loudly when the loaded array does not correspond to the
+    backbone declared in the metadata (wrong native_dim or a stem/name
+    mismatch) — the exact silent-mixup the sidecar exists to prevent.
+    Files without a sidecar (fusion outputs, legacy artifacts) pass.
+    """
+    import json
+
+    meta_path = npy_path.with_suffix("").with_suffix(".meta.json")
+    if not meta_path.exists():
+        return
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    declared_dim = meta.get("native_dim")
+    if declared_dim is not None and arr.shape[-1] != int(declared_dim):
+        raise ValueError(
+            f"{npy_path}: array last dim is {arr.shape[-1]} but its "
+            f"metadata declares native_dim={declared_dim} "
+            f"(extractor={meta.get('name')}). The features on disk do not "
+            "match the backbone they claim to be — re-extract."
+        )
+    declared_name = meta.get("name")
+    if declared_name is not None and npy_path.stem not in {
+        declared_name,
+        f"{declared_name}_comp",
+    }:
+        raise ValueError(
+            f"{npy_path}: file stem {npy_path.stem!r} does not match the "
+            f"extractor name {declared_name!r} declared in {meta_path.name}."
+        )
 
 
 __all__ = [
     "AdaptiveGatedFusion",
+    "LearnedAlignmentFusion",
+    "RaggedSources",
     "load_embedding",
     "online_module_for",
 ]

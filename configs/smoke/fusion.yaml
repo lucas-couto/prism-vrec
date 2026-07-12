@@ -8,3 +8,7 @@ normalize_before_fusion: true
 
 strategies:
   mean: {}
+
+alignment:
+  method: learned
+  dim: 32

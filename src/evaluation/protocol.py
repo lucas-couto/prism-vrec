@@ -234,7 +234,14 @@ class Evaluator:
                 if idx is not None:
                     batch_scores[i].index_fill_(0, idx, neg_inf)
 
-            top_indices = batch_scores.topk(self.max_k, dim=1).indices  # (B, K)
+            # Stable descending sort instead of topk: torch.topk's tie
+            # order is backend-dependent (CPU vs GPU can rank tied items
+            # differently), which breaks reproducibility across devices.
+            # A stable sort guarantees the unified rule used by every
+            # evaluation path: ties broken by LOWER item index.
+            top_indices = torch.sort(batch_scores, dim=1, descending=True, stable=True).indices[
+                :, : self.max_k
+            ]  # (B, K)
             top_indices_np = top_indices.cpu().numpy()
 
             for i, user_id in enumerate(batch_user_ids):
@@ -300,9 +307,13 @@ class Evaluator:
             else:
                 scores_np = np.asarray(scores)
 
-            order = np.argsort(-scores_np)
+            # Unified deterministic tie-break: ties by LOWER catalogue
+            # item id.  Breaking ties by pool position would favour the
+            # positives (listed first in the pool) and inflate metrics.
+            pool_ids = np.asarray(pool)
+            order = np.lexsort((pool_ids, -scores_np))
             top_k = order[: self.max_k]
-            ranked_list = [pool[i] for i in top_k]
+            ranked_list = pool_ids[top_k].tolist()
 
             user_metrics = compute_all_metrics(ranked_list, positives, self.k_values)
             user_metrics["user_id"] = user_id
@@ -347,10 +358,12 @@ class Evaluator:
             train_idx = np.array(list(train_items), dtype=np.int64)
             user_scores[train_idx] = -np.inf
 
-        top_k_indices = np.argpartition(-user_scores, self.max_k)[: self.max_k]
-        top_k_scores = user_scores[top_k_indices]
-        sorted_order = np.argsort(-top_k_scores)
-        ranked_list = top_k_indices[sorted_order].tolist()
+        # Stable full sort instead of argpartition: partition boundaries
+        # split tied scores arbitrarily, so tied items could enter or
+        # miss the top-k nondeterministically.  Stable sort implements
+        # the unified rule (ties broken by lower item index) shared with
+        # the batched and sampled paths.
+        ranked_list = np.argsort(-user_scores, kind="stable")[: self.max_k].tolist()
 
         ground_truth = self.test_interactions[user_id]
         user_metrics = compute_all_metrics(ranked_list, ground_truth, self.k_values)

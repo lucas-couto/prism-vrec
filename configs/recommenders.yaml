@@ -11,10 +11,6 @@ recommenders_enabled:
   - deepstyle
   - avbpr
 
-# Filter embeddings by dimension suffix (e.g. ["D128"] or ["D64", "D128"])
-# Empty list or omitted = use all available embeddings
-embedding_dims: ["D128"]
-
 common:
   latent_dim: [64, 128]
   learning_rate: [0.001, 0.01]
@@ -32,11 +28,17 @@ common:
   # metric across all models.
   eval_every_epochs: 10
 
-  # Optional subset-size for validation-set evaluation. Kept null so that
-  # hyperparameter selection is performed on the full validation set,
-  # consistent with the protocol used for bpr and vbpr. Set to an integer
-  # only when explicitly accepting faster-but-approximate grid search.
-  eval_sample_size: null
+  # Subset of test users scored during TRAINING-TIME validation (early
+  # stopping + Optuna pruning) — v2 protocol, B6. 2000 users keeps the
+  # per-validation standard error of ndcg@10 well below the
+  # between-configuration gaps that drive model selection, while cutting
+  # validation cost by ~an order of magnitude on the larger datasets.
+  # The subset is drawn once, deterministically (seed = global seed) and
+  # is IDENTICAL across every model/embedding/trial of a dataset, so
+  # selection stays a paired comparison. Final reported metrics are NOT
+  # affected: the evaluate step always ranks the full test set
+  # (src/steps/evaluate.py constructs its Evaluator without sample_size).
+  eval_sample_size: 2000
 
 vnpr:
   hidden_layers: [[256, 128], [512, 256, 128]]

@@ -16,7 +16,7 @@ def extractor():
     pytest.importorskip("timm")
     from src.extractors.convnext import ConvNeXtExtractor
 
-    return ConvNeXtExtractor(device="cpu", output_dim=64)
+    return ConvNeXtExtractor(device="cpu")
 
 
 def test_convnext_is_a_base_extractor():
@@ -39,7 +39,8 @@ def test_convnext_extract_returns_correct_shape(extractor):
     embedding = extractor.extract(image)
 
     assert isinstance(embedding, np.ndarray)
-    assert embedding.shape == (64,)
+    assert embedding.shape == (extractor.native_dim,)
+    assert extractor.native_dim == 1024
     assert embedding.dtype == np.float32
 
 

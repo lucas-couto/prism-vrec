@@ -2,13 +2,22 @@ import timm
 import torch
 import torch.nn as nn
 
-from src.extractors.base import BaseExtractor
+from src.extractors.base import BaseExtractor, timm_canonical_transform
 
 
 class _LeViTBackbone(nn.Module):
-    """LeViT-256 backbone followed by a trainable projection."""
+    """LeViT-256 backbone, frozen, native 512-d output.
 
-    def __init__(self, output_dim: int):
+    The "256" in the model name is the width of the FIRST stage, not the
+    final feature size — the pooled output is 512-d (read from the model
+    at probe time, never hardcoded).
+
+    ``projection`` defaults to identity so extraction emits the native
+    pooled feature; the fine-tuner replaces it with a classification
+    head.
+    """
+
+    def __init__(self):
         super().__init__()
 
         # num_classes=0 removes the classification head
@@ -16,18 +25,13 @@ class _LeViTBackbone(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # LeViT-256 output dim = 512
-        self.projection = nn.Sequential(
-            nn.Linear(512, output_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.projection = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(x)
-        return self.projection(x)
+        return self.projection(self.backbone(x))
 
     def forward_components(self, x: torch.Tensor) -> torch.Tensor:
-        """Return projected final-stage tokens ``(B, M, output_dim)``."""
+        """Return native final-stage tokens ``(B, M, 512)``."""
         feat = self.backbone.forward_features(x)  # (B, N, 512) or (B, C, H, W)
         if feat.dim() == 4:
             feat = feat.flatten(2).transpose(1, 2)
@@ -35,7 +39,7 @@ class _LeViTBackbone(nn.Module):
 
 
 class LeViTExtractor(BaseExtractor):
-    """Visual feature extractor based on LeViT-256.
+    """Visual feature extractor based on LeViT-256 (native 512-d).
 
     LeViT uses initial convolutional stages followed by Transformer
     blocks in a sequential architecture optimized for fast inference.
@@ -44,8 +48,6 @@ class LeViTExtractor(BaseExtractor):
     ----------
     device : str
         Device to run inference on.
-    output_dim : int
-        Dimensionality of the output embedding.
     """
 
     unfreeze_prefixes = ["backbone.stages.2"]
@@ -54,3 +56,10 @@ class LeViTExtractor(BaseExtractor):
     supports_components = True
 
     backbone_cls = _LeViTBackbone
+    extraction_point = "pooled final-stage tokens (timm num_classes=0)"
+    weights_id = "timm levit_256.fb_dist_in1k"
+
+    def _build_transform(self):
+        # Canonical recipe resolved from the checkpoint's pretrained
+        # config (crop_pct 0.9, bicubic, ImageNet norm).
+        return timm_canonical_transform(self.model.backbone)

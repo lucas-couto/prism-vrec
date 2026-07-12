@@ -145,10 +145,16 @@ class FineTuningEvaluator:
         _, val_cats = CategoryDataset.stratified_split(categories, seed=split_seed)
 
         extractor_cls = get_extractor_class(self.extractor_name)
-        extractor = extractor_cls(device=str(self.device), output_dim=in_features)
+        extractor = extractor_cls(device=str(self.device))
+        if extractor.native_dim != in_features:
+            raise RuntimeError(
+                f"{self.extractor_name}: checkpoint metadata says in_features="
+                f"{in_features} but the rebuilt extractor's native_dim is "
+                f"{extractor.native_dim}; the backbone drifted since training."
+            )
         model = extractor.model
-        # Replace the freshly-built projection with a classification head
-        # that matches the saved one before loading weights.
+        # Replace the identity projection with a classification head that
+        # matches the saved one before loading weights.
         model.projection = nn.Linear(in_features, n_classes).to(self.device)
 
         full_state = dict(backbone_state)

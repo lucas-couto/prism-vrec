@@ -6,9 +6,14 @@ from src.extractors.base import BaseExtractor
 
 
 class _ResNet50Backbone(nn.Module):
-    """ResNet-50 backbone (up to avgpool) followed by a trainable projection."""
+    """ResNet-50 backbone (up to avgpool), frozen, native 2048-d output.
 
-    def __init__(self, output_dim: int):
+    ``projection`` defaults to identity so extraction emits the native
+    pooled feature; the fine-tuner replaces it with a classification
+    head.
+    """
+
+    def __init__(self):
         super().__init__()
 
         backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
@@ -27,10 +32,7 @@ class _ResNet50Backbone(nn.Module):
             backbone.avgpool,
         )
 
-        self.projection = nn.Sequential(
-            nn.Linear(2048, output_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.projection = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
@@ -38,11 +40,10 @@ class _ResNet50Backbone(nn.Module):
         return self.projection(x)
 
     def forward_components(self, x: torch.Tensor) -> torch.Tensor:
-        """Return per-cell projected features ``(B, H*W, output_dim)``.
+        """Return native per-cell features ``(B, H*W, 2048)``.
 
         Uses the conv5 spatial map (``2048×7×7`` for 224² input, i.e.
-        ``M=49`` components) before the global average pool, projected
-        through the same trainable ``projection`` as the pooled path.
+        ``M=49`` components) before the global average pool.
         """
         x = self.features[:-1](x)  # drop avgpool -> (B, 2048, H, W)
         x = x.flatten(2).transpose(1, 2)  # (B, H*W, 2048)
@@ -50,18 +51,16 @@ class _ResNet50Backbone(nn.Module):
 
 
 class ResNet50Extractor(BaseExtractor):
-    """Visual feature extractor based on ResNet-50.
+    """Visual feature extractor based on ResNet-50 (native 2048-d).
 
     Uses ``torchvision.models.resnet50`` with ImageNet-V2 weights.  The
-    classification head is removed and a trainable ``Linear + ReLU``
-    projection maps the 2048-dim pooled features to ``output_dim``.
+    classification head is removed; the saved feature is the native
+    pooled output (2048-d).
 
     Parameters
     ----------
     device : str
         Device to run inference on (e.g. ``"cuda"`` or ``"cpu"``).
-    output_dim : int
-        Dimensionality of the output embedding.
     """
 
     # ``layer4`` (the last ResNet block) is unfrozen during fine-tuning.
@@ -71,3 +70,11 @@ class ResNet50Extractor(BaseExtractor):
     supports_components = True
 
     backbone_cls = _ResNet50Backbone
+    extraction_point = "global average pool (after layer4)"
+    weights_id = "torchvision resnet50 IMAGENET1K_V2"
+
+    def _build_transform(self):
+        # Canonical recipe shipped with the weights (IMAGENET1K_V2):
+        # resize 232 -> center-crop 224, bilinear, ImageNet norm.  Read
+        # from the weights object, never hand-written.
+        return ResNet50_Weights.IMAGENET1K_V2.transforms()
