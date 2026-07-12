@@ -1,9 +1,9 @@
-# Configuração das estratégias de fusão
+# Fusion strategy configuration.
 #
-# `fusion_strategies_enabled` controla quais estratégias rodam neste
-# experimento. Lista vazia ou ausente = nenhuma fusão roda. Para
-# desativar uma estratégia basta removê-la desta lista (a definição em
-# `strategies:` continua como catálogo). Nomes válidos: mean, sum, prod,
+# `fusion_strategies_enabled` controls which strategies run in this
+# experiment. An empty or absent list = no fusion runs. To disable a
+# strategy just remove it from this list (its definition under
+# `strategies:` stays as a catalogue). Valid names: mean, sum, prod,
 # max_pool, weighted_mean, attention_weighted, gated, concat, pca,
 # pca_per_model, adaptive_gated.
 fusion_strategies_enabled:
@@ -19,11 +19,11 @@ fusion_strategies_enabled:
   - pca_per_model
   - adaptive_gated
 
-# Normalizar L2 antes da fusão
+# L2-normalise before fusion
 normalize_before_fusion: true
 
 strategies:
-  # Estratégias que requerem dims iguais
+  # Strategies that require equal dims
   mean: {}
   sum: {}
   prod: {}
@@ -39,7 +39,7 @@ strategies:
 
   gated: {}
 
-  # Estratégias que aceitam dims diferentes
+  # Strategies that accept differing dims
   concat: {}
 
   pca:

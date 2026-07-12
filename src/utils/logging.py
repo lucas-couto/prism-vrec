@@ -15,9 +15,10 @@ Layout under ``logs/``::
     └── ...
 
 The unified file is created lazily on the first :func:`get_logger`
-call.  Override the timestamp with the ``HVR_RUN_ID`` env var when
-launching the pipeline if you want a stable name (handy when
-mounting the log directory from outside the container/pod).
+call.  Override the timestamp with the ``PRISM_RUN_ID`` env var (the
+legacy ``HVR_RUN_ID`` still works) when launching the pipeline if you
+want a stable name (handy when mounting the log directory from outside
+the container/pod).
 """
 
 from __future__ import annotations
@@ -41,9 +42,10 @@ _SESSION_LOG_PATH: Path | None = None
 def _resolve_session_log_path(log_dir: Path) -> Path:
     """Return the unified-session-log path, creating its directory.
 
-    The filename is ``run_<HVR_RUN_ID or UTC timestamp>.log``; supplying
-    ``HVR_RUN_ID`` from outside the process keeps the name stable
+    The filename is ``run_<PRISM_RUN_ID or UTC timestamp>.log``; supplying
+    ``PRISM_RUN_ID`` from outside the process keeps the name stable
     across forks (useful when the orchestrator launches sub-processes).
+    The legacy ``HVR_RUN_ID`` name is still honoured.
     """
     global _SESSION_LOG_PATH
     if _SESSION_LOG_PATH is not None:
@@ -51,11 +53,15 @@ def _resolve_session_log_path(log_dir: Path) -> Path:
 
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    run_id = os.environ.get("HVR_RUN_ID")
+    # Prefer the PRISM_ prefix; fall back to the legacy HVR_ name so
+    # existing pod/orchestrator scripts keep working.
+    run_id = os.environ.get("PRISM_RUN_ID") or os.environ.get("HVR_RUN_ID")
     if not run_id:
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        # Persist for child processes so they share the same log file.
-        os.environ["HVR_RUN_ID"] = run_id
+    # Persist under both names so child processes share the same log file
+    # regardless of which variable they read.
+    os.environ["PRISM_RUN_ID"] = run_id
+    os.environ["HVR_RUN_ID"] = run_id
 
     _SESSION_LOG_PATH = log_dir / f"run_{run_id}.log"
     return _SESSION_LOG_PATH

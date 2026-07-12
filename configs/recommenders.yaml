@@ -1,9 +1,9 @@
-# Configuração dos modelos de recomendação
+# Recommender model configuration.
 #
-# `recommenders_enabled` controla quais recomendadores rodam neste
-# experimento. Lista vazia ou ausente = nenhum recomendador roda. Para
-# desativar um modelo basta removê-lo desta lista. Nomes válidos: bpr,
-# vbpr, vnpr, deepstyle, avbpr, acf.
+# `recommenders_enabled` controls which recommenders run in this
+# experiment. An empty or absent list = no recommender runs. To disable
+# a model just remove it from this list. Valid names: bpr, vbpr, vnpr,
+# deepstyle, avbpr, acf.
 recommenders_enabled:
   - bpr
   - vbpr
@@ -19,7 +19,7 @@ common:
   latent_dim: [64, 128]
   learning_rate: [0.001, 0.01]
   l2_reg: [0.0001, 0.001]
-  visual_dim: [64, 128]  # D (dimensão da projeção visual)
+  visual_dim: [64, 128]  # D (visual projection dimension)
   epochs: 100
   batch_size: 4096
   early_stopping_patience: 20
