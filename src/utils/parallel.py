@@ -7,6 +7,7 @@ the pool accordingly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -62,8 +63,13 @@ class TrainingJob:
 
     @property
     def job_id(self) -> str:
-        hp_hash = hash(json.dumps(self.hyperparams, sort_keys=True)) & 0xFFFFFF
-        return f"{self.dataset_name}_{self.embedding_name}_{self.model_name}_{hp_hash:06x}"
+        # hashlib, not hash(): built-in str hashing is salted per process
+        # (PYTHONHASHSEED), so spawned workers would compute a different id
+        # than the parent and OOM-retry matching would silently never fire.
+        digest = hashlib.md5(
+            json.dumps(self.hyperparams, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return f"{self.dataset_name}_{self.embedding_name}_{self.model_name}_{digest[:6]}"
 
 
 def detect_max_workers(device: str = "cuda") -> int:
