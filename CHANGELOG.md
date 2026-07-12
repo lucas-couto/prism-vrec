@@ -8,6 +8,126 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-12
+
+**Breaking: new experimental protocol.** Every 1.x embedding, checkpoint
+and result table is incompatible and must be regenerated. 1.x results
+remain traceable via the ``v1.1.2`` tag and the Zenodo archive.
+
+### Changed (protocol)
+
+- **Native dimensionality at extraction (Mudanca 1).** Extractors now
+  save the backbone's native pooled feature (ResNet-50 2048, ConvNeXt
+  1024, ViT-B/16 / CoAtNet-0 / DINOv2 768, LeViT-256 / CLIP 512, CvT-13
+  384). The v1.x shared ``Linear+ReLU`` projection - which in the frozen
+  condition was an **untrained seeded random projection** - is gone; the
+  learned projection ``E`` inside each recommender (which already
+  existed) maps native -> ``d`` (``common.visual_dim``), trained by BPR
+  with the backbone frozen. Native dims are read from the model via a
+  probe forward, validated against ``configs/extractors.yaml``
+  (``raw_dim``, which had LeViT-256 wrong: 384 -> **512**). Artifacts are
+  ``<extractor>.npy`` + ``<extractor>.meta.json`` sidecar (backbone,
+  native dim, extraction point, exact weights id, transform recipe);
+  the loader cross-checks features against the sidecar and fails loudly
+  on mismatch. ``projection_dims`` is removed from config/schema.
+- **Canonical per-backbone preprocessing (Mudanca 1b)** - fixes the
+  worst silent bug in 1.x: transforms are resolved from the library
+  that ships the weights. ViT-B/16 (augreg2) and CoAtNet-0 (sw_in1k)
+  normalise with 0.5/0.5/0.5, **not ImageNet** as 1.x applied; all timm
+  recipes use bicubic resize+crop_pct, not direct bilinear resize.
+  Declared extraction points: CLIP = 512 projected (``encode_image``
+  space), CvT-13 pooled = CLS token, ViT/DINOv2 = CLS token. Pinned by
+  ``tests/test_canonical_transforms.py``.
+- **Fusion with native sources (Mudanca 4).** The equal-dim strategy
+  family gets a configurable alignment (``alignment.method``):
+  ``learned`` (default) - per-source ``Linear(D_i->D)`` co-trained via
+  BPR (``LearnedAlignmentFusion``, ragged concat buffer + JSON sidecar);
+  or ``pca`` - offline per-source PCA. The concat family operates on
+  native dims (``concat`` -> 2816). **Every PCA (joint, per-model and
+  alignment) now fits exclusively on items with a training interaction**
+  - fitting on the full catalogue leaked test-item structure - with
+  fixed seed and logged cumulative explained variance.
+  ``pca_per_model`` is documented as concatenation (-> ``M*k``).
+- **Deterministic tie-breaking.** The three ranking paths disagreed
+  under score ties (backend-dependent ``topk``, arbitrary
+  ``argpartition`` boundaries, pool-order bias in the sampled path that
+  favoured positives). All paths now share one rule: stable sort, ties
+  broken by lower item id.
+- **Wilcoxon ``zero_method="pratt"``.** Per-user LOO metrics are
+  0/1-heavy; scipy's default dropped all zero differences, shrinking
+  the effective sample far below ``n_users``. Pairwise tables now
+  report ``n_pairs`` and ``n_nonzero_pairs``.
+
+### Changed (models — Parte A)
+
+- **DeepStyle per the paper (Liu et al., SIGIR 2017):** linear embedding
+  ``E`` (no MLP) and a **learned category embedding subtracted** from the
+  item's visual style vector. Models declare ``wants_categories``; the
+  pipeline wires an item→category index array (``src/data/categories.py``)
+  through grid workers, Optuna trials and evaluation. Datasets without
+  category labels (Tradesy) degenerate to VBPR **by design** and this is
+  logged. The 1.x MLP variant — responsible for the 9-17x training-time
+  outlier in the efficiency audit — is gone.
+
+### Performance (Parte B — no protocol change unless stated)
+
+- **B1** ``ACF.predict_batch`` vectorized (user×item tiles + component
+  hidden-state cache); rankings identical (allclose 1e-5) to the per-user
+  Python loop it replaces. Was the audit's #1 bottleneck.
+- **B2** Immutable buffers (visual embeddings, interaction history)
+  excluded from checkpoints (``persistent=False``): 5.7x smaller
+  checkpoints on the synthetic dataset.
+- **B3** Per-model ``train_s``/``eval_s`` timing instrumentation.
+- **B4** VNPR's first MLP layer factored in ``predict_batch`` (declared
+  not bit-identical; metric-affecting swaps only in <1e-6 score gaps,
+  metrics verified exactly equal).
+- **B5** BPR negative sampling vectorized per epoch (``BPRBatchSampler``:
+  one shuffle + bulk draw + vectorized collision redraw via
+  ``torch.isin``): 7.1x faster than the per-sample rejection loop at
+  amazon_fashion scale. Negative sequence differs from 1.x (accepted:
+  v2 re-runs every battery).
+- **B6** Training-time validation on a fixed, deterministic 2000-user
+  subsample shared by every model/trial of a dataset
+  (``common.eval_sample_size``). Final reported metrics still rank the
+  full test set.
+- **B7** Optuna search parallelized across cells (spawn worker pool,
+  cap 3, per-process CUDA memory fraction, completed-cell skip);
+  trials within a cell remain sequential for TPE.
+
+### Fixed
+
+- **Frozen-BatchNorm corruption during fine-tuning (Parte C).**
+  ``FineTuner.train`` used a bare ``model.train()``, so BatchNorm layers
+  in the FROZEN stages kept re-estimating ``running_mean/var`` on
+  fine-tuning data while their weights stayed frozen (measured drift up
+  to 12.65 on LeViT-256's stem BN after one epoch) — re-extraction then
+  ran with corrupted stats. LeViT-256, the only BN-everywhere backbone
+  of the eight, degraded hardest; LayerNorm backbones were unaffected.
+  Frozen-stage norms are now pinned to eval mode every epoch (generic
+  prefix rule, no per-backbone branch), and the train loader drops a
+  degenerate size-1 tail batch. Hypotheses H1-H5 (head replacement,
+  distillation forward, BN crash at batch 1) were empirically refuted.
+- Single-component online-fusion sidecars (smoke profile) no longer
+  crash ``load_embedding``; fusion degenerates to a passthrough with a
+  warning. Empty sidecars still fail loudly.
+
+### Added
+
+- ``docs/protocol_v2.md`` - every methodological declaration (CLIP 512,
+  CvT CLS token, resolution posture, PCA protocol, DeepStyle variant
+  without category subtraction, ACF fed with real components, the
+  architecture-vs-pretraining confounder) with code pointers.
+- Provenance columns in every recorded result: ``protocol``,
+  ``visual_input_dim``, ``n_trainable_params``.
+- ``alignment`` config block (schema-validated), ``RaggedSources`` /
+  ``LearnedAlignmentFusion``, per-artifact ``.meta.json`` sidecars.
+
+### Removed
+
+- ``projection_dims`` and ``embedding_dims`` configuration (extraction
+  is single-pass native; the dim filter survives only for fusion
+  artifacts, which carry an explicit alignment-dim token).
+
 ## [1.1.2] - 2026-07-11
 
 Quality pass across the whole codebase (driven by a full multi-agent
@@ -369,7 +489,8 @@ This version covers the contracts the framework exposes to outside users
   `src/utils/manifest.py` replaced with the `datetime.UTC` alias
   (Python 3.11+), addressing ruff `UP017`.
 
-[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.2...v2.0.0
 [1.1.2]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/lucas-couto/prism-vrec/compare/v1.0.0...v1.1.0
