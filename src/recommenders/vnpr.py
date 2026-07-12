@@ -112,12 +112,15 @@ class VNPR(BaseRecommender):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
-        # Cache of [q_i, v_i] for the full item catalogue, populated lazily
-        # during evaluation and invalidated on every train() call.
+        # Caches populated lazily during evaluation and invalidated on
+        # every train() call: [q_i, v_i] for the full catalogue, and the
+        # item-side half of the first MLP layer (see predict_batch).
         self._item_feats_cache: torch.Tensor | None = None
+        self._item_first_layer_cache: torch.Tensor | None = None
 
     def train(self, mode: bool = True) -> VNPR:
         self._item_feats_cache = None
+        self._item_first_layer_cache = None
         return super().train(mode)
 
     def _item_feats(self, item_ids: torch.Tensor) -> torch.Tensor:
@@ -171,32 +174,45 @@ class VNPR(BaseRecommender):
     def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
         """Score every (user, item) pair in the cartesian product.
 
-        Vectorised across users in chunks bounded by
-        :func:`_predict_batch_chunk_pairs`.  This keeps peak VRAM bounded
-        regardless of ``B * N`` while still feeding the MLP with large
-        contiguous batches (orders of magnitude faster than scoring one
-        user at a time).  Item-side features are computed once per call
-        via :meth:`_item_feats` and reused across chunks.
+        The first MLP layer is factored: ``W1·[u; q; v] + b1`` splits into
+        a user half ``W1u·u`` (computed once per user) and an item half
+        ``W1qv·[q; v] + b1`` (computed ONCE PER EVALUATION and cached) —
+        the per-pair work for layer 1 becomes a broadcast add, and the
+        ``(b·N, 3k)`` concat materialisation disappears.  The remaining
+        layers run on the chunked cartesian product as before, bounded by
+        :func:`_predict_batch_chunk_pairs`.
+
+        NOTE: mathematically equivalent to the unfactored form but NOT
+        bit-identical (two GEMMs + add reorders float reductions);
+        rankings are validated unchanged in the tests.
         """
         B = user_ids.shape[0]
         N = item_ids.shape[0]
+        k = self.user_embedding.embedding_dim
 
-        item_feats = self._item_feats(item_ids)
+        first: nn.Linear = self.mlp[0]
+        rest = self.mlp[1:]  # ReLU + remaining layers
+
         u_u = self.user_embedding(user_ids)
+        user_first = u_u @ first.weight[:, :k].T  # (B, h1)
+
+        cache_eligible = self._online_fusion is None and item_ids.shape[0] == self.n_items
+        if cache_eligible and self._item_first_layer_cache is not None:
+            item_first = self._item_first_layer_cache
+        else:
+            item_feats = self._item_feats(item_ids)  # (N, 2k)
+            item_first = item_feats @ first.weight[:, k:].T + first.bias  # (N, h1)
+            if cache_eligible:
+                self._item_first_layer_cache = item_first
 
         users_per_chunk = max(1, _predict_batch_chunk_pairs() // max(N, 1))
 
         out = torch.empty(B, N, device=u_u.device, dtype=u_u.dtype)
         for start in range(0, B, users_per_chunk):
             end = min(start + users_per_chunk, B)
-            u_chunk = u_u[start:end]
-            b = u_chunk.shape[0]
+            b = end - start
 
-            u_expanded = u_chunk.unsqueeze(1).expand(b, N, -1)
-            item_expanded = item_feats.unsqueeze(0).expand(b, N, -1)
-            x_ui = torch.cat([u_expanded, item_expanded], dim=-1)
-            x_flat = x_ui.reshape(b * N, -1)
-
-            scores = self.mlp(x_flat).squeeze(-1)
+            hidden1 = user_first[start:end].unsqueeze(1) + item_first.unsqueeze(0)  # (b, N, h1)
+            scores = rest(hidden1.reshape(b * N, -1)).squeeze(-1)
             out[start:end] = scores.view(b, N)
         return out
