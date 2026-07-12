@@ -26,6 +26,27 @@ from __future__ import annotations
 import numpy as np
 from sklearn.decomposition import PCA
 
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def _warn_ignored_kwargs(strategy: str, kwargs: dict) -> None:
+    """Warn when a strategy receives kwargs it does not consume.
+
+    Every strategy accepts ``**kwargs`` (part of the plugin contract),
+    which means a typo'd hyperparameter (``n_component=...``) or one
+    aimed at a different strategy is silently discarded — an experiment
+    can appear to sweep a value that never varied.  Warn loudly instead.
+    """
+    if kwargs:
+        logger.warning(
+            "Fusion strategy '%s' ignored unknown kwargs %s — "
+            "check for typos in configs/fusion.yaml.",
+            strategy,
+            sorted(kwargs),
+        )
+
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
     """L2 normalise each row of *x*.
@@ -101,6 +122,7 @@ def fuse_mean(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("mean", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -127,6 +149,7 @@ def fuse_sum(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("sum", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -153,6 +176,7 @@ def fuse_prod(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("prod", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -179,6 +203,7 @@ def fuse_max_pool(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("max_pool", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -211,6 +236,7 @@ def fuse_weighted_mean(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("weighted_mean", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -262,6 +288,7 @@ def fuse_attention_weighted(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("attention_weighted", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -316,6 +343,7 @@ def fuse_gated(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
+    _warn_ignored_kwargs("gated", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -363,6 +391,7 @@ def fuse_concat(
     np.ndarray
         Fused matrix of shape ``(N, sum(d_m))``.
     """
+    _warn_ignored_kwargs("concat", kwargs)
     _validate_embeddings(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
     return np.concatenate(embeddings, axis=1)
@@ -397,6 +426,7 @@ def fuse_pca(
     np.ndarray
         Fused matrix of shape ``(N, n_components)``.
     """
+    _warn_ignored_kwargs("pca", kwargs)
     _validate_embeddings(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
     concatenated = np.concatenate(embeddings, axis=1)
@@ -437,6 +467,7 @@ def fuse_pca_per_model(
     np.ndarray
         Fused matrix of shape ``(N, M * n_components)``.
     """
+    _warn_ignored_kwargs("pca_per_model", kwargs)
     _validate_embeddings(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
 

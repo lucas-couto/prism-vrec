@@ -123,6 +123,15 @@ class FineTuningEvaluator:
 
         n_classes = int(metadata["n_classes"])
         in_features = int(metadata["in_features"])
+        if "split_seed" not in metadata:
+            # A wrong seed silently reconstructs a different val split
+            # than the one used at training time, corrupting the metrics.
+            logger.warning(
+                "Checkpoint metadata for %s/%s has no split_seed; assuming 42. "
+                "Reported metrics are only valid if training used the same seed.",
+                self.extractor_name,
+                self.dataset_name,
+            )
         split_seed = int(metadata.get("split_seed", 42))
 
         provider = get_dataset_provider(self.dataset_name)
@@ -146,12 +155,13 @@ class FineTuningEvaluator:
         full_state.update(head_state)
         missing, unexpected = model.load_state_dict(full_state, strict=False)
         if missing:
-            logger.warning(
-                "Checkpoint missing %d keys when loading %s/%s: %s",
-                len(missing),
-                self.extractor_name,
-                self.dataset_name,
-                missing[:5],
+            # Missing keys mean parts of the network would evaluate with
+            # randomly initialised weights, producing plausible-looking
+            # but wrong accuracy numbers. Fail instead of reporting them.
+            raise RuntimeError(
+                f"Checkpoint for {self.extractor_name}/{self.dataset_name} is "
+                f"missing {len(missing)} state-dict keys (e.g. {missing[:5]}); "
+                "the extractor code likely drifted from the checkpoint format."
             )
         if unexpected:
             logger.warning(

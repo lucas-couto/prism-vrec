@@ -129,6 +129,19 @@ class FineTuner:
         returned :class:`FineTuningResult` carries the backbone and head
         state_dicts already split for downstream persistence.
         """
+        missing = [
+            key
+            for key in ("learning_rate", "weight_decay", "epochs_max", "patience")
+            if key not in self.config
+        ]
+        if missing:
+            # A typo'd key in configs/finetuning.yaml would otherwise
+            # silently train with hidden defaults while the researcher
+            # believes their configured hyperparameters were used.
+            logger.warning(
+                "Fine-tuning config is missing %s; using built-in defaults for them.",
+                ", ".join(missing),
+            )
         lr = self.config.get("learning_rate", 1e-4)
         weight_decay = self.config.get("weight_decay", 1e-4)
         epochs_max = self.config.get("epochs_max", 15)

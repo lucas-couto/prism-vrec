@@ -258,7 +258,10 @@ def run(condition: str = "frozen") -> None:
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
     k_values = config.get("k_values", [5, 10, 20])
-    datasets = config.get("datasets", ["amazon_fashion", "amazon_women", "amazon_men"])
+    datasets = config.get("datasets", [])
+    if not datasets:
+        logger.info("evaluate step skipped: datasets list is empty in configs/default.yaml.")
+        return
 
     eval_cfg = config.get("evaluation") or {}
     protocol = eval_cfg.get("protocol", "full_ranking")

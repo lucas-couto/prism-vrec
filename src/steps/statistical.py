@@ -58,7 +58,10 @@ def run(condition: str = "frozen") -> None:
         raise ValueError(f"condition must be 'frozen', 'finetuned' or 'all', got {condition!r}")
 
     config = load_config()
-    datasets = config.get("datasets", ["amazon_fashion", "amazon_women", "amazon_men"])
+    datasets = config.get("datasets", [])
+    if not datasets:
+        logger.info("statistical step skipped: datasets list is empty in configs/default.yaml.")
+        return
     k_values = config.get("k_values", [5, 10, 20])
 
     stat_cfg = config.get("statistical", {})

@@ -177,7 +177,7 @@ def run() -> None:
     projection_dims = config.get("projection_dims", [64, 128, 256])
     batch_size = config.get("batch_size", 64)
     checkpoint_every = config.get("checkpoint_every", 500)
-    datasets = config.get("datasets", ["amazon_fashion", "amazon_women", "amazon_men"])
+    datasets = config.get("datasets", [])
     extract_components = bool(config.get("extract_components", False))
 
     # Instantiating the manager guarantees the on-disk directories exist.
