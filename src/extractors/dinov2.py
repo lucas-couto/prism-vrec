@@ -4,7 +4,13 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 
-from src.extractors.base import BaseExtractor
+from src.extractors.base import BaseExtractor, _imagenet_transform
+
+# Pinned commit of facebookresearch/dinov2 (default-branch HEAD at pin
+# time). An unpinned hub load tracks the remote branch, so an upstream
+# push could silently change the backbone code and break bit-identical
+# reproducibility of extracted embeddings.
+_DINOV2_COMMIT = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
 
 
 class _DINOv2Backbone(nn.Module):
@@ -25,7 +31,7 @@ class _DINOv2Backbone(nn.Module):
                 category=UserWarning,
             )
             self.backbone = torch.hub.load(
-                "facebookresearch/dinov2",
+                f"facebookresearch/dinov2:{_DINOV2_COMMIT}",
                 "dinov2_vitb14",
             )
         for param in self.backbone.parameters():
@@ -70,31 +76,9 @@ class DINOv2Extractor(BaseExtractor):
     #: DINOv2 exposes its 256 patch tokens (get_intermediate_layers) for ACF.
     supports_components = True
 
-    def __init__(self, device: str = "cuda", output_dim: int = 128):
-        super().__init__(device=device, output_dim=output_dim)
-        self.model = self._build_model()
-        self.transform = self._build_transform()
-
-    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model.forward_components(images)
-
-    def _build_model(self) -> nn.Module:
-        model = _DINOv2Backbone(output_dim=self.output_dim)
-        model = model.to(self.device)
-        model.eval()
-        return model
+    backbone_cls = _DINOv2Backbone
 
     def _build_transform(self) -> transforms.Compose:
-        return transforms.Compose(
-            [
-                transforms.Resize(
-                    (224, 224),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
+        # DINOv2 was trained with bicubic resizing (the rest of the
+        # framework uses the default bilinear).
+        return _imagenet_transform(interpolation=transforms.InterpolationMode.BICUBIC)

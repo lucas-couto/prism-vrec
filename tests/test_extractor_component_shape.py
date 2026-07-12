@@ -27,6 +27,7 @@ CASES = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(("name", "backend", "expected_m"), CASES)
 def test_component_shape_is_n_m_output_dim(name, backend, expected_m) -> None:
     pytest.importorskip(backend)
@@ -43,15 +44,25 @@ def test_component_shape_is_n_m_output_dim(name, backend, expected_m) -> None:
     assert components.dtype == torch.float32
 
 
-def test_every_component_capable_extractor_implements_forward() -> None:
-    """``supports_components=True`` must come with a real ``_forward_components``."""
+def test_every_component_capable_extractor_can_produce_components() -> None:
+    """``supports_components=True`` must be backed by a real component path.
+
+    The base :meth:`_forward_components` delegates to the backbone's
+    ``forward_components``; an extractor either overrides the method or
+    declares a ``backbone_cls`` whose class exposes ``forward_components``.
+    """
     import src.extractors  # noqa: F401  (populate registry)
     from src.extractors.base import BaseExtractor
     from src.extractors.registry import get_extractor_class, registered_extractor_names
 
     for name in registered_extractor_names():
         cls = get_extractor_class(name)
-        if getattr(cls, "supports_components", False):
-            assert cls._forward_components is not BaseExtractor._forward_components, (
-                f"{name} advertises supports_components but does not override _forward_components"
-            )
+        if not getattr(cls, "supports_components", False):
+            continue
+        overrides_method = cls._forward_components is not BaseExtractor._forward_components
+        backbone = getattr(cls, "backbone_cls", None)
+        backbone_has_components = backbone is not None and hasattr(backbone, "forward_components")
+        assert overrides_method or backbone_has_components, (
+            f"{name} advertises supports_components but has neither a "
+            f"_forward_components override nor a backbone_cls exposing forward_components"
+        )

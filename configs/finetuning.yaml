@@ -1,4 +1,4 @@
-# Configuração do fine-tuning por classificação de categorias
+# Category-classification fine-tuning configuration.
 finetuning:
   epochs_max: 15
   learning_rate: 0.0001
@@ -9,7 +9,7 @@ finetuning:
   batch_size: 128
   patience: 5
 
-  # Extratores que recebem fine-tuning (CLIP e DINOv2 ficam congelados)
+  # Extractors that get fine-tuned (CLIP and DINOv2 stay frozen)
   extractors:
     - "resnet50"
     - "vit_b16"
@@ -18,5 +18,5 @@ finetuning:
     - "levit_256"
     - "convnext_base"
 
-  # Para Tradesy (sem categorias), usar pesos fine-tuned de qual dataset
+  # For Tradesy (no categories), which dataset's fine-tuned weights to use
   tradesy_transfer_from: "amazon_fashion"

@@ -32,6 +32,7 @@ from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any
 
+from src.utils.atomic_io import atomic_write
 from src.utils.dataloader import describe as describe_dataloader_tune
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
@@ -257,9 +258,10 @@ def _package_versions(names: tuple[str, ...]) -> dict[str, str | None]:
 
 
 def _write_manifest(run_dir: Path, manifest: dict) -> None:
-    """Atomic write: tmp + rename so a crash mid-write never corrupts the file."""
-    target = run_dir / "manifest.json"
-    tmp = run_dir / "manifest.json.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2, sort_keys=False, default=str)
-    tmp.replace(target)
+    """Durable atomic write via :func:`atomic_write` (fsync + retried replace)."""
+
+    def _write(tmp: str) -> None:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=False, default=str)
+
+    atomic_write(_write, run_dir / "manifest.json")

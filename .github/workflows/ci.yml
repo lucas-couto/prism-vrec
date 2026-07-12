@@ -25,7 +25,9 @@ jobs:
           cache: "pip"
 
       - name: Install ruff
-        run: pip install "ruff>=0.5.0"
+        # Pinned to the same version as .pre-commit-config.yaml so local
+        # hooks and CI can never disagree about formatting.
+        run: pip install "ruff==0.5.5"
 
       - name: ruff check
         run: ruff check .
@@ -51,15 +53,50 @@ jobs:
 
       - name: Install package + dev deps
         # Torch + torchvision are large; the CPU-only wheels are enough
-        # for the contract tests, which never instantiate a real backbone.
+        # here because tests marked 'slow' (the ones that instantiate
+        # real backbones and download pretrained weights) are excluded
+        # from this job — they run in the backbone job below.
         run: |
           pip install --upgrade pip
           pip install --extra-index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.1.0,<2.6" "torchvision>=0.16.0,<0.21"
           pip install -e ".[dev]"
 
-      - name: Run pytest
-        run: pytest -q
+      - name: Run pytest (excluding backbone downloads)
+        run: pytest -q -m "not slow"
+
+  test-backbones:
+    name: Backbone contract tests (slow)
+    runs-on: ubuntu-latest
+    # Weight downloads total gigabytes; run only on pushes to main (and
+    # manual dispatch), with the HF/torch hub caches persisted between
+    # runs so repeat cost is near-zero.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache pretrained weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: pretrained-weights-v1
+
+      - name: Install package + dev deps
+        run: |
+          pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.1.0,<2.6" "torchvision>=0.16.0,<0.21"
+          pip install -e ".[dev]"
+
+      - name: Run slow tests
+        run: pytest -q -m "slow"
 
   smoke-import:
     name: Import smoke test (Python ${{ matrix.python-version }})

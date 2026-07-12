@@ -31,6 +31,7 @@ from src.finetuning.evaluator import (
     CheckpointMissingHeadError,
     FineTuningEvaluator,
 )
+from src.utils.atomic_io import atomic_write
 from src.utils.config import load_config
 from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import resolve_device
@@ -70,11 +71,8 @@ def _evaluate_one(
     )
     report = evaluator.evaluate()
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(report.to_dict(), fh, indent=2)
-    tmp.rename(output_path)
+    payload = json.dumps(report.to_dict(), indent=2)
+    atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), output_path)
 
     metrics = report.metrics
     logger.info(

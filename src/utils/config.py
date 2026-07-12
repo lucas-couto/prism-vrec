@@ -150,9 +150,13 @@ def load_config(config_dir: str = "configs") -> dict[str, Any]:
         if data and isinstance(data, dict):
             merged = _deep_merge(merged, data)
 
-    # Schema validation — opt-out via HVR_SKIP_CONFIG_VALIDATION=1 for
-    # tests that intentionally pass partial configs.
-    if not os.environ.get("HVR_SKIP_CONFIG_VALIDATION"):
+    # Schema validation — opt-out via PRISM_SKIP_CONFIG_VALIDATION=1
+    # (legacy HVR_SKIP_CONFIG_VALIDATION still honoured) for tests that
+    # intentionally pass partial configs.
+    skip_validation = os.environ.get("PRISM_SKIP_CONFIG_VALIDATION") or os.environ.get(
+        "HVR_SKIP_CONFIG_VALIDATION"
+    )
+    if not skip_validation:
         merged = validate_config(merged)
 
     _CONFIG_CACHE = merged

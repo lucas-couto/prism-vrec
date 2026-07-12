@@ -15,10 +15,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.recommenders._scoring import LinearVisualScoreMixin
 from src.recommenders.base import BaseRecommender
 
 
-class VBPR(BaseRecommender):
+class VBPR(LinearVisualScoreMixin, BaseRecommender):
     """VBPR with a linear visual projection.
 
     Parameters
@@ -45,7 +46,8 @@ class VBPR(BaseRecommender):
         k: int = config["latent_dim"]
         kv: int = config["visual_dim"]
 
-        assert self.visual_features is not None, "VBPR requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("VBPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)
@@ -63,11 +65,10 @@ class VBPR(BaseRecommender):
 
         self._item_proj_cache: torch.Tensor | None = None
 
-    def train(self, mode: bool = True) -> VBPR:
-        self._item_proj_cache = None
-        return super().train(mode)
+    def _visual_user_table(self) -> nn.Embedding:
+        return self.visual_user_embedding
 
-    def _visual_item(self, item_ids: torch.Tensor) -> torch.Tensor:
+    def _item_visual_term(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Project raw visual features for the given items: W_vis @ f_i.
 
         With an online fusion (3-D buffer) the cache is bypassed since
@@ -86,49 +87,3 @@ class VBPR(BaseRecommender):
         if cache_eligible and item_ids.shape[0] == self.n_items:
             self._item_proj_cache = proj
         return proj
-
-    def forward(
-        self,
-        user_ids: torch.Tensor,
-        pos_item_ids: torch.Tensor,
-        neg_item_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        gamma_u = self.user_embedding(user_ids)
-        alpha_u = self.visual_user_embedding(user_ids)
-
-        # Combine pos and neg item lookups into a single (2B,)-batched
-        # forward through item_embedding, item_bias and visual_projection.
-        # Each row is independent, so splitting after the matmul produces
-        # the same result as two separate B-sized passes while letting the
-        # GPU amortise launch overhead over a larger matmul.
-        B = pos_item_ids.shape[0]
-        all_items = torch.cat([pos_item_ids, neg_item_ids], dim=0)
-        gamma_all = self.item_embedding(all_items)
-        beta_all = self.item_bias(all_items).squeeze(-1)
-        theta_all = self._visual_item(all_items)
-
-        gamma_pos, gamma_neg = gamma_all[:B], gamma_all[B:]
-        beta_pos, beta_neg = beta_all[:B], beta_all[B:]
-        theta_pos, theta_neg = theta_all[:B], theta_all[B:]
-
-        score_pos = (gamma_u * gamma_pos).sum(-1) + (alpha_u * theta_pos).sum(-1) + beta_pos
-        score_neg = (gamma_u * gamma_neg).sum(-1) + (alpha_u * theta_neg).sum(-1) + beta_neg
-        return score_pos, score_neg
-
-    def predict(self, user_id: int, item_ids: torch.Tensor) -> torch.Tensor:
-        gamma_u = self.user_embedding.weight[user_id]
-        gamma_i = self.item_embedding(item_ids)
-        beta_i = self.item_bias(item_ids).squeeze(-1)
-        alpha_u = self.visual_user_embedding.weight[user_id]
-        theta_i = self._visual_item(item_ids)
-
-        return (gamma_u * gamma_i).sum(-1) + (alpha_u * theta_i).sum(-1) + beta_i
-
-    def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
-        gamma_u = self.user_embedding(user_ids)
-        gamma_i = self.item_embedding(item_ids)
-        beta_i = self.item_bias(item_ids).squeeze(-1)
-        alpha_u = self.visual_user_embedding(user_ids)
-        theta_i = self._visual_item(item_ids)
-
-        return gamma_u @ gamma_i.T + alpha_u @ theta_i.T + beta_i.unsqueeze(0)

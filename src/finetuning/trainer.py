@@ -12,6 +12,8 @@ from tqdm import tqdm
 
 from src.finetuning.checkpoint import split_state_dict
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
+from src.utils.atomic_io import atomic_write
+from src.utils.checkpoint import capture_rng_states, restore_rng_states
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -129,6 +131,19 @@ class FineTuner:
         returned :class:`FineTuningResult` carries the backbone and head
         state_dicts already split for downstream persistence.
         """
+        missing = [
+            key
+            for key in ("learning_rate", "weight_decay", "epochs_max", "patience")
+            if key not in self.config
+        ]
+        if missing:
+            # A typo'd key in configs/finetuning.yaml would otherwise
+            # silently train with hidden defaults while the researcher
+            # believes their configured hyperparameters were used.
+            logger.warning(
+                "Fine-tuning config is missing %s; using built-in defaults for them.",
+                ", ".join(missing),
+            )
         lr = self.config.get("learning_rate", 1e-4)
         weight_decay = self.config.get("weight_decay", 1e-4)
         epochs_max = self.config.get("epochs_max", 15)
@@ -161,6 +176,18 @@ class FineTuner:
                 start_epoch = ckpt["epoch"] + 1
                 best_acc = ckpt["best_acc"]
                 epochs_no_improve = ckpt.get("epochs_no_improve", 0)
+                if "scaler_state" in ckpt:
+                    scaler.load_state_dict(ckpt["scaler_state"])
+                # Restore RNG states so a resumed run draws the same
+                # augmentation / shuffle sequence as an uninterrupted one
+                # (bit-identical resume). Absent in pre-1.1.2 checkpoints.
+                if "rng_states" in ckpt:
+                    restore_rng_states(ckpt["rng_states"])
+                else:
+                    logger.warning(
+                        "  Resume checkpoint has no RNG states (pre-1.1.2 format); "
+                        "resumed run is not bit-identical to an uninterrupted one."
+                    )
                 logger.info(
                     "  Resumed fine-tuning from epoch %d (best_acc=%.4f)",
                     start_epoch,
@@ -217,19 +244,17 @@ class FineTuner:
                 epochs_no_improve += 1
 
             if checkpoint_path is not None:
-                tmp = Path(checkpoint_path).with_suffix(".tmp")
-                torch.save(
-                    {
-                        "model_state": self.model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "scheduler_state": scheduler.state_dict(),
-                        "epoch": epoch,
-                        "best_acc": best_acc,
-                        "epochs_no_improve": epochs_no_improve,
-                    },
-                    tmp,
-                )
-                tmp.rename(checkpoint_path)
+                payload = {
+                    "model_state": self.model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict(),
+                    "rng_states": capture_rng_states(),
+                    "epoch": epoch,
+                    "best_acc": best_acc,
+                    "epochs_no_improve": epochs_no_improve,
+                }
+                atomic_write(lambda tmp, p=payload: torch.save(p, tmp), checkpoint_path)
 
             if epochs_no_improve >= patience:
                 logger.info("  Early stopping at epoch %d", epoch + 1)

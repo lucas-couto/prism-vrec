@@ -18,21 +18,24 @@ and produces new files alongside; it never overwrites.
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # Filename patterns the pipeline emits in ``results/tables/``.
 _EVAL_PATTERN = re.compile(r"^(?P<ds>.+?)_evaluation_(?P<cond>frozen|finetuned)\.csv$")
-_SUMMARY_PATTERN = re.compile(r"^(?P<ds>.+?)_summary_(?P<metric>[a-z]+)_at_(?P<k>\d+)\.csv$")
-_FRIEDMAN_PATTERN = re.compile(r"^(?P<ds>.+?)_friedman_(?P<metric>[a-z]+)_at_(?P<k>\d+)\.csv$")
-_PAIRWISE_PATTERN = re.compile(r"^(?P<ds>.+?)_pairwise_(?P<metric>[a-z]+)_at_(?P<k>\d+)\.csv$")
+# [a-z0-9]+ (not [a-z]+) so metrics with a digit like ``f1`` classify;
+# otherwise an f1 table would glob-match but silently fail to parse.
+_SUMMARY_PATTERN = re.compile(r"^(?P<ds>.+?)_summary_(?P<metric>[a-z0-9]+)_at_(?P<k>\d+)\.csv$")
+_FRIEDMAN_PATTERN = re.compile(r"^(?P<ds>.+?)_friedman_(?P<metric>[a-z0-9]+)_at_(?P<k>\d+)\.csv$")
+_PAIRWISE_PATTERN = re.compile(r"^(?P<ds>.+?)_pairwise_(?P<metric>[a-z0-9]+)_at_(?P<k>\d+)\.csv$")
 
 _METRIC_COL_PATTERN = re.compile(r"^(?P<metric>precision|recall|ndcg|map|f1)@(?P<k>\d+)$")
 _EMBEDDING_DIM_PATTERN = re.compile(r"_D(\d+)$")

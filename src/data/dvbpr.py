@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
 from src.data.base import DatasetProvider, register_dataset_provider
@@ -340,8 +339,8 @@ class DVBPRDataLoader(DatasetProvider):
         unique_labels = sorted(df["category_label"].unique())
         remap = {lbl: i for i, lbl in enumerate(unique_labels)}
         return {
-            str(row["item_id"]): remap[row["category_label"]]
-            for _, row in df.iterrows()
+            str(item_id): remap[label]
+            for item_id, label in zip(df["item_id"], df["category_label"], strict=True)
         }
 
     def extract_images(self, image_dir: str | Path) -> None:
@@ -364,6 +363,7 @@ class DVBPRDataLoader(DatasetProvider):
         extracted = 0
         skipped = 0
         no_image = 0
+        errors = 0
 
         first_item = items_raw[0]
         logger.info(
@@ -399,16 +399,23 @@ class DVBPRDataLoader(DatasetProvider):
 
                 dest.write_bytes(img_bytes)
                 extracted += 1
-            except Exception as exc:
-                if no_image == 0:
+            except Exception as exc:  # noqa: BLE001 — count and keep going
+                # A genuine extraction failure (corrupt bytes, disk full,
+                # permission) is distinct from an item that simply has no
+                # image; conflating them under-reports data loss.  Log the
+                # first few and always count them separately.
+                if errors < 5:
                     logger.warning("Error extracting item %d: %s", item_id, exc)
-                no_image += 1
+                errors += 1
 
+        if errors:
+            logger.warning("Image extraction hit %d errors (see warnings above).", errors)
         logger.info(
-            "Images: %d extracted, %d skipped (existing), %d without image",
+            "Images: %d extracted, %d skipped (existing), %d without image, %d errors",
             extracted,
             skipped,
             no_image,
+            errors,
         )
 
     def save_processed(self, processed_dir: str | Path) -> None:

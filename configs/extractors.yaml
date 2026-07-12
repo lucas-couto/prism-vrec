@@ -1,9 +1,9 @@
-# Configuração dos extratores visuais
+# Visual extractor configuration.
 #
-# `extractors_enabled` controla quais extratores rodam neste experimento.
-# Lista vazia ou ausente = nenhum extrator roda. Para desativar um modelo
-# basta removê-lo desta lista (a definição em `extractors:` continua como
-# catálogo). Nomes válidos: resnet50, vit_b16, cvt_13, coatnet_0,
+# `extractors_enabled` controls which extractors run in this experiment.
+# An empty or absent list = no extractor runs. To disable a model just
+# remove it from this list (its definition under `extractors:` stays as
+# a catalogue). Valid names: resnet50, vit_b16, cvt_13, coatnet_0,
 # levit_256, clip_vitb32, dinov2_vitb14, convnext_base.
 extractors_enabled:
   - resnet50
@@ -16,7 +16,7 @@ extractors_enabled:
   - convnext_base
 
 extractors:
-  # --- Primários (usados na fusão) ---
+  # --- Primary (used in fusion) ---
   resnet50:
     model_name: "resnet50"
     weights: "IMAGENET1K_V2"
@@ -28,7 +28,7 @@ extractors:
     raw_dim: 768
     role: primary
 
-  # --- Híbridos arquiteturais ---
+  # --- Architectural hybrids ---
   cvt_13:
     model_name: "cvt_13"
     raw_dim: 384
@@ -44,7 +44,7 @@ extractors:
     raw_dim: 384
     role: hybrid
 
-  # --- Fundacionais SOTA ---
+  # --- SOTA foundation models ---
   clip_vitb32:
     model_name: "ViT-B-32"
     pretrained: "laion2b_s34b_b79k"
@@ -56,22 +56,22 @@ extractors:
     raw_dim: 768
     role: foundation
 
-  # --- Pure CNN moderna (baseline) ---
+  # --- Modern pure CNN (baseline) ---
   convnext_base:
     model_name: "convnext_base.fb_in22k_ft_in1k"
     raw_dim: 1024
     role: pure_modern
 
-# Extratores primários usados na fusão (os demais são baselines individuais)
+# Primary extractors used in fusion (the rest are standalone baselines)
 fusion_extractors:
   - "resnet50"
   - "vit_b16"
 
-# Dimensões de projeção a testar
+# Projection dimensions to test
 projection_dims: [64, 128, 256]
 
-# Batch size para extração (FP16 permite batch maior)
+# Batch size for extraction (FP16 allows a larger batch)
 batch_size: 256
 
-# Checkpoint a cada N batches
+# Checkpoint every N batches
 checkpoint_every: 500

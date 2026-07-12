@@ -38,7 +38,21 @@ def _autotune_chunk_pairs() -> int:
     return 5_000_000
 
 
-_PREDICT_BATCH_CHUNK_PAIRS = _autotune_chunk_pairs()
+_PREDICT_BATCH_CHUNK_PAIRS: int | None = None
+
+
+def _predict_batch_chunk_pairs() -> int:
+    """Cached chunk size, computed lazily on first use.
+
+    Deferred out of import time so that merely importing
+    ``src.recommenders`` does not touch the CUDA runtime (which can
+    misbehave in forked workers / under CUDA_VISIBLE_DEVICES). The chunk
+    size only affects batching, never the scores.
+    """
+    global _PREDICT_BATCH_CHUNK_PAIRS
+    if _PREDICT_BATCH_CHUNK_PAIRS is None:
+        _PREDICT_BATCH_CHUNK_PAIRS = _autotune_chunk_pairs()
+    return _PREDICT_BATCH_CHUNK_PAIRS
 
 
 class VNPR(BaseRecommender):
@@ -69,7 +83,8 @@ class VNPR(BaseRecommender):
         k: int = config["latent_dim"]
         hidden_layers: list[int] = config["hidden_layers"]
 
-        assert self.visual_features is not None, "VNPR requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("VNPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)  # u_u
@@ -157,7 +172,7 @@ class VNPR(BaseRecommender):
         """Score every (user, item) pair in the cartesian product.
 
         Vectorised across users in chunks bounded by
-        :data:`_PREDICT_BATCH_CHUNK_PAIRS`.  This keeps peak VRAM bounded
+        :func:`_predict_batch_chunk_pairs`.  This keeps peak VRAM bounded
         regardless of ``B * N`` while still feeding the MLP with large
         contiguous batches (orders of magnitude faster than scoring one
         user at a time).  Item-side features are computed once per call
@@ -169,7 +184,7 @@ class VNPR(BaseRecommender):
         item_feats = self._item_feats(item_ids)
         u_u = self.user_embedding(user_ids)
 
-        users_per_chunk = max(1, _PREDICT_BATCH_CHUNK_PAIRS // max(N, 1))
+        users_per_chunk = max(1, _predict_batch_chunk_pairs() // max(N, 1))
 
         out = torch.empty(B, N, device=u_u.device, dtype=u_u.dtype)
         for start in range(0, B, users_per_chunk):

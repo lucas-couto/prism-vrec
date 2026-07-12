@@ -63,13 +63,16 @@ and register the subclass under one or more dataset names::
             ...
 
         def save_processed(self, processed_dir) -> None:
+            # processed_dir is already the final per-dataset directory
+            # (the caller appends the dataset name) — do NOT append
+            # self.name again.
             train = pd.DataFrame({"user_idx": [...], "item_idx": [...]})
             val   = pd.DataFrame({"user_idx": [...], "item_idx": [...]})
             test  = pd.DataFrame({"user_idx": [...], "item_idx": [...]})
             user2idx = {"u1": 0, "u2": 1, ...}
             item2idx = {"i1": 0, "i2": 1, ...}
             write_processed_splits(
-                Path(processed_dir) / self.name,
+                processed_dir,
                 train, val, test, user2idx, item2idx,
             )
 
@@ -137,8 +140,12 @@ class DatasetProvider(abc.ABC):
     @abc.abstractmethod
     def save_processed(self, processed_dir: str | Path) -> None:
         """Write ``train.csv`` / ``val.csv`` / ``test.csv`` and the
-        ``user2idx.json`` / ``item2idx.json`` mappings under
-        ``Path(processed_dir) / self.name``.
+        ``user2idx.json`` / ``item2idx.json`` mappings.
+
+        ``processed_dir`` is the **final** per-dataset directory: the
+        caller (``src.steps.preprocess``) already appends the dataset
+        name, so implementations write directly into it and must NOT
+        append ``self.name`` again.
 
         The :func:`write_processed_splits` helper takes care of the
         boilerplate (column names, JSON formatting, ID validation) and
@@ -189,7 +196,8 @@ def write_processed_splits(
     ----------
     output_dir:
         Destination directory.  Will be created if necessary.  This is
-        typically ``Path(processed_dir) / self.name``.
+        the final per-dataset directory (the ``processed_dir`` passed to
+        ``save_processed``), not ``processed_dir / self.name``.
     train, val, test:
         Either a :class:`pandas.DataFrame` with columns
         ``user_idx, item_idx`` or an iterable of ``(user_idx, item_idx)``
@@ -225,7 +233,9 @@ def write_processed_splits(
 
     logger.info(
         "Wrote processed splits to %s (users=%d, items=%d)",
-        output_dir, n_users, n_items,
+        output_dir,
+        n_users,
+        n_items,
     )
 
 
@@ -254,13 +264,9 @@ def _check_indices(df: pd.DataFrame, n_users: int, n_items: int, split_name: str
     if df.empty:
         return
     if df["user_idx"].min() < 0 or df["user_idx"].max() >= n_users:
-        raise ValueError(
-            f"{split_name}.csv has user_idx out of range [0, {n_users})"
-        )
+        raise ValueError(f"{split_name}.csv has user_idx out of range [0, {n_users})")
     if df["item_idx"].min() < 0 or df["item_idx"].max() >= n_items:
-        raise ValueError(
-            f"{split_name}.csv has item_idx out of range [0, {n_items})"
-        )
+        raise ValueError(f"{split_name}.csv has item_idx out of range [0, {n_items})")
 
 
 def validate_layout(
@@ -357,7 +363,8 @@ _REGISTRY: dict[str, Callable[[], DatasetProvider]] = {}
 
 
 def register_dataset_provider(
-    name: str, factory: Callable[[], DatasetProvider],
+    name: str,
+    factory: Callable[[], DatasetProvider],
 ) -> None:
     """Register ``factory`` under ``name`` so the pipeline can resolve it later."""
     _REGISTRY[name] = factory

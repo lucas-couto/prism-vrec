@@ -242,6 +242,31 @@ class HpSpaceEntry(BaseModel):
         return self
 
 
+class CommonTrainingConfig(BaseModel):
+    """Shared recommender-training block (``common:`` in recommenders.yaml).
+
+    Declares both the shared hyperparameter grid (list-valued keys
+    consumed by ``get_hyperparam_grid``) and the training-loop knobs
+    consumed by ``train_single_run``.  Previously this block slipped
+    through ``extra='allow'`` untyped, so a typo like
+    ``early_stoping_patience`` silently reverted the run to defaults —
+    exactly the failure mode this schema exists to prevent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    latent_dim: list[int] | int = Field(default_factory=lambda: [64])
+    learning_rate: list[float] | float = Field(default_factory=lambda: [0.001])
+    l2_reg: list[float] | float = Field(default_factory=lambda: [0.0001])
+    visual_dim: list[int] | int = Field(default_factory=lambda: [64])
+    epochs: int = Field(100, ge=1)
+    batch_size: int = Field(4096, ge=1)
+    early_stopping_patience: int = Field(10, ge=1)
+    early_stopping_metric: str = "ndcg@10"
+    eval_every_epochs: int = Field(10, ge=1)
+    eval_sample_size: int | None = Field(None, ge=1)
+
+
 class FrameworkConfig(BaseModel):
     """Top-level merged config exposed to every step.
 
@@ -307,9 +332,14 @@ class FrameworkConfig(BaseModel):
     normalize_before_fusion: bool = True
 
     recommenders_enabled: list[str] = Field(default_factory=list)
+    common: CommonTrainingConfig = Field(default_factory=CommonTrainingConfig)
     hp_search: HpSearchConfig = Field(default_factory=HpSearchConfig)
 
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    k_values: list[int] = Field(
+        default_factory=lambda: [5, 10, 20],
+        description="Ranking cutoffs used by the evaluate and statistical steps.",
+    )
 
     finetuning: FineTuningConfig = Field(default_factory=FineTuningConfig)
 
@@ -329,6 +359,7 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "CONDITION_VALUES",
+    "CommonTrainingConfig",
     "DEVICE_VALUES",
     "EvaluationConfig",
     "FineTuningConfig",

@@ -18,6 +18,8 @@ training loop in :mod:`src.utils.training` is unchanged.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from src.recommenders.hp_search import (
     get_strategy,
     sample_hyperparams,
 )
+from src.utils.artifact_names import is_component_artifact, is_finetuned_artifact
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.device import resolve_device
@@ -71,17 +74,6 @@ def get_embedding_files(
     return names
 
 
-def is_component_artifact(stem: str) -> bool:
-    """Whether an embedding stem is a 3-D per-item component artifact.
-
-    Component artifacts (``<extractor>_D<dim>_comp``) feed models that
-    declare ``requires_components`` (e.g. ACF).  They are routed only to
-    those models and excluded from the pooled-embedding pool consumed by
-    every other recommender, so existing models' job lists are unchanged.
-    """
-    return stem.endswith("_comp")
-
-
 def _resolve_embedding_path(embeddings_dir: str, dataset_name: str, stem: str) -> str | None:
     """Map a stem to either ``<stem>.npy`` or ``<stem>.json`` on disk."""
     base = Path(embeddings_dir) / dataset_name
@@ -92,6 +84,85 @@ def _resolve_embedding_path(embeddings_dir: str, dataset_name: str, stem: str) -
     if sidecar.exists():
         return str(sidecar)
     return None
+
+
+@dataclass(frozen=True)
+class _Cell:
+    """One ``(dataset, model, embedding)`` unit of work with its metadata."""
+
+    dataset_name: str
+    model_name: str
+    spec: object
+    embedding_name: str
+    embedding_path: str | None
+    n_users: int
+    n_items: int
+
+
+def _resolve_model_names(config: dict) -> list[str]:
+    """Registered, enabled recommender names in (priority, name) order."""
+    enabled = set(config.get("recommenders_enabled") or [])
+    return [s.name for s in iter_specs() if s.name in enabled]
+
+
+def _iter_cells(
+    condition: str,
+    config: dict,
+    processed_dir: str,
+    embeddings_dir: str,
+    model_names: list[str],
+) -> Iterator[_Cell]:
+    """Yield every eligible training cell for *condition*.
+
+    Single source of truth for cell eligibility (dataset enumeration,
+    frozen/fine-tuned embedding filtering, per-model visual/component
+    source routing, embedding-path resolution).  Both the grid backend
+    (:func:`build_job_list`) and the Optuna backend (:func:`_list_cells`)
+    consume this so their notions of "which cells exist" can never drift.
+    """
+    dim_filter = config.get("embedding_dims", [])
+
+    for dataset_name in config.get("datasets", []):
+        all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
+        if condition == "frozen":
+            embedding_names = [e for e in all_embs if not is_finetuned_artifact(e)]
+        else:
+            embedding_names = [e for e in all_embs if is_finetuned_artifact(e)]
+
+        with open(Path(processed_dir) / dataset_name / "user2idx.json") as f:
+            n_users = len(json.load(f))
+        with open(Path(processed_dir) / dataset_name / "item2idx.json") as f:
+            n_items = len(json.load(f))
+
+        for model_name in model_names:
+            spec = get_recommender_spec(model_name)
+            if not spec.requires_visual:
+                # Models that ignore visual features (e.g. plain BPR) only
+                # run in the frozen condition with embedding_name="none".
+                sources = ["none"] if condition == "frozen" else []
+            else:
+                sources = [
+                    e
+                    for e in embedding_names
+                    if is_component_artifact(e) == spec.requires_components
+                ]
+
+            for emb_name in sources:
+                if emb_name == "none":
+                    emb_path = None
+                else:
+                    emb_path = _resolve_embedding_path(embeddings_dir, dataset_name, emb_name)
+                    if emb_path is None:
+                        continue
+                yield _Cell(
+                    dataset_name=dataset_name,
+                    model_name=model_name,
+                    spec=spec,
+                    embedding_name=emb_name,
+                    embedding_path=emb_path,
+                    n_users=n_users,
+                    n_items=n_items,
+                )
 
 
 def get_hyperparam_grid(model_name: str, config: dict) -> list[dict]:
@@ -130,11 +201,8 @@ def build_job_list(
     device: str,
 ) -> list[TrainingJob]:
     """Return the list of pending training jobs for the given condition."""
-    datasets = config.get("datasets", [])
     checkpoint_mgr = CheckpointManager()
     jobs: list[TrainingJob] = []
-
-    dim_filter = config.get("embedding_dims", [])
 
     enabled = config.get("recommenders_enabled")
     if enabled is None or not enabled:
@@ -144,81 +212,42 @@ def build_job_list(
             "[bpr, vbpr] to enable them. Registered recommenders: %s",
             ", ".join(registered_recommender_names()),
         )
-        model_names: list[str] = []
-    else:
-        unknown = [m for m in enabled if not is_registered(m)]
-        if unknown:
-            logger.warning(
-                "recommenders_enabled lists unregistered models (skipped): %s. "
-                "Registered recommenders: %s",
-                ", ".join(sorted(unknown)),
-                ", ".join(registered_recommender_names()),
+        return jobs
+
+    unknown = [m for m in enabled if not is_registered(m)]
+    if unknown:
+        logger.warning(
+            "recommenders_enabled lists unregistered models (skipped): %s. "
+            "Registered recommenders: %s",
+            ", ".join(sorted(unknown)),
+            ", ".join(registered_recommender_names()),
+        )
+    # Iterate in (priority, name) order so cheaper models train first.
+    model_names = _resolve_model_names(config)
+
+    for cell in _iter_cells(condition, config, processed_dir, embeddings_dir, model_names):
+        experiment_key = f"{cell.dataset_name}_{cell.embedding_name}_{cell.model_name}"
+        completed = checkpoint_mgr.load_grid_search_progress(experiment_key)
+        completed_hashes = {json.dumps(c["hyperparams"], sort_keys=True) for c in completed}
+
+        for hp in get_hyperparam_grid(cell.model_name, config):
+            if json.dumps(hp, sort_keys=True) in completed_hashes:
+                continue
+
+            jobs.append(
+                TrainingJob(
+                    dataset_name=cell.dataset_name,
+                    model_name=cell.model_name,
+                    embedding_name=cell.embedding_name,
+                    hyperparams=hp,
+                    n_users=cell.n_users,
+                    n_items=cell.n_items,
+                    embeddings_path=cell.embedding_path,
+                    processed_dir=processed_dir,
+                    device=device,
+                    priority=cell.spec.priority,
+                )
             )
-        # Iterate in (priority, name) order so cheaper models train first.
-        enabled_set = set(enabled)
-        model_names = [s.name for s in iter_specs() if s.name in enabled_set]
-
-    for dataset_name in datasets:
-        all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
-        if condition == "frozen":
-            embedding_names = [e for e in all_embs if "_finetuned" not in e]
-        else:
-            embedding_names = [e for e in all_embs if "_finetuned" in e]
-
-        with open(Path(processed_dir) / dataset_name / "user2idx.json") as f:
-            n_users = len(json.load(f))
-        with open(Path(processed_dir) / dataset_name / "item2idx.json") as f:
-            n_items = len(json.load(f))
-
-        for model_name in model_names:
-            spec = get_recommender_spec(model_name)
-            if not spec.requires_visual:
-                # Models that ignore visual features (e.g. plain BPR) only
-                # run in the frozen condition with embedding_name="none".
-                sources = ["none"] if condition == "frozen" else []
-            else:
-                sources = [
-                    e
-                    for e in embedding_names
-                    if is_component_artifact(e) == spec.requires_components
-                ]
-
-            for emb_name in sources:
-                experiment_key = f"{dataset_name}_{emb_name}_{model_name}"
-                completed = checkpoint_mgr.load_grid_search_progress(experiment_key)
-                completed_hashes = {json.dumps(c["hyperparams"], sort_keys=True) for c in completed}
-
-                grid = get_hyperparam_grid(model_name, config)
-
-                if emb_name == "none":
-                    emb_path = None
-                else:
-                    emb_path = _resolve_embedding_path(
-                        embeddings_dir,
-                        dataset_name,
-                        emb_name,
-                    )
-                    if emb_path is None:
-                        continue
-
-                for hp in grid:
-                    if json.dumps(hp, sort_keys=True) in completed_hashes:
-                        continue
-
-                    jobs.append(
-                        TrainingJob(
-                            dataset_name=dataset_name,
-                            model_name=model_name,
-                            embedding_name=emb_name,
-                            hyperparams=hp,
-                            n_users=n_users,
-                            n_items=n_items,
-                            embeddings_path=emb_path,
-                            processed_dir=processed_dir,
-                            device=device,
-                            priority=spec.priority,
-                        )
-                    )
 
     return jobs
 
@@ -395,56 +424,19 @@ def _list_cells(
 ) -> list[tuple[CellKey, int, int, str | None]]:
     """Enumerate every ``(dataset, model, embedding)`` cell to optimise.
 
-    Mirrors the iteration in :func:`build_job_list` but stops at the
-    cell granularity (no per-HP enumeration).
+    Shares :func:`_iter_cells` with :func:`build_job_list` but stops at
+    the cell granularity (no per-HP enumeration).
     """
-    out: list[tuple[CellKey, int, int, str | None]] = []
-    enabled = set(config.get("recommenders_enabled") or [])
-    model_names = [s.name for s in iter_specs() if s.name in enabled]
-    dim_filter = config.get("embedding_dims", [])
-
-    for dataset_name in config.get("datasets", []):
-        all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
-        if condition == "frozen":
-            embedding_names = [e for e in all_embs if "_finetuned" not in e]
-        else:
-            embedding_names = [e for e in all_embs if "_finetuned" in e]
-
-        with open(Path(processed_dir) / dataset_name / "user2idx.json") as f:
-            n_users = len(json.load(f))
-        with open(Path(processed_dir) / dataset_name / "item2idx.json") as f:
-            n_items = len(json.load(f))
-
-        for model_name in model_names:
-            spec = get_recommender_spec(model_name)
-            if not spec.requires_visual:
-                sources = ["none"] if condition == "frozen" else []
-            else:
-                sources = [
-                    e
-                    for e in embedding_names
-                    if is_component_artifact(e) == spec.requires_components
-                ]
-            for emb_name in sources:
-                if emb_name == "none":
-                    emb_path = None
-                else:
-                    emb_path = _resolve_embedding_path(
-                        embeddings_dir,
-                        dataset_name,
-                        emb_name,
-                    )
-                    if emb_path is None:
-                        continue
-                out.append(
-                    (
-                        CellKey(dataset_name, model_name, emb_name),
-                        n_users,
-                        n_items,
-                        emb_path,
-                    )
-                )
-    return out
+    model_names = _resolve_model_names(config)
+    return [
+        (
+            CellKey(cell.dataset_name, cell.model_name, cell.embedding_name),
+            cell.n_users,
+            cell.n_items,
+            cell.embedding_path,
+        )
+        for cell in _iter_cells(condition, config, processed_dir, embeddings_dir, model_names)
+    ]
 
 
 def _train_one_optuna_trial(

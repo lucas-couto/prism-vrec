@@ -121,7 +121,9 @@ def scan_user_datasets(root: Path | str = _USER_DATASETS_ROOT) -> list[str]:
     if registered:
         logger.info(
             "Auto-registered %d user dataset(s) under %s: %s",
-            len(registered), root, ", ".join(registered),
+            len(registered),
+            root,
+            ", ".join(registered),
         )
     return registered
 
@@ -144,7 +146,9 @@ def _resolve_factory(name: str, directory: Path) -> Callable[[], DatasetProvider
 
     logger.warning(
         "plugins/datasets/%s: missing %s and missing %s — skipping.",
-        name, "/".join(_REQUIRED_DIRECT), _SOURCE_FILE,
+        name,
+        "/".join(_REQUIRED_DIRECT),
+        _SOURCE_FILE,
     )
     return None
 
@@ -165,7 +169,9 @@ def _check_direct_layout(directory: Path) -> tuple[Path, Path, Path | None] | No
 
 
 def _build_from_source_yaml(
-    name: str, directory: Path, source_yaml: Path,
+    name: str,
+    directory: Path,
+    source_yaml: Path,
 ) -> DatasetProvider:
     """Materialise the dataset from a ``source.yaml`` declaration.
 
@@ -182,7 +188,8 @@ def _build_from_source_yaml(
     if csv_target.exists() and images_target.is_dir():
         logger.info(
             "%s: source.yaml already materialised at %s, skipping fetch.",
-            name, raw_dir,
+            name,
+            raw_dir,
         )
     else:
         with open(source_yaml, "r", encoding="utf-8") as fh:
@@ -206,8 +213,7 @@ def _fetch_resource(spec: dict, target: Path, expect_dir: bool = False) -> None:
     """
     if not spec:
         raise ValueError(
-            f"source.yaml entry for {target.name!r} is missing — "
-            f"specify either 'url' or 'path'."
+            f"source.yaml entry for {target.name!r} is missing — specify either 'url' or 'path'."
         )
 
     if "path" in spec:
@@ -226,9 +232,7 @@ def _fetch_resource(spec: dict, target: Path, expect_dir: bool = False) -> None:
         return
 
     if "url" not in spec:
-        raise ValueError(
-            f"source.yaml entry for {target.name!r} must contain 'url' or 'path'."
-        )
+        raise ValueError(f"source.yaml entry for {target.name!r} must contain 'url' or 'path'.")
 
     url = spec["url"]
     if expect_dir:
@@ -251,6 +255,7 @@ def _stream_download(url: str, target: Path) -> None:
     partial = target.with_suffix(target.suffix + ".partial")
 
     logger.info("Downloading %s -> %s", url, target)
+    written = 0
     with requests.get(url, stream=True, timeout=600) as response:
         response.raise_for_status()
         total = int(response.headers.get("content-length", "0") or 0)
@@ -260,7 +265,18 @@ def _stream_download(url: str, target: Path) -> None:
         ):
             for chunk in response.iter_content(chunk_size=1 << 20):
                 fout.write(chunk)
+                written += len(chunk)
                 pbar.update(len(chunk))
+
+    # Verify completeness before promoting the .partial file. A
+    # connection that ends early without raising would otherwise leave a
+    # truncated file at the final name, and the exists()-based skip would
+    # never re-fetch it.
+    if total and written != total:
+        partial.unlink(missing_ok=True)
+        raise OSError(
+            f"Incomplete download of {url}: got {written} of {total} bytes. Re-run to retry."
+        )
     partial.rename(target)
 
 
@@ -276,7 +292,14 @@ def _extract_archive(archive: Path, target_dir: Path) -> None:
 
     if tarfile.is_tarfile(archive):
         with tarfile.open(archive) as tf:
-            tf.extractall(target_dir, filter="data")  # python 3.12+ filter; falls back gracefully
+            # The 'data' filter (path-traversal protection) exists on
+            # CPython 3.12+ and 3.11.4+; on 3.11.0-3.11.3 the keyword is
+            # absent and raises TypeError, so fall back to a plain
+            # extract (plugin archives are trusted local content).
+            try:
+                tf.extractall(target_dir, filter="data")
+            except TypeError:
+                tf.extractall(target_dir)
         logger.info("Extracted %s into %s", archive.name, target_dir)
         return
 

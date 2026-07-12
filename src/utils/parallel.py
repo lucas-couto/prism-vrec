@@ -7,6 +7,7 @@ the pool accordingly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ from queue import Empty
 import torch
 import torch.multiprocessing as mp
 
+from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,8 +64,13 @@ class TrainingJob:
 
     @property
     def job_id(self) -> str:
-        hp_hash = hash(json.dumps(self.hyperparams, sort_keys=True)) & 0xFFFFFF
-        return f"{self.dataset_name}_{self.embedding_name}_{self.model_name}_{hp_hash:06x}"
+        # hashlib, not hash(): built-in str hashing is salted per process
+        # (PYTHONHASHSEED), so spawned workers would compute a different id
+        # than the parent and OOM-retry matching would silently never fire.
+        digest = hashlib.md5(
+            json.dumps(self.hyperparams, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return f"{self.dataset_name}_{self.embedding_name}_{self.model_name}_{digest[:6]}"
 
 
 def detect_max_workers(device: str = "cuda") -> int:
@@ -110,10 +117,12 @@ def _locked_append_grid_progress(path: Path, entry: dict) -> None:
                 with open(path) as f:
                     existing = json.load(f)
             existing.append(entry)
-            tmp = path.with_suffix(".json.tmp")
-            with open(tmp, "w") as f:
-                json.dump(existing, f, indent=2)
-            tmp.rename(path)
+            # fsync + retried replace (networked-FS dirent lag); the
+            # surrounding flock already serialises the read-modify-write.
+            atomic_write(
+                lambda tmp: Path(tmp).write_text(json.dumps(existing, indent=2)),
+                path,
+            )
         finally:
             _unlock_file(lf)
 

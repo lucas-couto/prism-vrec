@@ -16,10 +16,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.recommenders._scoring import LinearVisualScoreMixin
 from src.recommenders.base import BaseRecommender
 
 
-class AVBPR(BaseRecommender):
+class AVBPR(LinearVisualScoreMixin, BaseRecommender):
     """VBPR extended with a learned attention mechanism over the visual
     projection.
 
@@ -50,7 +51,8 @@ class AVBPR(BaseRecommender):
         kv: int = config.get("visual_dim", k)
         att_hidden: int = config["att_hidden"]
 
-        assert self.visual_features is not None, "AVBPR requires visual embeddings"
+        if self.visual_features is None:
+            raise RuntimeError("AVBPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)
@@ -79,11 +81,10 @@ class AVBPR(BaseRecommender):
 
         self._item_proj_cache: torch.Tensor | None = None
 
-    def train(self, mode: bool = True) -> AVBPR:
-        self._item_proj_cache = None
-        return super().train(mode)
+    def _visual_user_table(self) -> nn.Embedding:
+        return self.visual_user_embedding
 
-    def _attended_visual(self, item_ids: torch.Tensor) -> torch.Tensor:
+    def _item_visual_term(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Compute attention-weighted visual embedding for items.
 
         Returns theta_hat = theta_i * softmax(MLP_att(theta_i)).
@@ -105,48 +106,3 @@ class AVBPR(BaseRecommender):
         if cache_eligible and item_ids.shape[0] == self.n_items:
             self._item_proj_cache = proj
         return proj
-
-    def forward(
-        self,
-        user_ids: torch.Tensor,
-        pos_item_ids: torch.Tensor,
-        neg_item_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        gamma_u = self.user_embedding(user_ids)
-        alpha_u = self.visual_user_embedding(user_ids)
-
-        # Combine pos and neg item lookups into a single (2B,)-batched
-        # forward.  attention_net softmax applies per-row (dim=-1), so
-        # concatenating along dim 0 is mathematically equivalent to two
-        # independent B-sized calls while reducing kernel launches.
-        B = pos_item_ids.shape[0]
-        all_items = torch.cat([pos_item_ids, neg_item_ids], dim=0)
-        gamma_all = self.item_embedding(all_items)
-        beta_all = self.item_bias(all_items).squeeze(-1)
-        theta_all = self._attended_visual(all_items)
-
-        gamma_pos, gamma_neg = gamma_all[:B], gamma_all[B:]
-        beta_pos, beta_neg = beta_all[:B], beta_all[B:]
-        theta_pos, theta_neg = theta_all[:B], theta_all[B:]
-
-        score_pos = (gamma_u * gamma_pos).sum(-1) + (alpha_u * theta_pos).sum(-1) + beta_pos
-        score_neg = (gamma_u * gamma_neg).sum(-1) + (alpha_u * theta_neg).sum(-1) + beta_neg
-        return score_pos, score_neg
-
-    def predict(self, user_id: int, item_ids: torch.Tensor) -> torch.Tensor:
-        gamma_u = self.user_embedding.weight[user_id]
-        gamma_i = self.item_embedding(item_ids)
-        beta_i = self.item_bias(item_ids).squeeze(-1)
-        alpha_u = self.visual_user_embedding.weight[user_id]
-        theta_i = self._attended_visual(item_ids)
-
-        return (gamma_u * gamma_i).sum(-1) + (alpha_u * theta_i).sum(-1) + beta_i
-
-    def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
-        gamma_u = self.user_embedding(user_ids)
-        gamma_i = self.item_embedding(item_ids)
-        beta_i = self.item_bias(item_ids).squeeze(-1)
-        alpha_u = self.visual_user_embedding(user_ids)
-        theta_i = self._attended_visual(item_ids)
-
-        return gamma_u @ gamma_i.T + alpha_u @ theta_i.T + beta_i.unsqueeze(0)

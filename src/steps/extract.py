@@ -52,8 +52,12 @@ class ImageDataset(Dataset):
                 stem, ext = os.path.splitext(name)
                 if ext.lower() in valid_exts and stem not in files_by_stem:
                     files_by_stem[stem] = self.image_dir / name
-        except (FileNotFoundError, NotADirectoryError):
-            pass
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            logger.warning(
+                "Image directory %s is missing or not a directory (%s); dataset will be empty.",
+                self.image_dir,
+                exc,
+            )
 
         for item_id in item_ids:
             path = files_by_stem.get(str(item_id))
@@ -117,6 +121,13 @@ def _extract_for_config(
     extractor = extractor_cls(device=device, output_dim=dim)
 
     dataset = ImageDataset(image_dir, item_ids, transform=extractor.transform)
+    if len(dataset) == 0:
+        # Fail loudly: extracting over zero items would write a degenerate
+        # .npy that downstream steps then skip forever as "already exists".
+        raise RuntimeError(
+            f"No images found in {image_dir} for dataset '{dataset_name}' "
+            f"({len(item_ids)} items expected). Check paths.data_raw."
+        )
     extract_settings = resolve_dataloader_settings(load_config())
     dataloader = DataLoader(
         dataset,
@@ -166,7 +177,7 @@ def run() -> None:
     projection_dims = config.get("projection_dims", [64, 128, 256])
     batch_size = config.get("batch_size", 64)
     checkpoint_every = config.get("checkpoint_every", 500)
-    datasets = config.get("datasets", ["amazon_fashion", "amazon_women", "amazon_men"])
+    datasets = config.get("datasets", [])
     extract_components = bool(config.get("extract_components", False))
 
     # Instantiating the manager guarantees the on-disk directories exist.

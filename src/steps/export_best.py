@@ -15,27 +15,16 @@ import re
 from pathlib import Path
 
 from src.recommenders.registry import registered_recommender_names
+from src.utils.artifact_names import BEST_SUFFIX, parse_checkpoint_stem
 from src.utils.config import load_config
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-
-def _parse_checkpoint_stem(stem: str, known_models: list[str]) -> tuple[str, str] | None:
-    """Split ``{model_name}_{embedding_name}`` filename stem.
-
-    Recommender names may contain underscores (e.g. ``uniform_noise``),
-    so the boundary cannot be inferred positionally — we match the
-    longest registered recommender name as the *prefix*.  Returns
-    ``(model_name, embedding_name)`` or ``None`` when no registered
-    model matches.
-    """
-    for candidate in known_models:
-        if stem == candidate:
-            return candidate, "none"
-        if stem.startswith(candidate + "_"):
-            return candidate, stem[len(candidate) + 1 :]
-    return None
+# Re-exported under the historical private name so existing callers and
+# tests keep working; the canonical implementation lives in
+# src.utils.artifact_names.
+_parse_checkpoint_stem = parse_checkpoint_stem
 
 
 def _natural_sort_key(key: str) -> list:
@@ -73,8 +62,8 @@ def export_best_hyperparams(models_root: Path, output_path: Path) -> dict:
     for dataset_dir in sorted(p for p in models_root.iterdir() if p.is_dir()):
         dataset = dataset_dir.name
         for pt_path in sorted(dataset_dir.glob("*_best.pt")):
-            parsed = _parse_checkpoint_stem(
-                pt_path.stem.replace("_best", ""),
+            parsed = parse_checkpoint_stem(
+                pt_path.stem.replace(BEST_SUFFIX, ""),
                 known_models,
             )
             if parsed is None:

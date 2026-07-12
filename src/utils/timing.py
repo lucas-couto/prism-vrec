@@ -34,6 +34,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -105,8 +106,9 @@ class _TimingRecorder:
         if self._run_dir is None:
             return
         path = self._run_dir / "step_timings.json"
+        payload = json.dumps(self._cells, indent=2)
         try:
-            path.write_text(json.dumps(self._cells, indent=2))
+            atomic_write(lambda tmp: Path(tmp).write_text(payload), path)
         except OSError as exc:
             logger.warning("failed to write %s: %r", path, exc)
 

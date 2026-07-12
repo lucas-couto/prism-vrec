@@ -4,13 +4,36 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
+from torchvision import transforms
 from tqdm import tqdm
 
 from src.utils.amp_compat import cuda_autocast
 from src.utils.atomic_io import atomic_np_save
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+#: ImageNet channel statistics shared by the torchvision/timm backbones.
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-class BaseExtractor(abc.ABC):
+def _imagenet_transform(
+    size: int = 224,
+    interpolation: transforms.InterpolationMode = transforms.InterpolationMode.BILINEAR,
+) -> transforms.Compose:
+    """Standard resize + ImageNet normalisation pipeline."""
+    return transforms.Compose(
+        [
+            transforms.Resize((size, size), interpolation=interpolation),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
+        ]
+    )
+
+
+class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set backbone_cls
     """Abstract base class for visual feature extractors.
 
     Plugin-author hooks
@@ -46,21 +69,43 @@ class BaseExtractor(abc.ABC):
     #: path is unaffected.
     supports_components: bool = False
 
-    def __init__(self, device: str, output_dim: int):
+    #: Backbone :class:`nn.Module` class instantiated by the default
+    #: :meth:`_build_model` as ``backbone_cls(output_dim=self.output_dim)``.
+    #: The backbone's last submodule must be named ``projection`` (see the
+    #: class docstring).  A subclass may instead override :meth:`_build_model`.
+    backbone_cls: type[nn.Module] | None = None
+
+    def __init__(self, device: str = "cuda", output_dim: int = 128):
         self.device = torch.device(device)
         self.output_dim = output_dim
-        self.model = None
-        self.transform = None
+        self.model = self._build_model()
+        self.transform = self._build_transform()
 
-    @abc.abstractmethod
-    def _build_model(self):
-        """Build and return the feature extraction model."""
-        ...
+    def _build_model(self) -> nn.Module:
+        """Instantiate ``backbone_cls`` on the target device in eval mode.
 
-    @abc.abstractmethod
+        Subclasses that use a non-trivial construction path (e.g. an
+        ``open_clip`` preprocess) override this instead of setting
+        ``backbone_cls``.
+        """
+        if self.backbone_cls is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must set backbone_cls or override _build_model()."
+            )
+        model = self.backbone_cls(output_dim=self.output_dim)
+        model = model.to(self.device)
+        model.eval()
+        return model
+
     def _build_transform(self):
-        """Build and return the image transform pipeline."""
-        ...
+        """Return the image transform pipeline.
+
+        Defaults to the standard 224x224 resize + ImageNet normalisation
+        used by most torchvision/timm backbones.  Subclasses whose
+        backbone expects a different pipeline (e.g. bicubic resize, an
+        ``open_clip`` preprocess) override this.
+        """
+        return _imagenet_transform()
 
     def extract(self, image) -> np.ndarray:
         """Extract embedding from a single PIL image.
@@ -120,9 +165,10 @@ class BaseExtractor(abc.ABC):
                 all_embeddings = [ckpt["embeddings"]]
                 all_item_ids = ckpt["item_ids"]
                 start_batch = ckpt["last_batch_index"] + 1
-                print(
-                    f"Resuming from checkpoint: {len(all_item_ids)} items, "
-                    f"starting at batch {start_batch}"
+                logger.info(
+                    "Resuming from checkpoint: %d items, starting at batch %d",
+                    len(all_item_ids),
+                    start_batch,
                 )
 
         use_amp = self.device.type == "cuda"
@@ -158,7 +204,9 @@ class BaseExtractor(abc.ABC):
                         },
                         checkpoint_path,
                     )
-                    print(f"Checkpoint saved at batch {batch_idx} ({len(all_item_ids)} items)")
+                    logger.info(
+                        "Checkpoint saved at batch %d (%d items)", batch_idx, len(all_item_ids)
+                    )
 
         if len(all_embeddings) == 0:
             final_embeddings = np.empty((0, self.output_dim), dtype=np.float32)
@@ -181,15 +229,19 @@ class BaseExtractor(abc.ABC):
     def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
         """Return per-item component features ``(B, M, output_dim)``.
 
-        Override in subclasses that expose pre-pool features (spatial
-        feature-map cells or patch tokens) and set
-        :attr:`supports_components` to ``True``.  Components are passed
-        through the SAME trainable ``projection`` as the pooled path, so
-        the last dimension is ``output_dim``.
+        Default: delegate to the backbone's ``forward_components`` when
+        the extractor advertises ``supports_components = True`` (every
+        built-in backbone exposes that method).  Extractors that do not
+        expose components raise, and those with a non-standard component
+        path may override this method.  Components pass through the SAME
+        trainable ``projection`` as the pooled path, so the last
+        dimension is ``output_dim``.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not expose component features.",
-        )
+        if not self.supports_components:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not expose component features.",
+            )
+        return self.model.forward_components(images)
 
     def extract_components_batch(
         self,
@@ -265,7 +317,9 @@ class BaseExtractor(abc.ABC):
         atomic_np_save(components, npy_path)
         with open(json_path, "w") as f:
             json.dump(item_ids, f)
-        print(f"Saved {len(item_ids)} component features to {npy_path} ({components.shape})")
+        logger.info(
+            "Saved %d component features to %s (%s)", len(item_ids), npy_path, components.shape
+        )
 
     def save(self, embeddings: np.ndarray, item_ids: list, path: str):
         """Save embeddings as ``.npy`` and item_ids as ``.json``.
@@ -290,5 +344,5 @@ class BaseExtractor(abc.ABC):
         with open(json_path, "w") as f:
             json.dump(item_ids, f)
 
-        print(f"Saved {len(item_ids)} embeddings to {npy_path}")
-        print(f"Saved item ids to {json_path}")
+        logger.info("Saved %d embeddings to %s", len(item_ids), npy_path)
+        logger.info("Saved item ids to %s", json_path)

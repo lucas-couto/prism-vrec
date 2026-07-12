@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-vrec"
-version = "1.1.1"
+version = "1.1.2"
 description = "A reproducible framework for evaluating visual feature extractors in recommender systems — pure architectures, CNN-Transformer hybrids, foundation models, and late-fusion strategies."
 requires-python = ">=3.11,<3.13"
 keywords = [
@@ -75,6 +75,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-ra --strict-markers"
+markers = [
+    "slow: instantiates a real backbone and downloads pretrained weights on first run",
+]
 
 [tool.ruff]
 target-version = "py311"

@@ -8,6 +8,80 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-07-11
+
+Quality pass across the whole codebase (driven by a full multi-agent
+audit). No change to the experimental protocol: every model refactor was
+verified byte-identical (state_dict keys, seeded weights, forward /
+predict / component outputs) before landing.
+
+### Fixed
+
+- **Parallel OOM retries were silently dropped.** ``TrainingJob.job_id``
+  used Python's per-process-salted ``hash()``, so the id computed inside
+  a spawned worker never matched the parent's copy and OOM'd jobs were
+  never requeued. Now derived from a deterministic ``hashlib`` digest.
+- **Empty image datasets no longer "succeed" silently.** A wrong or
+  unmounted ``image_dir`` was swallowed by a bare ``except``; extraction
+  then wrote a degenerate ``.npy`` (skipped forever as "already exists")
+  and fine-tuning ran 0 batches, early-stopped at ``val_acc=0``, and
+  saved untouched weights labelled as fine-tuned. Both paths now log and
+  raise.
+- **DINOv2 ``torch.hub`` load is pinned to a commit** instead of tracking
+  the remote default branch, closing a reproducibility hole (verified
+  byte-identical to the previously cached checkout).
+- **Fine-tuning resume is now bit-identical.** The resume checkpoint
+  persists and restores RNG + GradScaler state, so an interrupted-then-
+  resumed run draws the same shuffle/augmentation sequence as an
+  uninterrupted one. *(Behaviour change for resumed fine-tuning runs.)*
+- Fusion strategies warn on unknown ``**kwargs`` (a typo'd hyperparameter
+  was silently discarded); ``asserts`` guarding required visual
+  embeddings became ``raise`` (asserts are stripped under ``python -O``).
+- All durable writes (run manifest, carbon block, fine-tuning
+  checkpoints, best-model, grid progress, timing sidecar, reports,
+  category CSVs) now go through the fsync+retry ``atomic_io.atomic_write``
+  instead of hand-rolled tmp+rename; several silently-swallowed
+  exceptions now log.
+- ``evaluate._route_targets`` matched ``"finetuned"`` while ``train``
+  matched ``"_finetuned"``; both now use one shared rule, so an extractor
+  named ``finetuned_*`` can't be mis-routed.
+- Plugin data downloads verify ``Content-Length`` before promoting the
+  ``.partial`` file; tar extraction falls back gracefully when the
+  ``filter="data"`` kwarg is absent (3.11.0–3.11.3).
+
+### Added
+
+- Typed ``common`` recommender-training block and ``k_values`` in the
+  config schema (previously untyped via ``extra="allow"``, so a typo
+  reverted runs to hidden defaults).
+- ``PRISM_RUN_ID`` / ``PRISM_SKIP_CONFIG_VALIDATION`` env vars (legacy
+  ``HVR_`` names still honoured).
+- Direct unit tests for ``metrics.py`` (hand-computed values) and model
+  contract tests for bpr/vbpr/avbpr/deepstyle/vnpr; a ``slow`` pytest
+  marker isolates backbone-downloading tests, with a dedicated CI job
+  that caches the weights.
+
+### Changed
+
+- **Deduplicated the model layer** with no behavioural change: the eight
+  extractors now share ``BaseExtractor`` boilerplate via a ``backbone_cls``
+  hook (−137 lines), and vbpr/avbpr/deepstyle share a
+  ``LinearVisualScoreMixin`` (−138 lines). Both verified byte-identical.
+- The three plugin ``auto_register`` scanners collapse into one
+  ``utils.plugin_scan``; the filename-routing tokens
+  (``_finetuned``/``_comp``/``hybrid_``/``_best``) and the checkpoint-stem
+  parser are centralised in ``utils.artifact_names``; ``build_job_list``
+  and ``_list_cells`` share one cell-enumeration generator (verified
+  identical job ordering).
+- Config comments translated to English; CI ``ruff`` pinned to the
+  pre-commit version.
+
+### Removed
+
+- Dead ``src/data/preprocessing.py`` (``kcore_filter`` /
+  ``leave_one_out_split`` / ``build_mappings``): exported but unused, and
+  ``leave_one_out_split`` predated the 3-way split protocol.
+
 ## [1.1.1] - 2026-06-18
 
 ### Changed
@@ -295,7 +369,8 @@ This version covers the contracts the framework exposes to outside users
   `src/utils/manifest.py` replaced with the `datetime.UTC` alias
   (Python 3.11+), addressing ruff `UP017`.
 
-[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/lucas-couto/prism-vrec/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/lucas-couto/prism-vrec/releases/tag/v1.0.0
