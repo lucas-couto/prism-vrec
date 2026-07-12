@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
 from src.data.base import DatasetProvider, register_dataset_provider
@@ -340,8 +339,8 @@ class DVBPRDataLoader(DatasetProvider):
         unique_labels = sorted(df["category_label"].unique())
         remap = {lbl: i for i, lbl in enumerate(unique_labels)}
         return {
-            str(row["item_id"]): remap[row["category_label"]]
-            for _, row in df.iterrows()
+            str(item_id): remap[label]
+            for item_id, label in zip(df["item_id"], df["category_label"], strict=True)
         }
 
     def extract_images(self, image_dir: str | Path) -> None:

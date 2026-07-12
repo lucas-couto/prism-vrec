@@ -75,8 +75,8 @@ Users with fewer than 3 interactions are dropped.  Override
 from __future__ import annotations
 
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -173,15 +173,27 @@ class CSVDatasetProvider(DatasetProvider):
 
         dataset_dir = self.images_dir.parent
 
+        # Build the item_id -> image_path lookup once. The per-item
+        # ``df.loc[df["item_id"] == ...]`` scan was O(n_items x n_rows).
+        path_by_item = {
+            str(item_id): str(rel)
+            for item_id, rel in zip(df["item_id"], df["image_path"], strict=True)
+        }
+
         item_images: dict[str, Path] = {}
+        missing = 0
         for item_str in item2idx:
-            row = df.loc[df["item_id"] == item_str].iloc[0]
-            rel = str(row["image_path"])
+            rel = path_by_item.get(item_str)
+            if rel is None:
+                missing += 1
+                continue
             src = (dataset_dir / rel).resolve()
             if not src.exists():
                 src = (self.images_dir / rel).resolve()
             if src.exists():
                 item_images[item_str] = src
+            else:
+                missing += 1
 
         copied = 0
         skipped = 0
@@ -194,8 +206,11 @@ class CSVDatasetProvider(DatasetProvider):
             shutil.copyfile(src, dest)
             copied += 1
         logger.info(
-            "%s: %d images copied, %d skipped (already on disk)",
-            self.name, copied, skipped,
+            "%s: %d images copied, %d skipped (already on disk), %d without a resolvable image",
+            self.name,
+            copied,
+            skipped,
+            missing,
         )
 
     def load_categories(self) -> dict[str, int] | None:

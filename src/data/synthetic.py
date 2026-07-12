@@ -18,7 +18,6 @@ Register it under whichever name your config references via
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -147,8 +146,8 @@ class SyntheticDatasetProvider(DatasetProvider):
         unique = sorted(df["category_label"].unique())
         remap = {lbl: i for i, lbl in enumerate(unique)}
         return {
-            str(row["item_id"]): remap[row["category_label"]]
-            for _, row in df.iterrows()
+            str(item_id): remap[label]
+            for item_id, label in zip(df["item_id"], df["category_label"], strict=True)
         }
 
     def num_categories(self) -> int:

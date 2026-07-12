@@ -38,10 +38,10 @@ logger = get_logger(__name__)
 def _build_interactions(df: pd.DataFrame) -> dict[int, set[int]]:
     """Build ``{user_idx: set(item_idx)}`` from a (user_idx, item_idx) DataFrame."""
     interactions: dict[int, set[int]] = {}
-    for _, row in df.iterrows():
-        u = int(row["user_idx"])
-        i = int(row["item_idx"])
-        interactions.setdefault(u, set()).add(i)
+    # zip over the two columns instead of iterrows(): the latter
+    # materialises a Series per row, ~10x slower on million-row CSVs.
+    for u, i in zip(df["user_idx"], df["item_idx"], strict=True):
+        interactions.setdefault(int(u), set()).add(int(i))
     return interactions
 
 
