@@ -10,6 +10,10 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 class CategoryDataset(Dataset):
     """PyTorch dataset for item category classification.
@@ -76,8 +80,12 @@ class CategoryDataset(Dataset):
                 if ext.lower() in valid_exts and stem not in existing_paths:
                     existing_ids.add(stem)
                     existing_paths[stem] = self.image_dir / name
-        except (FileNotFoundError, NotADirectoryError):
-            pass
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            logger.warning(
+                "Image directory %s is missing or not a directory (%s); dataset will be empty.",
+                self.image_dir,
+                exc,
+            )
         self._paths = existing_paths
 
         self.items: list[tuple[str, int]] = [

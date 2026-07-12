@@ -100,6 +100,16 @@ def _finetune_and_extract(
         )
         val_ds = CategoryDataset(image_dir, val_cats, transform=extractor.transform, augment=False)
 
+        if len(train_ds) == 0 or len(val_ds) == 0:
+            # Fail loudly: an empty loader would run 0 batches per epoch,
+            # early-stop at val_acc=0.0 and save untouched weights labeled
+            # as a fine-tuned model, silently poisoning re-extraction.
+            raise RuntimeError(
+                f"Empty fine-tuning dataset for '{dataset_name}' "
+                f"(train={len(train_ds)}, val={len(val_ds)} items) — "
+                f"check image_dir {image_dir}."
+            )
+
         batch_size = int(ft_config.get("batch_size", 128))
         use_cuda = device != "cpu" and torch.cuda.is_available()
         loader_settings = resolve_dataloader_settings(load_config())
