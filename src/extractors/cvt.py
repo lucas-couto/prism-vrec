@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torchvision import transforms
 from transformers import CvtModel
 
 from src.extractors.base import BaseExtractor
@@ -54,28 +53,4 @@ class CvTExtractor(BaseExtractor):
     #: CvT exposes its final-stage spatial tokens (14x14=196) for ACF.
     supports_components = True
 
-    def __init__(self, device: str = "cuda", output_dim: int = 128):
-        super().__init__(device=device, output_dim=output_dim)
-        self.model = self._build_model()
-        self.transform = self._build_transform()
-
-    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model.forward_components(images)
-
-    def _build_model(self) -> nn.Module:
-        model = _CvTBackbone(output_dim=self.output_dim)
-        model = model.to(self.device)
-        model.eval()
-        return model
-
-    def _build_transform(self) -> transforms.Compose:
-        return transforms.Compose(
-            [
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
+    backbone_cls = _CvTBackbone

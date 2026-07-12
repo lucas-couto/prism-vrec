@@ -67,20 +67,9 @@ class CLIPExtractor(BaseExtractor):
     #: CLIP exposes its 49 patch tokens (via open_clip output_tokens) for ACF.
     supports_components = True
 
-    def __init__(self, device: str = "cuda", output_dim: int = 128):
-        super().__init__(device=device, output_dim=output_dim)
-        self._backbone = _CLIPVisualBackbone(output_dim=self.output_dim)
-        self.model = self._build_model()
-        self.transform = self._build_transform()
-
-    def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model.forward_components(images)
-
-    def _build_model(self) -> nn.Module:
-        model = self._backbone
-        model = model.to(self.device)
-        model.eval()
-        return model
+    backbone_cls = _CLIPVisualBackbone
 
     def _build_transform(self):
-        return self._backbone.preprocess
+        # The transform is the open_clip preprocess carried on the
+        # backbone that the base _build_model already constructed.
+        return self.model.preprocess
