@@ -89,8 +89,10 @@ def _aggregate(df: pd.DataFrame, group_keys: list[str], value_col: str) -> pd.Da
     keys = [k for k in group_keys if k in df.columns]
     grouped = df.groupby(keys, dropna=False)[value_col]
     return grouped.agg(
+        # "std" already uses ddof=1 (NaN for a single seed) and takes the
+        # fast cython path, unlike a per-group python lambda.
         mean_across_seeds="mean",
-        std_across_seeds=lambda s: s.std(ddof=1),
+        std_across_seeds="std",
         median_across_seeds="median",
         min_across_seeds="min",
         max_across_seeds="max",
