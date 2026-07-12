@@ -1,6 +1,6 @@
 """Read granular ``results/tables/`` CSVs and emit long-format files.
 
-The transformation logic lives in :mod:`src.evaluation.long_format`;
+The transformation logic lives in :mod:`src.reporting.long_format`;
 this module orchestrates filesystem IO (globbing + writing the three
 consolidated CSVs).  Pipeline steps call ``write_consolidated`` after
 their normal outputs so the long-format files are always in sync.
@@ -8,7 +8,6 @@ their normal outputs so the long-format files are always in sync.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import pandas as pd
@@ -20,19 +19,26 @@ from src.reporting.long_format import (
     pairwise_to_long,
     summary_to_long,
 )
+from src.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+# Kept in sync with the built-in recommenders so a config is never
+# mislabelled "unknown" if the registry import ever fails.  Any plugin
+# recommender is picked up via the live registry below; this list is
+# only the last-resort fallback.
+_BUILTIN_RECOMMENDERS = ["acf", "avbpr", "bpr", "deepstyle", "vbpr", "vnpr"]
 
 
 def _known_recommenders() -> list[str]:
-    """Pull the recommender registry, falling back to a fixed list."""
+    """Pull the recommender registry, falling back to the built-in list."""
     try:
         from src.recommenders.registry import registered_recommender_names
 
         return list(registered_recommender_names())
     except Exception:  # noqa: BLE001
-        logger.warning("Recommender registry unavailable; using hardcoded fallback list.")
-        return ["bpr", "vbpr", "avbpr", "deepstyle", "vnpr"]
+        logger.warning("Recommender registry unavailable; using built-in fallback list.")
+        return list(_BUILTIN_RECOMMENDERS)
 
 
 def consolidate_evaluation(tables_dir: Path) -> pd.DataFrame:

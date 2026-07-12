@@ -153,14 +153,23 @@ class AdaptiveGatedFusion(nn.Module):
         return torch.sigmoid(self.gate(gate_input))
 
 
+# Maps an online strategy name to the nn.Module that implements it. The
+# error message below derives its list from this dict so the two never
+# drift apart when a new online strategy is added.
+_ONLINE_MODULES: dict[str, type[nn.Module]] = {
+    "adaptive_gated": AdaptiveGatedFusion,
+}
+
+
 def online_module_for(strategy_name: str, dim: int) -> nn.Module:
     """Factory: instantiate the matching online module for a strategy."""
-    if strategy_name == "adaptive_gated":
-        return AdaptiveGatedFusion(dim=dim)
-    raise ValueError(
-        f"Unknown online fusion strategy: {strategy_name!r}. "
-        f"Available online strategies: ['adaptive_gated'].",
-    )
+    factory = _ONLINE_MODULES.get(strategy_name)
+    if factory is None:
+        raise ValueError(
+            f"Unknown online fusion strategy: {strategy_name!r}. "
+            f"Available online strategies: {sorted(_ONLINE_MODULES)}.",
+        )
+    return factory(dim=dim)
 
 
 def load_embedding(path: str | Path):
