@@ -84,7 +84,7 @@ class BaseRecommender(nn.Module, abc.ABC):
             from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
 
             arr = torch.FloatTensor(np.asarray(visual_embeddings))
-            self.register_buffer("visual_features", arr)
+            self.register_buffer("visual_features", arr, persistent=False)
             self.visual_dim_raw = int(visual_embeddings.aligned_dim)
             self._online_fusion = LearnedAlignmentFusion(
                 source_dims=list(source_dims),
@@ -96,17 +96,17 @@ class BaseRecommender(nn.Module, abc.ABC):
         elif visual_embeddings is not None:
             arr = torch.FloatTensor(visual_embeddings)
             if arr.dim() == 3 and not self.consumes_raw_components:
-                self.register_buffer("visual_features", arr)
+                self.register_buffer("visual_features", arr, persistent=False)
                 self.visual_dim_raw = int(arr.shape[-1])
                 self._init_online_fusion(int(arr.shape[1]), self.visual_dim_raw, config)
             elif arr.dim() == 3:
                 # Raw component buffer (n_items, M, D): the consuming model
                 # (e.g. ACF) applies its own component attention; no online
                 # fusion module is created.
-                self.register_buffer("visual_features", arr)
+                self.register_buffer("visual_features", arr, persistent=False)
                 self.visual_dim_raw = int(arr.shape[-1])
             elif arr.dim() == 2:
-                self.register_buffer("visual_features", arr)
+                self.register_buffer("visual_features", arr, persistent=False)
                 self.visual_dim_raw = int(arr.shape[-1])
             else:
                 raise ValueError(

@@ -105,8 +105,8 @@ class ACF(BaseRecommender):
             length = len(chosen)
             items[user, :length] = torch.tensor(chosen, dtype=torch.long)
             mask[user, :length] = True
-        self.register_buffer("history_items", items)
-        self.register_buffer("history_mask", mask)
+        self.register_buffer("history_items", items, persistent=False)
+        self.register_buffer("history_mask", mask, persistent=False)
 
     def _projected_components(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Return ``W_c f`` for items: ``(B, M, kv)``. Cached for all-items lookups."""
