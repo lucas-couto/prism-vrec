@@ -35,7 +35,11 @@ from src.recommenders.hp_search import (
     get_strategy,
     sample_hyperparams,
 )
-from src.utils.artifact_names import is_component_artifact, is_finetuned_artifact
+from src.utils.artifact_names import (
+    FUSION_PREFIX,
+    is_component_artifact,
+    is_finetuned_artifact,
+)
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.device import resolve_device
@@ -57,6 +61,10 @@ def get_embedding_files(
     and ``.json`` sidecars (online fusions like ``adaptive_gated``).
     The stem is what the train step uses to identify the embedding;
     ``load_embedding`` resolves the actual on-disk path at load time.
+
+    ``dim_filter`` only applies to fusion artifacts (``hybrid_*``), whose
+    names carry an explicit alignment-dim token; single-extractor
+    artifacts are native-dim and carry no dim token, so they always pass.
     """
     emb_dir = Path(embeddings_dir) / dataset_name
     if not emb_dir.exists():
@@ -65,11 +73,11 @@ def get_embedding_files(
     names.extend(f.stem for f in sorted(emb_dir.glob("hybrid_*.json")))
     names = sorted(set(names))
     if dim_filter:
-        # Component artifacts end in "_comp" after the dim token
-        # (``<extractor>_D<dim>_comp``); accept that suffixed form too so
-        # the dim filter does not silently drop them.
         names = [
-            n for n in names if any(n.endswith(d) or n.endswith(f"{d}_comp") for d in dim_filter)
+            n
+            for n in names
+            if not n.startswith(FUSION_PREFIX)
+            or any(n.endswith(d) or n.endswith(f"{d}_comp") for d in dim_filter)
         ]
     return names
 

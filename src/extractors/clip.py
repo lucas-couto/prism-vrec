@@ -5,9 +5,18 @@ from src.extractors.base import BaseExtractor
 
 
 class _CLIPVisualBackbone(nn.Module):
-    """CLIP ViT-B/32 visual encoder followed by a trainable projection."""
+    """CLIP ViT-B/32 visual encoder, frozen, native 512-d projected output.
 
-    def __init__(self, output_dim: int):
+    The feature is the **projected** output (the same space
+    ``encode_image`` returns, aligned with the text tower), not the
+    768-d pre-projection encoder width — a deliberate, declared choice:
+    it is how CLIP is canonically used as a feature extractor in
+    practice.  ``projection`` defaults to identity so extraction emits
+    that native feature; the fine-tuner replaces it with a
+    classification head.
+    """
+
+    def __init__(self):
         super().__init__()
         import open_clip
 
@@ -20,23 +29,18 @@ class _CLIPVisualBackbone(nn.Module):
         for param in self.visual.parameters():
             param.requires_grad = False
 
-        # CLIP ViT-B/32 output dim = 512
-        self.projection = nn.Sequential(
-            nn.Linear(512, output_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.projection = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.visual(x)
-        return self.projection(x)
+        return self.projection(self.visual(x))
 
     def forward_components(self, x: torch.Tensor) -> torch.Tensor:
-        """Return projected patch tokens ``(B, M, output_dim)`` (49 for B/32).
+        """Return native patch tokens ``(B, M, 512)`` (49 for B/32).
 
         ``output_tokens`` makes open_clip's visual encoder return the
         per-patch sequence (pre-projection ``width``); we apply the same
         ``visual.proj`` the pooled path uses so components live in the
-        512-d CLIP space before the trainable projection.
+        512-d CLIP space, consistent with the pooled feature.
         """
         self.visual.output_tokens = True
         try:
@@ -50,26 +54,26 @@ class _CLIPVisualBackbone(nn.Module):
 
 
 class CLIPExtractor(BaseExtractor):
-    """Visual feature extractor based on CLIP ViT-B/32.
+    """Visual feature extractor based on CLIP ViT-B/32 (native 512-d).
 
-    Uses ``open_clip`` with LAION-2B pretrained weights.  Only the visual
-    encoder is used.  The 512-dim output is projected to ``output_dim``
-    via a trainable ``Linear + ReLU`` layer.
+    Uses ``open_clip`` with LAION-2B pretrained weights.  Only the
+    visual encoder is used; the saved feature is the projected 512-d
+    output (the ``encode_image`` space).
 
     Parameters
     ----------
     device : str
         Device to run inference on (e.g. ``"cuda"`` or ``"cpu"``).
-    output_dim : int
-        Dimensionality of the output embedding.
     """
 
     #: CLIP exposes its 49 patch tokens (via open_clip output_tokens) for ACF.
     supports_components = True
 
     backbone_cls = _CLIPVisualBackbone
+    extraction_point = "projected visual output (encode_image space, post visual.proj)"
+    weights_id = "open_clip ViT-B-32 laion2b_s34b_b79k"
 
     def _build_transform(self):
-        # The transform is the open_clip preprocess carried on the
-        # backbone that the base _build_model already constructed.
+        # Canonical: the open_clip preprocess returned alongside the
+        # weights (resize 224 bicubic -> crop 224, CLIP normalisation).
         return self.model.preprocess

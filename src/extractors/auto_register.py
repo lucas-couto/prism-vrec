@@ -19,12 +19,19 @@ Minimal example (``plugins/extractors/my_extractor.py``)::
     from src.extractors.registry import register_extractor
 
     class MyExtractor(BaseExtractor):
+        extraction_point = "global average pool"
+        weights_id = "torchvision resnet18 IMAGENET1K_V1"
+
         def _build_model(self):
+            # v2 contract: emit the NATIVE feature (no projection —
+            # the recommender's learned E handles dimensionality).
             backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-            backbone.fc = nn.Linear(backbone.fc.in_features, self.output_dim)
+            backbone.fc = nn.Identity()
+            backbone.projection = nn.Identity()
             return backbone.to(self.device).eval()
 
         def _build_transform(self):
+            # ALWAYS the canonical recipe of the weights in use.
             return ResNet18_Weights.IMAGENET1K_V1.transforms()
 
     register_extractor("my_resnet18", MyExtractor)

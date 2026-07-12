@@ -41,7 +41,10 @@ extractors:
 
   levit_256:
     model_name: "levit_256"
-    raw_dim: 384
+    # NOTE: the "256" in the model name is the width of the FIRST stage;
+    # the pooled feature is 512-d (validated against a probe forward at
+    # extraction time — a mismatch here fails loudly).
+    raw_dim: 512
     role: hybrid
 
   # --- SOTA foundation models ---
@@ -67,8 +70,9 @@ fusion_extractors:
   - "resnet50"
   - "vit_b16"
 
-# Projection dimensions to test
-projection_dims: [64, 128, 256]
+# v2: extraction always emits the backbone's NATIVE dimensionality
+# (raw_dim above); the learned projection E inside each recommender maps
+# it to the common latent dim (common.visual_dim in recommenders.yaml).
 
 # Batch size for extraction (FP16 allows a larger batch)
 batch_size: 256

@@ -12,6 +12,5 @@ extractors:
 fusion_extractors:
   - "resnet50"
 
-projection_dims: [64]
 batch_size: 16
 checkpoint_every: 50

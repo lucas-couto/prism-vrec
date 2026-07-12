@@ -18,6 +18,7 @@ layer-name mismatch does not abort the entire queue.
 from __future__ import annotations
 
 import gc
+import json
 import traceback
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from src.finetuning.checkpoint import (
 from src.finetuning.dataset import CategoryDataset
 from src.finetuning.trainer import FineTuner
 from src.steps.extract import ImageDataset, get_item_ids
+from src.utils.atomic_io import atomic_write
 from src.utils.config import load_config
 from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import resolve_device
@@ -51,20 +53,16 @@ def _finetune_and_extract(
     image_dir: str,
     categories: dict,
     n_classes: int,
-    projection_dims: list[int],
     embeddings_dir: str,
     ft_config: dict,
     device: str,
     split_seed: int,
     backbone_weights_path: Path | None = None,
 ) -> None:
-    """Fine-tune one extractor and extract embeddings at every projection dim."""
+    """Fine-tune one extractor and re-extract native-dim embeddings."""
 
-    all_exist = all(
-        (Path(embeddings_dir) / dataset_name / f"{extractor_name}_finetuned_D{dim}.npy").exists()
-        for dim in projection_dims
-    )
-    if all_exist:
+    output_path = Path(embeddings_dir) / dataset_name / f"{extractor_name}_finetuned.npy"
+    if output_path.exists():
         logger.info("  %s finetuned embeddings already exist, skipping.", extractor_name)
         return
 
@@ -87,8 +85,9 @@ def _finetune_and_extract(
             n_classes,
         )
 
-        extractor = extractor_cls(device=device, output_dim=projection_dims[0])
+        extractor = extractor_cls(device=device)
         backbone = extractor.model
+        native_dim = extractor.native_dim
 
         train_cats, val_cats = CategoryDataset.stratified_split(
             categories,
@@ -143,6 +142,7 @@ def _finetune_and_extract(
             unfreeze_prefixes=list(extractor_cls.unfreeze_prefixes),
             device=device,
             config=ft_config,
+            in_features=native_dim,
         )
         result = finetuner.train(
             train_loader,
@@ -171,67 +171,68 @@ def _finetune_and_extract(
 
         # Drop everything the fine-tuner needed (model, optimiser state,
         # autograd graph, head, train/val loaders, the FineTuner itself,
-        # the result dataclass holding ``result.model``) before we walk
-        # projection_dims and spin up a fresh extractor per dim.  Without
-        # this, Python keeps strong references in the enclosing scope
-        # and peak memory doubles when the re-extract dataloader queues
-        # fill up, which can OOM-kill the worker pool on small-RAM hosts.
+        # the result dataclass holding ``result.model``) before spinning
+        # up a fresh extractor for re-extraction.  Without this, Python
+        # keeps strong references in the enclosing scope and peak memory
+        # doubles when the re-extract dataloader queues fill up, which
+        # can OOM-kill the worker pool on small-RAM hosts.
         # ``backbone_state`` is the only thing we still need.
         del extractor, backbone, finetuner, train_loader, val_loader, result
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    for dim in projection_dims:
-        output_path = Path(embeddings_dir) / dataset_name / f"{extractor_name}_finetuned_D{dim}.npy"
-        if output_path.exists():
-            logger.info("  %s finetuned D=%d: already exists, skipping.", extractor_name, dim)
-            continue
+    logger.info("  Extracting %s finetuned (native dim)...", extractor_name)
 
-        logger.info("  Extracting %s finetuned D=%d...", extractor_name, dim)
+    extractor = extractor_cls(device=device)
 
-        extractor = extractor_cls(device=device, output_dim=dim)
+    current_state = extractor.model.state_dict()
+    # The classification head lives under "projection" in the fine-tuned
+    # state; the extractor keeps its identity projection so re-extracted
+    # features are the fine-tuned backbone's native output.
+    ft_state_filtered = {
+        k: v
+        for k, v in backbone_state.items()
+        if k in current_state and "projection" not in k and v.shape == current_state[k].shape
+    }
+    current_state.update(ft_state_filtered)
+    extractor.model.load_state_dict(current_state)
 
-        current_state = extractor.model.state_dict()
-        ft_state_filtered = {
-            k: v
-            for k, v in backbone_state.items()
-            if k in current_state and "projection" not in k and v.shape == current_state[k].shape
-        }
-        current_state.update(ft_state_filtered)
-        extractor.model.load_state_dict(current_state)
+    item_ids = get_item_ids(
+        load_config()["paths"]["data_processed"],
+        dataset_name,
+    )
+    dataset = ImageDataset(image_dir, item_ids, transform=extractor.transform)
+    ext_settings = resolve_dataloader_settings(load_config())
+    ext_workers = ext_settings.num_workers
+    ext_prefetch = ext_settings.prefetch_factor
+    ext_batch = ext_settings.batch_size
+    dataloader = DataLoader(
+        dataset,
+        batch_size=ext_batch,
+        shuffle=False,
+        num_workers=ext_workers,
+        pin_memory=True,
+        persistent_workers=ext_workers > 0,
+        prefetch_factor=ext_prefetch if ext_workers > 0 else None,
+    )
 
-        item_ids = get_item_ids(
-            load_config()["paths"]["data_processed"],
-            dataset_name,
-        )
-        dataset = ImageDataset(image_dir, item_ids, transform=extractor.transform)
-        ext_settings = resolve_dataloader_settings(load_config())
-        ext_workers = ext_settings.num_workers
-        ext_prefetch = ext_settings.prefetch_factor
-        ext_batch = ext_settings.batch_size
-        dataloader = DataLoader(
-            dataset,
-            batch_size=ext_batch,
-            shuffle=False,
-            num_workers=ext_workers,
-            pin_memory=True,
-            persistent_workers=ext_workers > 0,
-            prefetch_factor=ext_prefetch if ext_workers > 0 else None,
-        )
+    ckpt_path = f"checkpoints/extraction/{dataset_name}_{extractor_name}_finetuned"
+    Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
 
-        ckpt_path = f"checkpoints/extraction/{dataset_name}_{extractor_name}_finetuned_D{dim}"
-        Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+    embeddings, extracted_ids = extractor.extract_batch(
+        dataloader,
+        checkpoint_path=ckpt_path,
+        save_every=500,
+    )
 
-        embeddings, extracted_ids = extractor.extract_batch(
-            dataloader,
-            checkpoint_path=ckpt_path,
-            save_every=500,
-        )
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        extractor.save(embeddings, extracted_ids, str(output_path))
-        logger.info("  %s finetuned D=%d: saved (%s)", extractor_name, dim, embeddings.shape)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    extractor.save(embeddings, extracted_ids, str(output_path))
+    meta = {"name": f"{extractor_name}_finetuned", **extractor.metadata(), "kind": "pooled"}
+    meta_path = output_path.with_suffix("").with_suffix(".meta.json")
+    payload = json.dumps(meta, indent=2)
+    atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
+    logger.info("  %s finetuned: saved (%s)", extractor_name, embeddings.shape)
 
 
 def run() -> None:
@@ -247,7 +248,6 @@ def run() -> None:
     split_seed = int(config["seed"])
     raw_dir = config["paths"]["data_raw"]
     embeddings_dir = config["paths"]["embeddings"]
-    projection_dims = config.get("projection_dims", [64, 128, 256])
     datasets = config.get("datasets", [])
     ft_config = config.get("finetuning", {})
     ft_extractors = list(ft_config.get("extractors", []))
@@ -315,7 +315,6 @@ def run() -> None:
                             image_dir=image_dir,
                             categories=categories,
                             n_classes=n_classes,
-                            projection_dims=projection_dims,
                             embeddings_dir=embeddings_dir,
                             ft_config=ft_config,
                             device=device,
@@ -350,7 +349,6 @@ def run() -> None:
                             image_dir=image_dir,
                             categories={},
                             n_classes=0,
-                            projection_dims=projection_dims,
                             embeddings_dir=embeddings_dir,
                             ft_config=ft_config,
                             device=device,

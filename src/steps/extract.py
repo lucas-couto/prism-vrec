@@ -19,6 +19,7 @@ from src.extractors import (
     is_registered,
     registered_extractor_names,
 )
+from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.dataloader import resolve_dataloader_settings
@@ -83,42 +84,77 @@ def get_item_ids(processed_dir: str, dataset_name: str) -> list:
     return list(item2idx.keys())
 
 
+def _write_meta(extractor, extractor_name: str, npy_path: Path, extra: dict | None = None) -> None:
+    """Write the ``<stem>.meta.json`` sidecar next to a feature file.
+
+    The metadata is what makes the artifact reproducible and lets the
+    loader know the input dimension without inferring it from the shape:
+    backbone name, native dimensionality, extraction point, exact
+    pretrained-weights id, and the transform recipe.
+    """
+    meta = {"name": extractor_name, **extractor.metadata()}
+    if extra:
+        meta.update(extra)
+    meta_path = npy_path.with_suffix("").with_suffix(".meta.json")
+    payload = json.dumps(meta, indent=2)
+    atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
+
+
+def _validate_native_dim(extractor, extractor_name: str, config: dict) -> None:
+    """Fail loudly when the probed native dim contradicts the config.
+
+    ``configs/extractors.yaml`` declares each backbone's expected
+    ``raw_dim``.  The authoritative value is the one READ from the model
+    (probe forward); a mismatch means the config (or the model wiring)
+    is wrong and must be fixed before anything is extracted.
+    """
+    declared = config.get("extractors", {}).get(extractor_name, {}).get("raw_dim")
+    if declared is not None and int(declared) != extractor.native_dim:
+        raise RuntimeError(
+            f"{extractor_name}: probed native_dim={extractor.native_dim} but "
+            f"configs/extractors.yaml declares raw_dim={declared}. The model "
+            "is authoritative — fix the config (dims are read, never assumed)."
+        )
+
+
 def _extract_for_config(
     extractor_cls,
     extractor_name: str,
     dataset_name: str,
-    dim: int,
     image_dir: str,
     item_ids: list,
     embeddings_dir: str,
     batch_size: int,
     checkpoint_every: int,
     device: str,
+    config: dict,
     extract_components: bool = False,
 ) -> None:
-    """Extract embeddings for a single ``(extractor, dataset, dim)`` cell.
+    """Extract native-dim embeddings for a single ``(extractor, dataset)`` cell.
 
-    Always writes the pooled ``<extractor>_D<dim>.npy``.  When
+    Writes the pooled ``<extractor>.npy`` at the backbone's native
+    dimensionality plus a ``<extractor>.meta.json`` sidecar.  When
     ``extract_components`` is set and the extractor advertises
     ``supports_components``, additionally writes the 3-D
-    ``<extractor>_D<dim>_comp.npy`` (per-item components) consumed by ACF.
-    Both outputs are skipped independently when already present.
+    ``<extractor>_comp.npy`` (native per-item components) consumed by
+    ACF.  Both outputs are skipped independently when already present.
     """
     out_dir = Path(embeddings_dir) / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    pooled_path = out_dir / f"{extractor_name}_D{dim}.npy"
-    comp_path = out_dir / f"{extractor_name}_D{dim}_comp.npy"
+    pooled_path = out_dir / f"{extractor_name}.npy"
+    comp_path = out_dir / f"{extractor_name}_comp.npy"
 
     want_components = extract_components and getattr(extractor_cls, "supports_components", False)
     need_pooled = not pooled_path.exists()
     need_components = want_components and not comp_path.exists()
 
     if not need_pooled and not need_components:
-        logger.info("  %s D=%d: already exists, skipping.", extractor_name, dim)
+        logger.info("  %s: already exists, skipping.", extractor_name)
         return
 
-    logger.info("  Extracting %s D=%d...", extractor_name, dim)
-    extractor = extractor_cls(device=device, output_dim=dim)
+    logger.info("  Extracting %s (native dim)...", extractor_name)
+    extractor = extractor_cls(device=device)
+    _validate_native_dim(extractor, extractor_name, config)
 
     dataset = ImageDataset(image_dir, item_ids, transform=extractor.transform)
     if len(dataset) == 0:
@@ -136,7 +172,7 @@ def _extract_for_config(
         num_workers=extract_settings.num_workers,
     )
 
-    ckpt_base = f"checkpoints/extraction/{dataset_name}_{extractor_name}_D{dim}"
+    ckpt_base = f"checkpoints/extraction/{dataset_name}_{extractor_name}"
     Path(ckpt_base).parent.mkdir(parents=True, exist_ok=True)
 
     if need_pooled:
@@ -146,8 +182,9 @@ def _extract_for_config(
             save_every=checkpoint_every,
         )
         extractor.save(embeddings, extracted_ids, str(pooled_path))
+        _write_meta(extractor, extractor_name, pooled_path, {"kind": "pooled"})
         logger.info(
-            "  %s D=%d: pooled saved to %s (%s)", extractor_name, dim, pooled_path, embeddings.shape
+            "  %s: native pooled saved to %s (%s)", extractor_name, pooled_path, embeddings.shape
         )
 
     if need_components:
@@ -157,24 +194,28 @@ def _extract_for_config(
             save_every=checkpoint_every,
         )
         extractor.save_components(components, comp_ids, str(comp_path))
-        logger.info(
-            "  %s D=%d: components saved to %s (%s)",
+        _write_meta(
+            extractor,
             extractor_name,
-            dim,
+            comp_path,
+            {"kind": "components", "n_components": int(components.shape[1])},
+        )
+        logger.info(
+            "  %s: native components saved to %s (%s)",
+            extractor_name,
             comp_path,
             components.shape,
         )
 
 
 def run() -> None:
-    """Extract embeddings for every configured ``(extractor, dataset, dim)``."""
+    """Extract native-dim embeddings for every configured ``(extractor, dataset)``."""
     config = load_config()
     set_seed(config["seed"])
 
     device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
-    projection_dims = config.get("projection_dims", [64, 128, 256])
     batch_size = config.get("batch_size", 64)
     checkpoint_every = config.get("checkpoint_every", 500)
     datasets = config.get("datasets", [])
@@ -216,25 +257,23 @@ def run() -> None:
         image_dir = f"{config['paths']['data_raw']}/{dataset_name}/images"
 
         for extractor_name, extractor_cls in extractors.items():
-            for dim in projection_dims:
-                with time_cell(
-                    "extract",
-                    dataset=dataset_name,
-                    extractor=extractor_name,
-                    dim=dim,
-                ):
-                    _extract_for_config(
-                        extractor_cls=extractor_cls,
-                        extractor_name=extractor_name,
-                        dataset_name=dataset_name,
-                        dim=dim,
-                        image_dir=image_dir,
-                        item_ids=item_ids,
-                        embeddings_dir=embeddings_dir,
-                        batch_size=batch_size,
-                        checkpoint_every=checkpoint_every,
-                        device=device,
-                        extract_components=extract_components,
-                    )
+            with time_cell(
+                "extract",
+                dataset=dataset_name,
+                extractor=extractor_name,
+            ):
+                _extract_for_config(
+                    extractor_cls=extractor_cls,
+                    extractor_name=extractor_name,
+                    dataset_name=dataset_name,
+                    image_dir=image_dir,
+                    item_ids=item_ids,
+                    embeddings_dir=embeddings_dir,
+                    batch_size=batch_size,
+                    checkpoint_every=checkpoint_every,
+                    device=device,
+                    config=config,
+                    extract_components=extract_components,
+                )
 
     logger.info("Embedding extraction complete.")

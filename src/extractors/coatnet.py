@@ -2,13 +2,18 @@ import timm
 import torch
 import torch.nn as nn
 
-from src.extractors.base import BaseExtractor
+from src.extractors.base import BaseExtractor, timm_canonical_transform
 
 
 class _CoAtNetBackbone(nn.Module):
-    """CoAtNet-0 backbone followed by a trainable projection."""
+    """CoAtNet-0 backbone, frozen, native 768-d output.
 
-    def __init__(self, output_dim: int):
+    ``projection`` defaults to identity so extraction emits the native
+    pooled feature; the fine-tuner replaces it with a classification
+    head.
+    """
+
+    def __init__(self):
         super().__init__()
 
         # num_classes=0 removes the classification head
@@ -16,25 +21,20 @@ class _CoAtNetBackbone(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # CoAtNet-0 output dim = 768
-        self.projection = nn.Sequential(
-            nn.Linear(768, output_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.projection = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(x)
-        return self.projection(x)
+        return self.projection(self.backbone(x))
 
     def forward_components(self, x: torch.Tensor) -> torch.Tensor:
-        """Return projected spatial cells ``(B, H*W, output_dim)`` (7x7=49)."""
+        """Return native spatial cells ``(B, H*W, 768)`` (7x7=49)."""
         feat = self.backbone.forward_features(x)  # (B, 768, H, W)
         tokens = feat.flatten(2).transpose(1, 2)  # (B, H*W, 768)
         return self.projection(tokens)
 
 
 class CoAtNetExtractor(BaseExtractor):
-    """Visual feature extractor based on CoAtNet-0.
+    """Visual feature extractor based on CoAtNet-0 (native 768-d).
 
     CoAtNet combines depthwise convolutions with self-attention modules
     in a unified architecture, mixing both operations within the same
@@ -44,8 +44,6 @@ class CoAtNetExtractor(BaseExtractor):
     ----------
     device : str
         Device to run inference on.
-    output_dim : int
-        Dimensionality of the output embedding.
     """
 
     unfreeze_prefixes = ["backbone.stages.3"]
@@ -54,3 +52,12 @@ class CoAtNetExtractor(BaseExtractor):
     supports_components = True
 
     backbone_cls = _CoAtNetBackbone
+    extraction_point = "global average pool (timm num_classes=0)"
+    weights_id = "timm coatnet_0_rw_224.sw_in1k"
+
+    def _build_transform(self):
+        # Canonical recipe resolved from the checkpoint's pretrained
+        # config. NOTE: this tag normalises with mean/std 0.5 (NOT
+        # ImageNet), crop_pct 0.95, bicubic — v1.x applied ImageNet norm
+        # here, silently degrading the features.
+        return timm_canonical_transform(self.model.backbone)

@@ -78,6 +78,7 @@ class FineTuner:
         unfreeze_prefixes: list[str],
         device: str | torch.device,
         config: dict,
+        in_features: int | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.extractor_name = extractor_name
@@ -87,11 +88,21 @@ class FineTuner:
 
         self.model = backbone.to(self.device)
 
-        proj = self.model.projection
-        if isinstance(proj, nn.Sequential):
-            in_features = proj[0].in_features
-        else:
-            in_features = proj.in_features
+        # v2 backbones default projection to nn.Identity (extraction emits
+        # the native feature), so the head size must be given explicitly
+        # (the extractor's probed native_dim). Legacy Linear/Sequential
+        # projections are still introspected for backward compatibility.
+        if in_features is None:
+            proj = self.model.projection
+            if isinstance(proj, nn.Sequential):
+                in_features = proj[0].in_features
+            elif isinstance(proj, nn.Linear):
+                in_features = proj.in_features
+            else:
+                raise ValueError(
+                    "FineTuner needs in_features when the backbone projection "
+                    f"is {type(proj).__name__} (pass extractor.native_dim)."
+                )
         self._proj_in_features = in_features
 
         self.model.projection = nn.Linear(in_features, n_classes).to(self.device)

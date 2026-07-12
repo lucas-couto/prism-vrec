@@ -66,17 +66,34 @@ class BaseRecommender(nn.Module, abc.ABC):
         self.train_interactions = train_interactions
 
         # Register visual embeddings as a non-trainable buffer if provided.
-        # Two shapes are accepted:
+        # Three layouts are accepted:
         #   2-D ``(n_items, D)``    — pre-fused or single-source embeddings
         #                             (the long-standing default).
-        #   3-D ``(n_items, M, D)`` — M source embeddings stacked along
-        #                             axis=1, ready to feed an online
+        #   3-D ``(n_items, M, D)`` — M equal-dim source embeddings stacked
+        #                             along axis=1, ready to feed an online
         #                             fusion module (e.g. adaptive_gated).
-        # ``self.visual_dim_raw`` always reports ``D`` regardless of shape
-        # so downstream recommenders can size their projections without
-        # caring about the fusion mode.
+        #   RaggedSources          — 2-D concat of M native sources with
+        #                             differing dims + metadata; drives a
+        #                             LearnedAlignmentFusion (per-source
+        #                             learned projections, alignment=learned).
+        # ``self.visual_dim_raw`` always reports the dimension the model's
+        # learned projection E consumes, regardless of the layout.
         self._online_fusion: nn.Module | None = None
-        if visual_embeddings is not None:
+        source_dims = getattr(visual_embeddings, "source_dims", None)
+        if visual_embeddings is not None and source_dims:
+            from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
+
+            arr = torch.FloatTensor(np.asarray(visual_embeddings))
+            self.register_buffer("visual_features", arr)
+            self.visual_dim_raw = int(visual_embeddings.aligned_dim)
+            self._online_fusion = LearnedAlignmentFusion(
+                source_dims=list(source_dims),
+                dim=int(visual_embeddings.aligned_dim),
+                strategy=visual_embeddings.strategy,
+                normalize=bool(visual_embeddings.normalize),
+                **visual_embeddings.fusion_kwargs,
+            )
+        elif visual_embeddings is not None:
             arr = torch.FloatTensor(visual_embeddings)
             if arr.dim() == 3 and not self.consumes_raw_components:
                 self.register_buffer("visual_features", arr)
@@ -130,6 +147,13 @@ class BaseRecommender(nn.Module, abc.ABC):
 
         if self._online_fusion is None:
             return self.visual_features[item_ids]
+
+        from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
+
+        if isinstance(self._online_fusion, LearnedAlignmentFusion):
+            # 2-D ragged concat buffer: the module splits by source_dims,
+            # projects each native source to the aligned dim and fuses.
+            return self._online_fusion(self.visual_features[item_ids])
 
         # 3-D buffer: features[item_ids] has shape (B, M, D).
         stacked = self.visual_features[item_ids]
