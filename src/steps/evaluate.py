@@ -22,6 +22,11 @@ from src.recommenders.registry import (
     get_recommender_spec,
     registered_recommender_names,
 )
+from src.utils.artifact_names import (
+    BEST_SUFFIX,
+    is_finetuned_artifact,
+    parse_checkpoint_stem,
+)
 from src.utils.config import load_config
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
@@ -100,22 +105,12 @@ def find_best_models(dataset_name: str, results_dir: Path | str = "results") -> 
 
     results: list[dict] = []
     for model_path in sorted(models_dir.glob("*_best.pt")):
-        stem = model_path.stem.replace("_best", "")
-
-        model_name: str | None = None
-        embedding_name = "none"
-        for candidate in known_models:
-            if stem == candidate:
-                model_name = candidate
-                break
-            if stem.startswith(candidate + "_"):
-                model_name = candidate
-                embedding_name = stem[len(candidate) + 1 :]
-                break
-
-        if model_name is None:
+        stem = model_path.stem.replace(BEST_SUFFIX, "")
+        parsed = parse_checkpoint_stem(stem, known_models)
+        if parsed is None:
             logger.warning("  Unrecognised checkpoint filename: %s", model_path.name)
             continue
+        model_name, embedding_name = parsed
 
         results.append(
             {
@@ -137,7 +132,7 @@ def _route_targets(model_name: str, embedding_name: str) -> list[str]:
     """
     if model_name == "bpr" or embedding_name == "none":
         return ["frozen", "finetuned"]
-    if "finetuned" in embedding_name:
+    if is_finetuned_artifact(embedding_name):
         return ["finetuned"]
     return ["frozen"]
 
