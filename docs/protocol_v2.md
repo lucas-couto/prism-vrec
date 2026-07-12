@@ -1,0 +1,158 @@
+# v2 Experimental Protocol — Declarations
+
+This document records every methodological decision the v2 protocol
+fixes explicitly, in the order a reviewer would ask about them. Each
+item is implemented in code (pointers included) and must be restated in
+the dissertation's methodology chapter.
+
+## 1. Native dimensionality at extraction; learned projection `E` in the recommender
+
+Comparing backbones is only valid if the backbone is the sole variable.
+v1.x forced every extractor through a shared `Linear+ReLU` projection to
+a common dim — and in the frozen condition that projection was **never
+trained** (a seeded random projection), so the benchmark compared
+"backbone × random compression", not backbones.
+
+v2: extraction saves the **native** feature of each backbone; the
+learned projection `E` inside each recommender (VBPR's `W_vis`,
+DeepStyle's style MLP, VNPR's visual transform, ACF's component
+projection) maps `D_backbone → d`, trained jointly by the BPR loss with
+the backbone frozen (fine-tuning end-to-end would be DVBPR, out of
+scope). `d` (`common.visual_dim`) is fixed and identical across all
+backbones of a comparison.
+
+| Backbone | Weights (exact) | Extraction point | Native dim |
+|---|---|---|---|
+| ResNet-50 | torchvision `IMAGENET1K_V2` | global avg pool (after layer4) | 2048 |
+| ConvNeXt-Base | timm `convnext_base.fb_in22k_ft_in1k` | global avg pool | 1024 |
+| ViT-B/16 | timm `vit_base_patch16_224.augreg2_in21k_ft_in1k` | **CLS token** | 768 |
+| CoAtNet-0 | timm `coatnet_0_rw_224.sw_in1k` | global avg pool | 768 |
+| DINOv2 ViT-B/14 | torch.hub `facebookresearch/dinov2` (pinned commit) | **CLS token** | 768 |
+| LeViT-256 | timm `levit_256.fb_dist_in1k` | pooled final-stage tokens | **512** (the "256" in the name is the stage-1 width) |
+| CLIP ViT-B/32 | open_clip `laion2b_s34b_b79k` | **projected output (512, the `encode_image` space)** — the canonical practical use of CLIP as an extractor; the 768-d pre-projection width is NOT used | 512 |
+| CvT-13 | HF `microsoft/cvt-13` (224px) | **CLS token** (the `[B, 384, 14, 14]` spatial map is used only as ACF components, never flattened into the pooled feature) | 384 |
+
+Native dims are **read from the model** by a probe forward
+(`BaseExtractor._probe_native_dim`), never hardcoded, and validated
+against `configs/extractors.yaml` (`raw_dim`) — a mismatch fails the
+extraction loudly. Every artifact ships a `.meta.json` sidecar
+(backbone, native dim, extraction point, exact weights id, transform
+recipe); the loader cross-checks features against it.
+
+## 2. Canonical per-backbone preprocessing
+
+The preprocessing recipe is part of the model. Three **distinct
+normalisations** coexist across the 8 backbones:
+
+- ImageNet (`0.485/0.456/0.406`): ResNet-50, ConvNeXt, LeViT, CvT, DINOv2
+- Inception-style (`0.5/0.5/0.5`): **ViT-B/16 (augreg2)**, **CoAtNet-0 (sw_in1k)**
+- CLIP (`0.48145466/…`): CLIP ViT-B/32
+
+v1.x applied ImageNet normalisation + direct bilinear 224 resize to all
+timm backbones — ViT-B/16 and CoAtNet-0 ran silently degraded, and no
+backbone used its canonical bicubic resize+crop. v2 resolves each
+transform from the library that ships the weights (torchvision
+`weights.transforms()`, `timm.data.resolve_model_data_config`,
+`AutoImageProcessor`, open_clip's `preprocess`; DINOv2 is the one
+hand-built recipe, matching its reference eval transform: resize 256
+bicubic → crop 224, ImageNet norm). Pinned by
+`tests/test_canonical_transforms.py`.
+
+**Resolution posture (declared): all backbones consume 224×224 crops**,
+their canonical eval resolution — the resize path (resize size,
+interpolation, crop_pct) differs per recipe and is recorded in each
+artifact's metadata. No hidden resolution variable.
+
+## 3. Evaluation protocol: full ranking default, sampled opt-in
+
+`full_ranking` is the default and the only protocol for reported
+numbers (Krichene & Rendle, KDD 2020: sampled metrics can invert model
+rankings). `sampled` exists for fast iteration only and is locked when
+used: `n_negatives`, `negative_sampling_seed` (per-user seeded pools →
+identical across models, required by the paired tests), sampling from
+items unseen by the user. **Every recorded result row carries a
+`protocol` column**; train-time BPR negative sampling is a different
+thing entirely and is not configurable here.
+
+**Training-time validation subsample (`common.eval_sample_size = 2000`).**
+Early stopping and Optuna pruning score a fixed subset of 2000 test
+users instead of the full test set. The subset is drawn once per
+dataset, deterministically (`sample_seed` = global seed,
+`src/evaluation/protocol.py`), and is identical for every
+model/embedding/trial — hyperparameter selection therefore remains a
+paired comparison on a common user set; only its variance changes
+(standard error on ndcg@10 stays well below between-configuration
+gaps). The validation metric itself is still full-ranking over all
+items for those users. **Reported numbers are unaffected**: the final
+evaluate step constructs its `Evaluator` without `sample_size`
+(`src/steps/evaluate.py`) and ranks the entire test set.
+
+## 4. Deterministic tie-breaking
+
+All three ranking paths (batched torch, sampled numpy, single-user
+numpy) implement one rule: **stable sort, ties broken by the lower item
+id**. In the sampled path, ties are explicitly NOT broken by pool
+position (positives come first in the pool — that would inflate
+metrics).
+
+## 5. Statistics
+
+- **Wilcoxon signed-rank, `zero_method="pratt"`**: per-user LOO metrics
+  are 0/1-heavy; the scipy default drops all zero differences,
+  shrinking the effective sample far below `n_users`. Pratt keeps them.
+  Every pairwise table reports `n_pairs` and `n_nonzero_pairs`.
+- Friedman as the non-parametric omnibus (no normality assumption over
+  per-user metric distributions), Holm–Bonferroni for multiple
+  comparisons (uniformly more powerful than Bonferroni at the same
+  FWER), Cliff's delta as the effect size a p-value cannot convey
+  (thresholds 0.147/0.33/0.474), percentile bootstrap CIs.
+
+## 6. Fusion pipeline (Pipeline B — separate from the 8-extractor Pipeline A)
+
+Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
+
+- **Element-wise family (8 of 11 strategies)** requires alignment, and
+  the alignment method is an experimental variable
+  (`alignment.method`): `learned` (default) — per-source
+  `Linear(D_i→D)` co-trained via BPR (`LearnedAlignmentFusion`), the
+  analogue of `E`; or `pca` — per-source PCA to `D`.
+- **Concat family** operates on native dims: `concat` → 2816-d;
+  `pca` (joint) reduces the 2816-d concat; **`pca_per_model`
+  CONCATENATES after per-source PCA (→ `M·k`)** — declared, it is a
+  concatenation-family strategy.
+- **PCA protocol**: every PCA (`pca`, `pca_per_model`, `pca` alignment)
+  is **fit exclusively on items with ≥1 training interaction** and
+  applied to all items; seed fixed; cumulative explained variance
+  logged per fit. The `k` of the PCA is itself a confounder vs the
+  2816-d concat — report explained variance and/or sweep `k`.
+- The fused `h_i` enters the recommender as the item's visual feature,
+  through the same `E` as any single extractor.
+
+## 7. Model-specific declarations
+
+- **ACF is NOT degenerate**: it consumes `(n_items, M, D_native)`
+  component artifacts (`*_comp.npy`; M = 49–256 depending on the
+  backbone), so component-level attention has real components to
+  attend. Its user-history side is built from train interactions only.
+- **DeepStyle variant**: this implementation uses an MLP style
+  projector and does **not** subtract a category vector (the original
+  paper does). It therefore does not degenerate into VBPR on Tradesy,
+  but it is a variant and must be cited as such in the dissertation.
+- **Trainable-parameter counts differ across backbones** because `E`'s
+  input is the native dim — an expected second-order effect, reported
+  per cell (`n_trainable_params` column), never hidden.
+
+## 8. Known confounder to acknowledge (defense question 13)
+
+CLIP and DINOv2 are both ViT-B under the hood; if CLIP wins, the design
+cannot separate architecture from pre-training data (2B image-text
+pairs). The honest claim: this benchmark compares **extractors as
+available in practice** (architecture + weights + canonical recipe),
+not pure architectures.
+
+## 9. Recommended robustness checks (before the defense)
+
+Run the comparison at ≥2 values of `d` (64, 128), under both protocols,
+and with multiple seeds (`seeds: [...]` is supported), verifying the
+backbone ranking is stable. Each of these preempts a standard committee
+question.
