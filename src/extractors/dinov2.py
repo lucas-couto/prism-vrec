@@ -6,6 +6,12 @@ from torchvision import transforms
 
 from src.extractors.base import BaseExtractor
 
+# Pinned commit of facebookresearch/dinov2 (default-branch HEAD at pin
+# time). An unpinned hub load tracks the remote branch, so an upstream
+# push could silently change the backbone code and break bit-identical
+# reproducibility of extracted embeddings.
+_DINOV2_COMMIT = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
+
 
 class _DINOv2Backbone(nn.Module):
     """DINOv2 ViT-B/14 backbone ([CLS] token) followed by a trainable projection."""
@@ -25,7 +31,7 @@ class _DINOv2Backbone(nn.Module):
                 category=UserWarning,
             )
             self.backbone = torch.hub.load(
-                "facebookresearch/dinov2",
+                f"facebookresearch/dinov2:{_DINOV2_COMMIT}",
                 "dinov2_vitb14",
             )
         for param in self.backbone.parameters():
