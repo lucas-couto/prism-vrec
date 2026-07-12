@@ -56,14 +56,32 @@ def wilcoxon_test(
 ) -> tuple[float, float]:
     """Two-sided Wilcoxon signed-rank test on paired samples.
 
+    Uses ``zero_method="pratt"`` so zero differences are kept in the
+    ranking rather than discarded.  With per-user leave-one-out metrics
+    (recall@k is 0/1 per user) the vast majority of paired differences
+    are exactly zero; scipy's default (``"wilcox"``) drops them all,
+    shrinking the effective sample far below ``n_users`` and inflating
+    apparent effects on the tiny nonzero remainder.  Pratt's treatment
+    keeps the zeros in the rank computation, which is the conservative
+    choice for tie-heavy paired metrics.
+
     Returns ``(0.0, 1.0)`` when the two arrays are identical (the test
     is undefined if every paired difference is zero).
     """
     diff = scores_a - scores_b
     if np.all(diff == 0):
         return 0.0, 1.0
-    stat, p_value = wilcoxon(scores_a, scores_b, alternative="two-sided")
+    stat, p_value = wilcoxon(scores_a, scores_b, alternative="two-sided", zero_method="pratt")
     return float(stat), float(p_value)
+
+
+def n_nonzero_pairs(scores_a: np.ndarray, scores_b: np.ndarray) -> int:
+    """Number of paired differences that are not exactly zero.
+
+    Reported alongside the Wilcoxon p-value so the reader can see how
+    much of ``n_users`` actually carries signal in tie-heavy metrics.
+    """
+    return int(np.count_nonzero(np.asarray(scores_a) - np.asarray(scores_b)))
 
 
 def bonferroni_correction(
@@ -377,6 +395,11 @@ def pairwise_significance(
             "mean_b": float(np.mean(scores_b)),
             "statistic": stat,
             "p_value": p_val,
+            "n_pairs": int(len(scores_a)),
+            # How many pairs carry signal: with 0/1 per-user metrics most
+            # differences are zero; report it so n_pairs is not read as
+            # the effective sample size.
+            "n_nonzero_pairs": n_nonzero_pairs(scores_a, scores_b),
         }
         if include_effect_size:
             d = cohens_d_paired(scores_a, scores_b)
