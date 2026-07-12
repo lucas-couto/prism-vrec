@@ -101,11 +101,38 @@ metrics).
   are 0/1-heavy; the scipy default drops all zero differences,
   shrinking the effective sample far below `n_users`. Pratt keeps them.
   Every pairwise table reports `n_pairs` and `n_nonzero_pairs`.
+- **Comparison families** (`src/evaluation/comparison_families.py`):
+  the Holm correction and the Friedman omnibus are applied WITHIN the
+  family of comparisons one research question defines — never over the
+  Cartesian product of every config (all-pairs Holm over ~77 configs
+  runs with `m ≈ 2900` and rejects everything artificially). Each
+  family varies exactly one dimension: `backbone_within_model`
+  (`m = C(n_backbones, 2)` per recommender), `model_within_backbone`,
+  `fusion_within_model`, `frozen_vs_finetuned` (one `m = 1` pair per
+  config). Every result row carries `family`, `group` and
+  `n_comparisons_in_family` so the correction is auditable; `all_pairs`
+  exists as an exploratory option only.
+- **Primary metrics under LOO**: with one relevant item per user only
+  two independent signals exist — hit-or-not (recall@k ≡ HitRate@k) and
+  hit rank (ndcg@k). precision@k = recall@k / k and map@k = 1/rank are
+  deterministic transforms; they stay in the raw evaluation CSVs, are
+  excluded from the reported tests by default
+  (`statistical.include_derived_metrics`), and must never be read as
+  independent evidence.
 - Friedman as the non-parametric omnibus (no normality assumption over
   per-user metric distributions), Holm–Bonferroni for multiple
   comparisons (uniformly more powerful than Bonferroni at the same
-  FWER), Cliff's delta as the effect size a p-value cannot convey
-  (thresholds 0.147/0.33/0.474), percentile bootstrap CIs.
+  FWER), percentile bootstrap CIs.
+- **Effect size: Cliff's delta is primary** (non-parametric,
+  tie-robust; thresholds 0.147/0.33/0.474) — consistent with
+  Wilcoxon+pratt on zero-dominated differences. Cohen's d is parametric
+  and inflates on such vectors (the std shrinks); it is off by default
+  and available for diagnostics only.
+- **Paired-difference bootstrap CI** on every pairwise row
+  (`diff_mean`, `diff_ci_lower/upper`, resampling USERS): the CI that
+  must agree with the Wilcoxon verdict. Per-config CIs are descriptive
+  — under paired inference, overlapping individual CIs do NOT imply
+  absence of a significant difference.
 
 ## 6. Fusion pipeline (Pipeline B — separate from the 8-extractor Pipeline A)
 

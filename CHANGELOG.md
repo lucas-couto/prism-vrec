@@ -8,6 +8,47 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-12
+
+Statistical-validity pass (C1-C4): changes what the analysis can claim,
+not how models are trained. No training artifact is invalidated.
+
+### Changed
+
+- **Comparison families (C1).** Holm and the Friedman omnibus now run
+  WITHIN the family of comparisons a research question defines
+  (``src/evaluation/comparison_families.py``), never over the Cartesian
+  product of every config — all-pairs Holm over ~77 configs ran with
+  ``m ≈ 2900`` and rejected everything artificially. Families:
+  ``backbone_within_model``, ``model_within_backbone``,
+  ``fusion_within_model``, ``frozen_vs_finetuned``; each output row
+  carries ``family``, ``group`` and ``n_comparisons_in_family`` so the
+  correction is auditable. ``all_pairs`` remains as an exploratory
+  option (and is the smoke profile's setting, whose grid is too small
+  for the question-aligned families).
+- **Primary metrics under LOO (C2).** Step 07 analyses ``recall`` (≡
+  HitRate) and ``ndcg`` by default; ``precision@k = recall@k / k`` and
+  ``map@k = 1/rank`` are deterministic transforms under leave-one-out
+  and are only analysed with ``include_derived_metrics: true`` — never
+  as independent evidence. The derivation is documented in the module
+  and in ``docs/protocol_v2.md`` §5.
+- **Cliff's delta promoted to primary effect size (C3).** Cohen's d is
+  parametric and inflates on zero-dominated paired differences (the
+  same property that motivated Wilcoxon ``pratt``); it is now off by
+  default (``include_cohens_d``) and documented as diagnostic-only.
+
+### Added
+
+- **Paired-difference bootstrap CI (C4).** Every pairwise row now
+  reports ``diff_mean`` / ``diff_ci_lower`` / ``diff_ci_upper``
+  (resampling users, seed-fixed) — the CI that must agree with the
+  Wilcoxon verdict. Per-config CIs remain as descriptive statistics;
+  their overlap does not contradict a significant paired test.
+- ``tests/test_comparison_families.py``: family enumeration (no pair
+  varies two dimensions; C(n,2) sizes; frozen never paired with
+  finetuned within a backbone family), Holm ``m`` = family size,
+  diff-CI ↔ Wilcoxon consistency, effect-size policy.
+
 ## [2.0.1] - 2026-07-12
 
 Documentation-only release so the Zenodo archive carries README/docs

@@ -9,6 +9,11 @@ metrics:
 statistical:
   alpha: 0.05
   correction: "holm"
+  # The smoke grid has one backbone and one fusion, so the
+  # question-aligned families produce no pairs; all_pairs keeps the
+  # pairwise/friedman plumbing exercised (exploratory mode).
+  families:
+    - all_pairs
   bootstrap:
     enabled: true
     n_iterations: 100

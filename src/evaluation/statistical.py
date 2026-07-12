@@ -18,14 +18,32 @@ Provided methods
 * **Multiple-comparison corrections** (``bonferroni_correction``,
   ``holm_bonferroni``) — control the family-wise error rate when many
   pairwise tests are reported together.  Holm is uniformly more
-  powerful than vanilla Bonferroni.
+  powerful than vanilla Bonferroni.  The correction is applied WITHIN
+  a comparison family (:mod:`src.evaluation.comparison_families`) —
+  the set of hypotheses one research question defines — never over the
+  Cartesian product of every config.
 
-* **Effect sizes** (``cohens_d_paired``, ``cliffs_delta``) — magnitude
-  of the difference, complementary to p-values.  Always report both.
+* **Effect sizes** — **Cliff's delta** (``cliffs_delta``) is the
+  primary one: non-parametric and tie-robust, consistent with
+  Wilcoxon+pratt on 0/1-heavy LOO metrics.  ``cohens_d_paired`` is
+  parametric and inflates on zero-dominated differences; it is kept
+  for diagnostics only (off by default in reported tables).
 
 * **Bootstrap confidence intervals** (``bootstrap_ci``,
-  ``per_model_summary``) — non-parametric estimate of the metric mean
-  uncertainty.  Robust against non-normal score distributions.
+  ``per_model_summary``, ``bootstrap_diff_ci``) — non-parametric
+  uncertainty for the per-config mean (descriptive) and for the
+  PAIRED mean difference (inferential; the CI that must agree with
+  the Wilcoxon verdict).
+
+Metric redundancy under leave-one-out
+-------------------------------------
+
+With exactly one relevant item per user, recall@k is 0/1 (HitRate@k),
+precision@k = recall@k / k, map@k = 1/rank of the single hit, and
+ndcg@k = 1/log2(rank+1) — only two independent signals exist (hit
+or not; at which rank).  The reporting step analyses recall + ndcg as
+primary and treats precision/map as derived, never as independent
+evidence.
 
 Notes on cross-validation
 -------------------------
@@ -135,6 +153,17 @@ def holm_bonferroni(
 def cohens_d_paired(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
     """Cohen's d for paired samples: ``mean(diff) / std(diff)``.
 
+    .. warning::
+        **Secondary/diagnostic only under this pipeline's LOO metrics.**
+        Cohen's d is parametric (assumes roughly normal differences);
+        per-user LOO metrics are 0/1-heavy, so the difference vector is
+        dominated by zeros with a few ``±1`` — the ``std`` shrinks and
+        ``d`` inflates without a sensible interpretation.  The primary
+        effect size is :func:`cliffs_delta` (non-parametric, tie-robust),
+        consistent with the choice of Wilcoxon + ``pratt``.  This column
+        is therefore OFF by default in the reported tables
+        (``statistical.include_cohens_d``).
+
     Conventional thresholds: ``|d| < 0.2`` small, ``< 0.5`` medium,
     ``≥ 0.8`` large.  Returns ``0.0`` when the differences have zero
     variance (everyone changed by the same amount).
@@ -216,6 +245,29 @@ def bootstrap_ci(
     return float(arr.mean()), lower, upper
 
 
+def bootstrap_diff_ci(
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    n_iterations: int = 1000,
+    alpha: float = 0.05,
+    seed: int | None = 42,
+) -> tuple[float, float, float]:
+    """Bootstrap CI of the PAIRED mean difference ``mean(A - B)``.
+
+    Resamples USERS (paired rows), not configs, so the between-user
+    variance that the paired Wilcoxon removes is also removed here.
+    Individual per-config CIs (:func:`bootstrap_ci`) can overlap while
+    the paired test is highly significant — that is not a
+    contradiction, it is unpaired vs paired variance.  This CI is the
+    one that must agree with the Wilcoxon verdict: a paired-difference
+    CI excluding zero is consistent with a significant paired test.
+
+    Returns ``(diff_mean, lower, upper)``.
+    """
+    diff = np.asarray(scores_a, dtype=float) - np.asarray(scores_b, dtype=float)
+    return bootstrap_ci(diff, n_iterations=n_iterations, alpha=alpha, seed=seed)
+
+
 def _ensure_config(results_df: pd.DataFrame) -> pd.DataFrame:
     """Return *results_df* with a unique-per-(user, config) ``config`` column.
 
@@ -284,12 +336,16 @@ def friedman_test(
     results_df: pd.DataFrame,
     metric: str,
     alpha: float = 0.05,
+    configs: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
-    """Friedman test across all configs on the same set of users.
+    """Friedman test across configs on the same set of users.
 
-    A *config* is ``model_name + "_" + embedding_name``. Returns a dict
-    with ``statistic``, ``p_value``, ``significant`` (bool against
-    ``alpha``), ``n_configs``, ``n_users``.
+    A *config* is ``model_name + "_" + embedding_name``.  When *configs*
+    is given, the omnibus runs on that subset only — this is how the
+    step applies it PER COMPARISON FAMILY (an omnibus over all ~77
+    heterogeneous configs of a dataset answers no research question).
+    Returns a dict with ``statistic``, ``p_value``, ``significant``
+    (bool against ``alpha``), ``n_configs``, ``n_users``.
 
     Use this as a *gate* before pairwise testing — only run pairwise
     Wilcoxon when ``significant`` is True (otherwise none of the
@@ -301,6 +357,8 @@ def friedman_test(
         )
 
     df = _ensure_config(results_df)
+    if configs is not None:
+        df = df[df["config"].isin(set(configs))]
     pivot = df.pivot(index="user_id", columns="config", values=metric).dropna()
     if pivot.shape[1] < 3:
         # Friedman undefined for < 3 groups; the pairwise test is the right tool.
@@ -333,8 +391,22 @@ def pairwise_significance(
     alpha: float = 0.05,
     correction: str = "holm",
     include_effect_size: bool = True,
+    pairs: list[tuple[str, str]] | tuple[tuple[str, str], ...] | None = None,
+    family: str = "all_pairs",
+    group: str = "all",
+    include_cohens_d: bool = False,
+    diff_ci: bool = True,
+    n_iterations: int = 1000,
+    seed: int = 42,
 ) -> pd.DataFrame:
-    """All-pairs Wilcoxon test with multiple-comparison correction and effect sizes.
+    """Pairwise Wilcoxon tests with correction applied WITHIN one family.
+
+    The correction's ``m`` is the number of *pairs tested in this call*
+    — pass the pairs of ONE comparison family (see
+    :mod:`src.evaluation.comparison_families`) so Holm corrects within
+    the set of hypotheses the research question actually defines.
+    Called without *pairs*, it degrades to the exploratory all-pairs
+    mode over every config in *results_df*.
 
     Parameters
     ----------
@@ -349,15 +421,30 @@ def pairwise_significance(
         ``"holm"`` (default — uniformly more powerful than Bonferroni),
         ``"bonferroni"``, or ``"none"``.
     include_effect_size:
-        When True, adds Cohen's d and Cliff's delta columns.
+        When True, adds the Cliff's delta columns (primary effect size).
+    pairs / family / group:
+        The comparison family: explicit ``(config_a, config_b)`` pairs
+        plus the labels recorded on every output row so the correction
+        is auditable (``n_comparisons_in_family`` = ``len(pairs)``).
+    include_cohens_d:
+        Adds the parametric Cohen's d column.  OFF by default: it has
+        no sensible interpretation on 0/1-heavy LOO differences (see
+        :func:`cohens_d_paired`).
+    diff_ci:
+        Adds the bootstrap CI of the PAIRED mean difference
+        (``diff_mean``, ``diff_ci_lower``, ``diff_ci_upper``) — the CI
+        that must agree with the Wilcoxon verdict (individual
+        per-config CIs may overlap under a significant paired test).
 
     Returns
     -------
     pd.DataFrame
-        One row per config pair with columns ``config_a``, ``config_b``,
+        One row per pair: ``family``, ``group``,
+        ``n_comparisons_in_family``, ``config_a``, ``config_b``,
         ``mean_a``, ``mean_b``, ``statistic``, ``p_value``,
-        ``corrected_p``, ``significant``, plus (optionally)
-        ``cohens_d``, ``cliffs_delta``, ``cliffs_magnitude``.
+        ``corrected_p``, ``significant``, ``n_pairs``,
+        ``n_nonzero_pairs``, plus the effect-size and paired-diff-CI
+        columns enabled above.
     """
     if correction not in _VALID_CORRECTIONS:
         raise ValueError(
@@ -369,18 +456,30 @@ def pairwise_significance(
         )
 
     df = _ensure_config(results_df)
-    configs = sorted(df["config"].unique())
-    if len(configs) < 2:
-        raise ValueError(
-            f"Need at least 2 distinct configs for pairwise comparison, got {len(configs)}."
-        )
+    if pairs is None:
+        configs = sorted(df["config"].unique())
+        if len(configs) < 2:
+            raise ValueError(
+                f"Need at least 2 distinct configs for pairwise comparison, got {len(configs)}."
+            )
+        pairs = list(combinations(configs, 2))
+    else:
+        pairs = list(pairs)
+        if not pairs:
+            raise ValueError("pairs must be a non-empty list of (config_a, config_b) tuples.")
 
-    pivot = df.pivot(index="user_id", columns="config", values=metric)
+    needed = sorted({c for pair in pairs for c in pair})
+    missing = [c for c in needed if c not in set(df["config"])]
+    if missing:
+        raise ValueError(f"configs referenced by pairs but absent from results: {missing}")
+
+    pivot = df[df["config"].isin(needed)].pivot(index="user_id", columns="config", values=metric)
 
     rows: list[dict] = []
     raw_p_values: list[float] = []
+    m_family = len(pairs)
 
-    for config_a, config_b in combinations(configs, 2):
+    for config_a, config_b in pairs:
         valid = pivot[[config_a, config_b]].dropna()
         scores_a = valid[config_a].to_numpy()
         scores_b = valid[config_b].to_numpy()
@@ -389,6 +488,9 @@ def pairwise_significance(
         raw_p_values.append(p_val)
 
         row = {
+            "family": family,
+            "group": group,
+            "n_comparisons_in_family": m_family,
             "config_a": config_a,
             "config_b": config_b,
             "mean_a": float(np.mean(scores_a)),
@@ -401,12 +503,23 @@ def pairwise_significance(
             # the effective sample size.
             "n_nonzero_pairs": n_nonzero_pairs(scores_a, scores_b),
         }
+        if diff_ci:
+            diff_mean, diff_lo, diff_hi = bootstrap_diff_ci(
+                scores_a,
+                scores_b,
+                n_iterations=n_iterations,
+                alpha=alpha,
+                seed=seed,
+            )
+            row["diff_mean"] = diff_mean
+            row["diff_ci_lower"] = diff_lo
+            row["diff_ci_upper"] = diff_hi
         if include_effect_size:
-            d = cohens_d_paired(scores_a, scores_b)
             delta = cliffs_delta(scores_a, scores_b)
-            row["cohens_d"] = d
             row["cliffs_delta"] = delta
             row["cliffs_magnitude"] = cliffs_delta_magnitude(delta)
+            if include_cohens_d:
+                row["cohens_d"] = cohens_d_paired(scores_a, scores_b)
         rows.append(row)
 
     if correction == "bonferroni":

@@ -636,14 +636,22 @@ Step 07 produces three granular CSVs per dataset and metric, plus three long-for
 
 | Output                            | Method                                           |
 | --------------------------------- | ------------------------------------------------ |
-| `{dataset}_summary_{metric}.csv`  | Bootstrap CI on the mean (1000 resamples)        |
-| `{dataset}_friedman_{metric}.csv` | Friedman omnibus test                            |
-| `{dataset}_pairwise_{metric}.csv` | Wilcoxon signed-rank + correction + effect sizes |
+| `{dataset}_summary_{metric}.csv`  | Bootstrap CI on the per-config mean (descriptive) |
+| `{dataset}_friedman_{metric}.csv` | Friedman omnibus test, one row per comparison-family instance |
+| `{dataset}_pairwise_{metric}.csv` | Wilcoxon signed-rank + within-family correction + Cliff's delta + paired-difference bootstrap CI |
 | `evaluation_aggregated.csv`       | Long-format mean per cell (all datasets/metrics/k) |
 | `bootstrap_ci.csv`                | Long-format bootstrap CI rows                     |
 | `statistical_tests.csv`           | Long-format Friedman + Wilcoxon rows              |
 
 The three long-format files are auto-generated at the end of `statistical.run()` via `src.reporting.write_consolidated` — they collapse the ~160 granular files into one row per observation with explicit `dataset` / `recommender` / `extractor` / `fusion` / `condition` / `metric` / `k` columns, making thesis-time analysis a single `pandas.read_csv` + `df.query`.
+
+#### Comparison families
+
+The correction and the Friedman omnibus are applied **within the family of comparisons a research question defines** (`src/evaluation/comparison_families.py`), never over the Cartesian product of every config (all-pairs Holm over ~77 configs would run with `m ≈ 2900` and reject everything artificially). Each family varies exactly one experimental dimension — `backbone_within_model`, `model_within_backbone`, `fusion_within_model`, `frozen_vs_finetuned` — and every result row carries `family`, `group` and `n_comparisons_in_family` so the correction is auditable. `all_pairs` is available as an exploratory option only (`statistical.families`).
+
+#### Primary metrics under leave-one-out
+
+With exactly one relevant item per user, only two independent signals exist: hit-or-not (`recall@k` ≡ HitRate@k) and hit rank (`ndcg@k`). `precision@k = recall@k / k` and `map@k = 1/rank` are deterministic transforms of them; they stay in the raw evaluation CSVs but are only analysed with `include_derived_metrics: true`, and must not be read as independent evidence.
 
 #### Multiple comparison corrections
 
@@ -653,12 +661,11 @@ The three long-format files are auto-generated at the end of `statistical.run()`
 | `correction: bonferroni` | Vanilla Bonferroni        |
 | `correction: none`       | Raw p-values              |
 
-#### Effect sizes
+#### Effect sizes and paired-difference CI
 
-- **Cohen's d (paired)**, magnitude in standard-deviation units of the per-user difference.
-- **Cliff's delta**, non-parametric, in `[-1, 1]`; the qualitative label (`negligible` / `small` / `medium` / `large`) follows Romano et al. thresholds.
-
-Both columns are added to `{dataset}_pairwise_{metric}.csv` when `effect_size: true`.
+- **Cliff's delta (primary)**, non-parametric and tie-robust, in `[-1, 1]`; the qualitative label (`negligible` / `small` / `medium` / `large`) follows Romano et al. thresholds. Consistent with Wilcoxon+pratt on 0/1-heavy per-user LOO metrics.
+- **Cohen's d (diagnostic only, off by default)** — parametric; on zero-dominated paired differences the `std` shrinks and `d` inflates without a sensible interpretation. Enable with `include_cohens_d: true` if needed.
+- **Paired-difference bootstrap CI** (`diff_mean`, `diff_ci_lower/upper`) on every pairwise row, resampling users: this is the CI that must agree with the Wilcoxon verdict. Per-config CIs in the summary table are descriptive — because the inference is paired, overlapping individual CIs do **not** imply absence of a significant difference.
 
 Each method is toggled individually in `configs/evaluation.yaml` -> `statistical:`.
 
@@ -866,7 +873,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.0.1},
+  version = {2.1.0},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }

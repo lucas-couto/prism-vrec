@@ -43,22 +43,55 @@ statistical:
   # "none"       — uncorrected (do not use in published tables)
   correction: "holm"
 
-  # Bootstrap confidence intervals for the per-model mean.
-  # Cheap (~100 ms per metric on hundreds of thousands of users) and
-  # gives the reader a sense of metric uncertainty without re-training.
+  # Comparison families: the correction is applied WITHIN each family
+  # (the set of hypotheses one research question defines), never over
+  # the Cartesian product of every config — all-pairs Holm over ~77
+  # configs runs with m ≈ 2900 and rejects everything artificially.
+  # Each family varies exactly one experimental dimension:
+  #   backbone_within_model — which backbone? (fixes the recommender)
+  #   model_within_backbone — which recommender? (fixes the backbone)
+  #   fusion_within_model   — which fusion? (fixes the recommender)
+  #   frozen_vs_finetuned   — does fine-tuning help? (one pair per config;
+  #                           requires condition "all")
+  # "all_pairs" may be added for exploration but is never the default
+  # for reported numbers. Every output row carries family, group and
+  # n_comparisons_in_family so the correction is auditable.
+  families:
+    - backbone_within_model
+    - model_within_backbone
+    - fusion_within_model
+    - frozen_vs_finetuned
+
+  # Metric families analysed by step 07. Under leave-one-out there are
+  # only two independent signals per user — hit-or-not (recall@k, i.e.
+  # HitRate@k) and hit rank (ndcg@k) — so these two are the primary
+  # evidence. precision@k (= recall@k / k) and map@k (= 1/rank with a
+  # single relevant item) are deterministic transforms of them; they
+  # stay in the raw evaluation CSVs and are only analysed when
+  # include_derived_metrics is true. Never read them as independent
+  # confirmation of the primary metrics.
+  primary_metrics: ["recall", "ndcg"]
+  include_derived_metrics: false
+
+  # Bootstrap confidence intervals: per-config mean (descriptive) and
+  # the PAIRED mean-difference CI on every pairwise row (inferential —
+  # the one that must agree with the Wilcoxon verdict; overlapping
+  # per-config CIs do NOT contradict a significant paired test).
   bootstrap:
     enabled: true
     n_iterations: 1000
 
-  # Friedman omnibus test across all models on the same set of users.
-  # Always run before pairwise tests when there are 3+ competing models:
-  # if Friedman is not significant, no pairwise effect can be claimed
-  # at the family level.
+  # Friedman omnibus test, run WITHIN each comparison family (3+
+  # configs). If a family's omnibus is not significant, none of its
+  # pairwise effects can be claimed at the family level.
   friedman:
     enabled: true
 
-  # Add Cohen's d (parametric) and Cliff's delta (non-parametric)
-  # effect-size columns to the pairwise table.  Always report effect
-  # sizes alongside p-values — magnitude is what the reader cares
-  # about beyond "non-zero difference".
+  # Cliff's delta (non-parametric, tie-robust) is the primary effect
+  # size, consistent with Wilcoxon+pratt on 0/1-heavy LOO metrics.
   effect_size: true
+
+  # Cohen's d is parametric and has no sensible interpretation on
+  # zero-dominated paired differences (std shrinks, d inflates); it is
+  # available for diagnostics only.
+  include_cohens_d: false
