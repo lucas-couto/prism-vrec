@@ -165,8 +165,6 @@ def _run_step(name: str, condition: str | None) -> None:
         fn(condition=condition)
     elif name == "statistical":
         fn(condition=condition or "frozen")
-    elif name == "export_best":
-        fn()
     else:
         fn()
     duration = time.time() - started
