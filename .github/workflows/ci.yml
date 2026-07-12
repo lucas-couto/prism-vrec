@@ -27,7 +27,7 @@ jobs:
       - name: Install ruff
         # Pinned to the same version as .pre-commit-config.yaml so local
         # hooks and CI can never disagree about formatting.
-        run: pip install "ruff==0.5.5"
+        run: pip install "ruff==0.15.17"
 
       - name: ruff check
         run: ruff check .
