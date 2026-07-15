@@ -646,19 +646,23 @@ def _train_one_optuna_trial(
 
     dataset_name = cell.dataset_name
     train_path = Path(processed_dir) / dataset_name / "train.csv"
-    test_path = Path(processed_dir) / dataset_name / "test.csv"
+    # Model selection (early stopping + the Optuna objective) runs on
+    # VALIDATION users, masking each user's TRAIN items. The test set is
+    # never read during training/selection — it is touched only by the
+    # final evaluate step. Mirrors the grid worker (src/utils/parallel.py).
+    val_path = Path(processed_dir) / dataset_name / "val.csv"
 
     import pandas as pd
 
     train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
+    val_df = pd.read_csv(val_path)
 
     train_interactions: dict = {}
     for u, i in zip(train_df["user_idx"], train_df["item_idx"], strict=False):
         train_interactions.setdefault(int(u), set()).add(int(i))
-    test_interactions: dict = {}
-    for u, i in zip(test_df["user_idx"], test_df["item_idx"], strict=False):
-        test_interactions.setdefault(int(u), set()).add(int(i))
+    val_interactions: dict = {}
+    for u, i in zip(val_df["user_idx"], val_df["item_idx"], strict=False):
+        val_interactions.setdefault(int(u), set()).add(int(i))
 
     visual_embeddings = None
     if embeddings_path is not None:
@@ -680,7 +684,7 @@ def _train_one_optuna_trial(
         n_items=n_items,
         visual_embeddings=visual_embeddings,
         train_interactions=train_interactions,
-        test_interactions=test_interactions,
+        test_interactions=val_interactions,
         hyperparams=hyperparams,
         config=config,
         checkpoint_mgr=checkpoint_mgr,

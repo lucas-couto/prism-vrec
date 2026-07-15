@@ -1,16 +1,19 @@
 """Regression: the validation subsample is a pure function of sample_seed.
 
-The ~2000-user early-stopping subsample must be identical across every
-model and Optuna trial of a run so the whole hyperparameter search is
-compared on the same held-out users. That invariant holds only because
-the Evaluator draws it from a dedicated ``np.random.default_rng(sample_seed)``
-over a sorted population (src/evaluation/protocol.py) — NOT from the global
-RNGs that model init, negative sampling and dropout mutate.
+Model selection (early stopping + the Optuna objective) runs on a
+~2000-user subsample of the VALIDATION users (each masked by their own
+train items). That subsample must be identical across every model and
+Optuna trial of a run so the whole hyperparameter search is compared on
+the same held-out users. The invariant holds only because the Evaluator
+draws it from a dedicated ``np.random.default_rng(sample_seed)`` over a
+sorted population (src/evaluation/protocol.py) — NOT from the global RNGs
+that model init, negative sampling and dropout mutate.
 
-These tests lock that property: they pollute the global ``random`` /
-``numpy`` / ``torch`` RNGs by different amounts between two Evaluator
-constructions and assert the sampled user set is unchanged. A future
-refactor that switches the draw to a shared/global RNG would break them.
+These tests lock that property over the validation population: they
+pollute the global ``random`` / ``numpy`` / ``torch`` RNGs by different
+amounts between two Evaluator constructions and assert the sampled user
+set is unchanged. A future refactor that switches the draw to a
+shared/global RNG would break them.
 """
 
 from __future__ import annotations
@@ -27,17 +30,20 @@ _SAMPLE_SIZE = 50
 
 
 def _population() -> tuple[dict[int, set[int]], dict[int, set[int]]]:
-    """A train/test population larger than the subsample size."""
+    """A train + validation population larger than the subsample size."""
     train = {u: {u % 7} for u in range(_POPULATION)}
-    test = {u: {1000 + u} for u in range(_POPULATION)}
-    return train, test
+    val = {u: {1000 + u} for u in range(_POPULATION)}
+    return train, val
 
 
 def _make_evaluator(sample_seed: int) -> Evaluator:
-    train, test = _population()
+    # The selection Evaluator is built with the VALIDATION held-outs as
+    # ``test_interactions`` (the Evaluator's generic held-out slot) and
+    # the train items as the mask — mirroring the training path.
+    train, val = _population()
     return Evaluator(
         train_interactions=train,
-        test_interactions=test,
+        test_interactions=val,
         n_items=5000,
         k_values=[10],
         sample_size=_SAMPLE_SIZE,

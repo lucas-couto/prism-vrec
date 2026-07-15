@@ -75,18 +75,30 @@ items unseen by the user. **Every recorded result row carries a
 `protocol` column**; train-time BPR negative sampling is a different
 thing entirely and is not configurable here.
 
+**Model selection on validation.** Early stopping and the Optuna
+objective (`ndcg@10`) score the **validation** held-outs, never the
+test set: the training path loads `val.csv` and masks each user's train
+items (`src/steps/train.py`, `src/utils/parallel.py`;
+`src/utils/training.py` builds the selection `Evaluator`). The test set
+is read only by the final evaluate step (`src/steps/evaluate.py`), so
+hyperparameters and the stopping epoch are never chosen by looking at
+test performance — the reported test numbers are an out-of-sample
+estimate, not an optimistically-biased one. During validation the
+user's own test item stays in the candidate set and competes as an
+ordinary item; this is neutral across models and leaks nothing to the
+model (the model never sees which items are held out).
+
 **Training-time validation subsample (`common.eval_sample_size = 2000`).**
-Early stopping and Optuna pruning score a fixed subset of 2000 test
-users instead of the full test set. The subset is drawn once per
-dataset, deterministically (`sample_seed` = global seed,
-`src/evaluation/protocol.py`), and is identical for every
-model/embedding/trial — hyperparameter selection therefore remains a
-paired comparison on a common user set; only its variance changes
-(standard error on ndcg@10 stays well below between-configuration
-gaps). The validation metric itself is still full-ranking over all
-items for those users. **Reported numbers are unaffected**: the final
-evaluate step constructs its `Evaluator` without `sample_size`
-(`src/steps/evaluate.py`) and ranks the entire test set.
+Selection scores a fixed subset of 2000 **validation** users instead of
+all of them. The subset is drawn once per dataset, deterministically
+(dedicated `np.random.default_rng`, `sample_seed` = global run seed —
+not the per-trial job seed; `src/evaluation/protocol.py`), and is
+identical for every model/embedding/trial, so selection remains a
+paired comparison on a common validation-user set; only its variance
+changes (standard error on ndcg@10 stays well below between-config
+gaps). The validation metric is still full-ranking over all items for
+those users. The final evaluate step constructs its `Evaluator` without
+`sample_size` and ranks the entire test set.
 
 ## 4. Deterministic tie-breaking
 
