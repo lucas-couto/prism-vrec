@@ -8,6 +8,28 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-07-15
+
+Follow-up corrections. No behaviour or artifact change.
+
+### Changed
+
+- **Per-user records now come from a single scoring pass.** The Task F
+  per-user sufficient statistic (rank / n_candidates / tie_block_size /
+  top-20) was recomputed in a second scoring pass at final evaluation.
+  The three ranking paths now emit these as ``_``-prefixed columns in the
+  one metric pass; ``evaluate_with_records`` returns
+  ``(metrics, records)`` from that single pass (metrics still drop the
+  diagnostics). ``tie_block_size`` is reused, not recomputed.
+- **``train_single_run`` selection kwarg renamed** ``test_interactions``
+  → ``selection_interactions`` (it carries the VALIDATION held-outs used
+  for model selection). The Evaluator's own ``test_interactions`` param
+  is unchanged (accurate on the final-eval path).
+- **CHANGELOG 2.3.0 comparability note** amended: results from ≤ 2.2.7 are
+  not comparable for two independent reasons — model selection moved from
+  test to validation (HP search was previously selected on the test set),
+  and the tie-break changed.
+
 ## [2.4.0] - 2026-07-15
 
 Battery-readiness build: four new capabilities to run the full battery
