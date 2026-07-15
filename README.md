@@ -197,6 +197,17 @@ datasets:
   - "amazon_men"
   - "tradesy"
 
+# Per-dataset contract: whether the dataset is EXPECTED to ship item
+# category labels.  Enforced at preprocess time — if the raw data
+# disagrees with the declaration the run fails loudly instead of
+# silently flipping DeepStyle degeneration and fine-tuning transfer.
+# Datasets without an entry skip the check.
+dataset_contracts:
+  amazon_fashion: { expects_categories: true }
+  amazon_women:   { expects_categories: true }
+  amazon_men:     { expects_categories: true }
+  tradesy:        { expects_categories: false }
+
 pipeline:
   run_all: true # set to false to use start_from / stop_at
   start_from: null # e.g. "train"
@@ -873,7 +884,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.1.0},
+  version = {2.2.2},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }
