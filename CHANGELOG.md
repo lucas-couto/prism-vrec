@@ -8,6 +8,40 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.2] - 2026-07-15
+
+Housekeeping; no runtime behaviour change.
+
+### Fixed
+
+- **CI: ``ruff format``.** ``src/fusions/strategies.py`` was left
+  unformatted (the multi-arg ``_fit_pca_train_only`` call in
+  ``fuse_pca_per_model`` was hand-wrapped), failing ``ruff format
+  --check .`` on ``main``. Reformatted (ruff 0.15.17): one argument per
+  line. No logic change.
+
+### Changed
+
+- **``data/`` kept in the repo, contents ignored.** Added
+  ``data/.gitignore`` that ignores everything under ``data/`` except
+  itself, and simplified the root ``.gitignore`` data section
+  accordingly, so raw datasets / processed splits / embeddings / smoke
+  artifacts stay out of Git while the directory remains tracked.
+
+## [2.2.1] - 2026-07-15
+
+Documentation only; no code change.
+
+### Changed
+
+- **Protocol doc de-versioned.** Renamed ``docs/protocol_v2.md`` ->
+  ``docs/protocol.md`` and dropped ``v2`` from the title, since
+  versioning belongs to releases, not the methodology. Reworded the
+  ``v1.x``-vs-``v2`` historical contrast as "an earlier version of the
+  framework" vs "this protocol"; updated the path references in README
+  and CHANGELOG. Model names (DINOv2) and the versioned release history
+  are untouched.
+
 ## [2.2.0] - 2026-07-15
 
 Audit follow-up: hardening guards, a regression test, and doc fixes from
