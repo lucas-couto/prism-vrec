@@ -8,6 +8,19 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-07-15
+
+### Added
+
+- **Battery covers the finetuned condition.** The cell enumerator only
+  produced frozen cells; it now enumerates both frozen and finetuned per
+  ``pipeline.condition`` (``both`` → both) via ``_iter_cells``. Finetuned
+  cells carry a distinct ``_finetuned`` embedding stem, so their study /
+  checkpoint / F artifact are separate from the frozen twin, and BPR
+  (feature-blind) is not duplicated. Finetuned cells appear only when the
+  finetuned features exist on disk (run the ``finetune`` step first).
+  Runbook updated.
+
 ## [2.4.2] - 2026-07-15
 
 ### Fixed
