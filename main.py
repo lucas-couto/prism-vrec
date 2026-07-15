@@ -271,6 +271,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     selection.add_argument(
+        "--battery",
+        action="store_true",
+        help=(
+            "Run the full battery via the resumable runner: enumerate cells, "
+            "skip completed ones (idempotent), track state in the manifest, "
+            "and retry-safe after a spot-instance interruption."
+        ),
+    )
+    selection.add_argument(
+        "--battery-status",
+        action="store_true",
+        help="Print the battery manifest state counts + remaining-cost projection.",
+    )
+    selection.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="With --battery, also re-run cells currently marked failed.",
+    )
+    selection.add_argument(
         "--report",
         action="store_true",
         help=(
@@ -623,6 +642,19 @@ def main(argv: list[str] | None = None) -> None:
         ds = args.validate_features[0] if len(args.validate_features) >= 1 else None
         bb = args.validate_features[1] if len(args.validate_features) >= 2 else None
         sys.exit(validate_features.run(dataset=ds, backbone=bb))
+    if args.battery_status:
+        from src.battery.runner import battery_status
+
+        cfg = load_config()
+        battery_status(cfg["paths"]["results"])
+        return
+    if args.battery:
+        from src.battery.execute import execute_cell
+        from src.battery.runner import run_battery
+
+        cfg = load_config()
+        run_battery(cfg, cfg["paths"]["results"], execute_cell, retry_failed=args.retry_failed)
+        return
     if args.report:
         from src.utils.report import write_report
 

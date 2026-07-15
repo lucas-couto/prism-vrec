@@ -47,10 +47,13 @@ def per_user_metrics(ranks: np.ndarray, k: int) -> dict[str, np.ndarray]:
 def metrics_frame(records: pd.DataFrame, k_values: list[int]) -> pd.DataFrame:
     """Per-user metrics DataFrame (``user_id`` + ``<metric>@<k>``) from records.
 
-    ``records`` must have ``user_id`` and ``rank`` columns.
+    ``records`` must have a ``rank`` column and a user column named either
+    ``user_id`` (online Evaluator output) or ``user_idx`` (persisted
+    artifact).
     """
     ranks = records["rank"].to_numpy()
-    out = {"user_id": records["user_id"].to_numpy()}
+    user_col = "user_id" if "user_id" in records.columns else "user_idx"
+    out = {"user_id": records[user_col].to_numpy()}
     for k in k_values:
         for name, values in per_user_metrics(ranks, k).items():
             out[f"{name}@{k}"] = values
