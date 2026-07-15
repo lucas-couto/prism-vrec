@@ -15,6 +15,7 @@ from pathlib import Path
 
 from src.data import dvbpr  # noqa: F401
 from src.data.base import get_dataset_provider
+from src.data.categories import enforce_category_contract
 from src.utils.config import load_config
 from src.utils.logging import get_logger
 
@@ -33,6 +34,7 @@ def run() -> None:
     raw_dir = config["paths"]["data_raw"]
     processed_dir = config["paths"]["data_processed"]
     datasets = config.get("datasets", [])
+    contracts = config.get("dataset_contracts", {})
 
     for dataset_name in datasets:
         output_dir = Path(processed_dir) / dataset_name
@@ -48,6 +50,18 @@ def run() -> None:
             provider = get_dataset_provider(dataset_name)
             provider.save_processed(output_dir)
             logger.info("%s: preprocessing complete.", dataset_name)
+
+        # Enforce the declared category contract on the loaded data. Runs
+        # even when preprocessing was skipped: the raw taxonomy / sidecar
+        # is on disk either way, and the contract must hold every run.
+        contract = contracts.get(dataset_name)
+        if contract is not None:
+            provider = get_dataset_provider(dataset_name)
+            enforce_category_contract(
+                dataset_name,
+                contract["expects_categories"],
+                provider.load_categories(),
+            )
 
         image_dir = Path(raw_dir) / dataset_name / "images"
         n_existing = len(list(image_dir.glob("*.jpg"))) if image_dir.exists() else 0

@@ -8,6 +8,52 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-07-15
+
+Audit follow-up: hardening guards, a regression test, and doc fixes from
+the 4-point diagnostic audit. No experimental protocol changes and no
+training artifact is invalidated — the two behaviour changes only turn
+previously silent decisions into loud, declared ones.
+
+### Added
+
+- **Explicit per-dataset category contract.** A ``dataset_contracts``
+  block in ``configs/default.yaml`` declares ``expects_categories`` per
+  dataset (amazon_* = true, tradesy = false), validated by the new
+  ``DatasetContract`` schema. ``src.steps.preprocess`` enforces it via
+  ``src.data.categories.enforce_category_contract``: a mismatch between
+  the declaration and what the provider's ``load_categories()`` returns
+  now raises ``CategoryContractError`` instead of silently flipping
+  DeepStyle degeneration and fine-tuning transfer. Datasets without an
+  entry skip the check (backwards compatible).
+- **Regression test for validation-subsample determinism.** Locks the
+  invariant that the ~2000-user early-stopping subsample is a pure
+  function of ``sample_seed`` (dedicated ``np.random.default_rng`` over a
+  sorted population), independent of global RNG state mutated by model
+  init / negative sampling — so a future refactor to a shared RNG fails
+  CI instead of silently desynchronising validation across trials.
+
+### Changed
+
+- **PCA transductive fallback is now an opt-in error.**
+  ``_fit_pca_train_only`` (and ``fuse_pca`` / ``fuse_pca_per_model`` /
+  ``pca_align``) raise when ``train_items=None`` unless
+  ``allow_transductive=True`` is passed explicitly. A fit over all rows
+  is the test→fit leak the v2 protocol eliminated; it was previously a
+  warning (which does not fail CI). No production path passes ``None``
+  (``src.steps.fuse`` always supplies train item indices), so behaviour
+  there is unchanged; only synthetic tests opt in.
+
+### Fixed
+
+- **DeepStyle documentation.** ``docs/protocol_v2.md`` described the
+  removed 1.x DeepStyle (MLP projector, no category subtraction, "does
+  not degenerate on Tradesy"). Rewritten to the paper-faithful v2
+  formulation ``θ_i = E·f_i − c_cat(i)`` with the analytic degeneration
+  to VBPR on category-less Tradesy. Also corrected the contradictory
+  ``_ensure_categories_sidecar`` docstring that listed tradesy among
+  taxonomy-bearing datasets.
+
 ## [2.1.0] - 2026-07-12
 
 Statistical-validity pass (C1-C4): changes what the analysis can claim,
