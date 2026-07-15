@@ -237,7 +237,7 @@ def _worker_fn(
                 n_items=n_items,
                 visual_embeddings=visual_emb,
                 train_interactions=train_inter,
-                test_interactions=val_inter,
+                selection_interactions=val_inter,
                 hyperparams=job.hyperparams,
                 config=config,
                 checkpoint_mgr=checkpoint_mgr,

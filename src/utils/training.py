@@ -195,7 +195,7 @@ def train_single_run(
     n_items: int,
     visual_embeddings,
     train_interactions: dict,
-    test_interactions: dict,
+    selection_interactions: dict,
     hyperparams: dict,
     config: dict,
     checkpoint_mgr: CheckpointManager,
@@ -286,9 +286,12 @@ def train_single_run(
     sampler = BPRBatchSampler(train_interactions, n_items, batch_size, seed=job_seed)
 
     scaler = get_grad_scaler(enabled=use_cuda)
+    # NB: the Evaluator's second positional arg is its generic held-out
+    # slot; here it carries the VALIDATION interactions (selection), not
+    # the test set — hence the neutral parameter name above.
     evaluator = Evaluator(
         train_interactions,
-        test_interactions,
+        selection_interactions,
         n_items,
         k_values=[10],
         sample_size=eval_sample_size,
