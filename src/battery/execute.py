@@ -58,6 +58,14 @@ def execute_cell(cell: BatteryCell, config: dict) -> dict:
     cfg["seed"] = cell.seed
     processed_dir = cfg["paths"]["data_processed"]
     embeddings_dir = cfg["paths"]["embeddings"]
+    base_results = cfg["paths"]["results"]
+    # Isolate the best-model checkpoint per seed. The Optuna study is shared
+    # across seeds (D2: search on the primary seed supplies best_params), but
+    # each seed's TRAINED model must be the one evaluated — a shared
+    # ``_best.pt`` path would let a replay whose val metric is below the
+    # search's silently keep the search seed's checkpoint. The F artifact
+    # still lands in the shared, seed-keyed directory (``base_results``).
+    cfg["paths"] = {**cfg["paths"], "results": f"{base_results}_seed{cell.seed}"}
     device = resolve_device(cfg["device"])
     n_users, n_items = _dims(processed_dir, cell.dataset)
     emb_path = _embedding_path(embeddings_dir, cell.dataset, cell.visual_config)
@@ -88,21 +96,32 @@ def execute_cell(cell: BatteryCell, config: dict) -> dict:
             config=cfg,
         )
 
-    _evaluate_one_cell(cell, cfg, n_users, n_items, emb_path, device)
+    _evaluate_one_cell(cell, cfg, n_users, n_items, emb_path, device, f_out_dir=base_results)
     return {"seed": cell.seed, "role": cell.role}
 
 
 def _evaluate_one_cell(
-    cell: BatteryCell, cfg: dict, n_users: int, n_items: int, emb_path: str | None, device: str
+    cell: BatteryCell,
+    cfg: dict,
+    n_users: int,
+    n_items: int,
+    emb_path: str | None,
+    device: str,
+    *,
+    f_out_dir: str,
 ) -> None:
-    """Final full-ranking evaluation for one cell → per-user artifact (F)."""
+    """Final full-ranking evaluation for one cell → per-user artifact (F).
+
+    Reads the best checkpoint from the seed-isolated results dir
+    (``cfg['paths']['results']``); writes the F artifact to the shared,
+    seed-keyed ``f_out_dir`` so all seeds land in one per_user directory.
+    """
+    from src.evaluation.protocol import Evaluator
     from src.steps.evaluate import _evaluate_cell, find_best_models, load_data
 
     _, _, seen_inter, test_inter, train_only = load_data(
         cfg["paths"]["data_processed"], cell.dataset
     )
-    from src.evaluation.protocol import Evaluator
-
     evaluator = Evaluator(
         seen_inter,
         test_inter,
@@ -113,8 +132,7 @@ def _evaluate_one_cell(
     models = [
         m
         for m in find_best_models(cell.dataset, results_dir=cfg["paths"]["results"])
-        if m["model_name"] == cell.recommender
-        and m["embedding_name"] == (cell.visual_config if emb_path else "none")
+        if m["model_name"] == cell.recommender and m["embedding_name"] == cell.visual_config
     ]
     if not models:
         raise RuntimeError(f"no best checkpoint found for cell {cell.key()} after training.")
@@ -127,6 +145,6 @@ def _evaluate_one_cell(
         cfg["paths"]["embeddings"],
         device,
         train_interactions=train_only,
-        per_user_out_dir=str(cfg["paths"]["results"]),
+        per_user_out_dir=f_out_dir,
         seed=int(cell.seed),
     )

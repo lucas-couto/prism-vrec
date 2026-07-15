@@ -1,6 +1,14 @@
-"""Battery runner: enumeration, manifest, idempotency, resume, smoke (Task I)."""
+"""Battery runner: enumeration, manifest, idempotency, resume, smoke (Task I).
+
+Enumeration reads the ACTUAL feature artifacts on disk (the visual_config
+is the real embedding stem), so the tests lay down a tiny processed +
+embeddings fixture.
+"""
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -16,42 +24,52 @@ from src.evaluation.protocol import Evaluator
 _CONFIG = {
     "datasets": ["synthetic"],
     "recommenders_enabled": ["bpr", "vbpr", "deepstyle", "avbpr"],
-    "extractors_enabled": ["resnet50"],
-    "fusion_strategies_enabled": ["mean"],
     "seeds": [1, 2],
     "seed": 1,
 }
+_NU, _NI = 12, 30
+
+
+def _fixture(tmp_path: Path) -> tuple[str, str]:
+    """Minimal on-disk processed + embeddings for enumeration."""
+    proc = tmp_path / "processed" / "synthetic"
+    emb = tmp_path / "embeddings" / "synthetic"
+    proc.mkdir(parents=True)
+    emb.mkdir(parents=True)
+    (proc / "user2idx.json").write_text(json.dumps({str(i): i for i in range(_NU)}))
+    (proc / "item2idx.json").write_text(json.dumps({str(i): i for i in range(_NI)}))
+    np.save(emb / "resnet50.npy", np.zeros((_NI, 4), dtype=np.float32))
+    return str(tmp_path / "processed"), str(tmp_path / "embeddings")
+
+
+def _cells(tmp_path: Path) -> list[BatteryCell]:
+    proc, emb = _fixture(tmp_path)
+    return enumerate_cells(_CONFIG, processed_dir=proc, embeddings_dir=emb)
 
 
 class TestEnumeration:
-    def test_rules_applied(self) -> None:
-        cells = enumerate_cells(_CONFIG)
+    def test_rules_applied(self, tmp_path) -> None:
+        cells = _cells(tmp_path)
         by_rec: dict[str, list[BatteryCell]] = {}
         for c in cells:
             by_rec.setdefault(c.recommender, []).append(c)
 
-        # AVBPR excluded.
-        assert "avbpr" not in by_rec
-        # BPR once per (dataset, seed), feature-blind.
-        assert len(by_rec["bpr"]) == 2
-        assert all(c.visual_config == "none" for c in by_rec["bpr"])
-        # Visual model: one cell per visual config (resnet50 + mean) per seed.
-        assert len(by_rec["vbpr"]) == 4
-        assert {c.visual_config for c in by_rec["vbpr"]} == {"resnet50", "mean"}
-        # DeepStyle present (not skipped on any dataset).
-        assert "deepstyle" in by_rec
+        assert "avbpr" not in by_rec  # excluded
+        assert len(by_rec["bpr"]) == 2  # once per (dataset, seed)
+        assert all(c.visual_config == "none" for c in by_rec["bpr"])  # feature-blind
+        assert {c.visual_config for c in by_rec["vbpr"]} == {"resnet50"}  # real stem
+        assert "deepstyle" in by_rec  # not skipped
 
-    def test_primary_seed_is_search_others_replay(self) -> None:
-        cells = enumerate_cells(_CONFIG)
-        roles = {c.seed: c.role for c in cells}
-        assert roles[1] == "search"  # primary (first seed)
+    def test_primary_seed_is_search_others_replay(self, tmp_path) -> None:
+        roles = {c.seed: c.role for c in _cells(tmp_path)}
+        assert roles[1] == "search"
         assert roles[2] == "replay"
 
 
 class TestManifest:
     def test_state_transitions_and_summary(self, tmp_path) -> None:
         m = BatteryManifest.load(tmp_path / "m.json")
-        m.sync_cells(enumerate_cells(_CONFIG))
+        m.sync_cells(_cells(tmp_path))
         total = len(m.cells)
         m.set_state(next(iter(m.cells)), "done", duration_seconds=1.0)
         assert m.summary()["done"] == 1
@@ -65,15 +83,14 @@ class TestManifest:
             "c": {"state": "pending", "role": "search"},
         }
         proj = project_cost(m)
-        assert proj["estimated_remaining_hours"] == 2.0  # 2 pending * 1h mean
+        assert proj["estimated_remaining_hours"] == 2.0
 
 
-def _synthetic_eval() -> tuple[Evaluator, object, int]:
-    n_users, n_items = 12, 30
-    train = {u: {u % 4} for u in range(n_users)}
-    test = {u: {10 + u} for u in range(n_users)}
-    ev = Evaluator(train, test, n_items, k_values=[5, 10], tiebreak_seed=1)
-    scores = np.random.default_rng(0).standard_normal((n_users, n_items)).astype(np.float32)
+def _synthetic_eval() -> tuple[Evaluator, object]:
+    train = {u: {u % 4} for u in range(_NU)}
+    test = {u: {10 + u} for u in range(_NU)}
+    ev = Evaluator(train, test, _NI, k_values=[5, 10], tiebreak_seed=1)
+    scores = np.random.default_rng(0).standard_normal((_NU, _NI)).astype(np.float32)
 
     class _M:
         def eval(self):
@@ -82,11 +99,11 @@ def _synthetic_eval() -> tuple[Evaluator, object, int]:
         def predict_batch(self, uids, items):
             return torch.tensor(scores[np.ix_(uids.cpu().numpy(), items.cpu().numpy())])
 
-    return ev, _M(), n_items
+    return ev, _M()
 
 
 def _make_light_execute(results_dir):
-    ev, model, n_items = _synthetic_eval()
+    ev, model = _synthetic_eval()
     called: list[str] = []
 
     def _execute(cell: BatteryCell, config: dict) -> dict:
@@ -100,7 +117,7 @@ def _make_light_execute(results_dir):
             d=8,
             split="test",
             n_users=len(records),
-            n_items=n_items,
+            n_items=_NI,
         )
         write_cell_artifact(records, meta, results_dir)
         return {}
@@ -110,70 +127,105 @@ def _make_light_execute(results_dir):
 
 class TestSmokeEndToEnd:
     def test_runner_produces_valid_artifacts_and_paired_matrix(self, tmp_path) -> None:
+        proc, emb = _fixture(tmp_path)
         execute, called = _make_light_execute(tmp_path)
-        manifest = run_battery(_CONFIG, tmp_path, execute)
+        manifest = run_battery(_CONFIG, tmp_path, execute, processed_dir=proc, embeddings_dir=emb)
 
-        # Every cell ran and is done.
         assert manifest.summary()["done"] == len(manifest.cells)
         assert len(called) == len(manifest.cells)
 
-        # Artifacts read back, metrics derive, paired matrix assembles.
-        cells = enumerate_cells(_CONFIG)
-        seed1 = [c for c in cells if c.seed == 1]
-        one = seed1[0]
+        # 3 systems for seed 1: bpr__none, vbpr__resnet50, deepstyle__resnet50.
+        matrix = load_paired(tmp_path, "synthetic", seed=1, metric="ndcg", k=10)
+        assert matrix.shape == (_NU, 3)
+
         from src.evaluation.persistence import artifact_paths
 
+        one = next(c for c in manifest.cells)
+        meta = manifest.cells[one]
         recs_path, _ = artifact_paths(
             tmp_path,
-            CellMetadata(one.dataset, one.visual_config, one.recommender, one.seed, 8, "test"),
+            CellMetadata(
+                meta["dataset"], meta["visual_config"], meta["recommender"], meta["seed"], 8, "test"
+            ),
         )
-        meta, df = read_cell_artifact(recs_path)
-        assert not df.empty and "rank" in df.columns
-        assert not metrics_frame(df, [5, 10]).empty
-
-        matrix = load_paired(tmp_path, "synthetic", seed=1, metric="ndcg", k=10)
-        # bpr__none + vbpr x{resnet50,mean} + deepstyle x{resnet50,mean} = 5 systems.
-        assert matrix.shape[1] == 5
+        _, df = read_cell_artifact(recs_path)
+        assert not df.empty and not metrics_frame(df, [5, 10]).empty
 
     def test_idempotent_rerun_skips_completed(self, tmp_path) -> None:
-        execute, called = _make_light_execute(tmp_path)
-        run_battery(_CONFIG, tmp_path, execute)
-        first = len(called)
+        proc, emb = _fixture(tmp_path)
+        execute, _ = _make_light_execute(tmp_path)
+        run_battery(_CONFIG, tmp_path, execute, processed_dir=proc, embeddings_dir=emb)
 
         execute2, called2 = _make_light_execute(tmp_path)
-        run_battery(_CONFIG, tmp_path, execute2)
-        # Second run: everything already done → nothing re-executed.
-        assert first == len(enumerate_cells(_CONFIG))
+        run_battery(_CONFIG, tmp_path, execute2, processed_dir=proc, embeddings_dir=emb)
         assert called2 == []
 
 
 class TestResumeAndFailure:
     def test_failed_cell_isolated_then_retried(self, tmp_path) -> None:
-        boom = {"cell": None}
+        proc, emb = _fixture(tmp_path)
+        cells = enumerate_cells(_CONFIG, processed_dir=proc, embeddings_dir=emb)
         good, _ = _make_light_execute(tmp_path)
+        boom_key = cells[0].key()
 
         def _flaky(cell, config):
-            if cell.key() == boom["cell"]:
+            if cell.key() == boom_key:
                 raise RuntimeError("simulated interruption")
             return good(cell, config)
 
-        cells = enumerate_cells(_CONFIG)
-        boom["cell"] = cells[0].key()
-
-        m = run_battery(_CONFIG, tmp_path, _flaky)
+        m = run_battery(_CONFIG, tmp_path, _flaky, processed_dir=proc, embeddings_dir=emb)
         assert m.summary()["failed"] == 1
         assert m.summary()["done"] == len(cells) - 1
-        assert m.state_of(cells[0].key()) == "failed"
 
-        # Resume with retry: the failed cell runs, the done ones are skipped.
         good2, called2 = _make_light_execute(tmp_path)
-        m2 = run_battery(_CONFIG, tmp_path, good2, retry_failed=True)
+        m2 = run_battery(
+            _CONFIG, tmp_path, good2, retry_failed=True, processed_dir=proc, embeddings_dir=emb
+        )
         assert m2.summary()["failed"] == 0
-        assert called2 == [cells[0].key()]
+        assert called2 == [boom_key]
 
     def test_is_cell_complete_detects_written_artifact(self, tmp_path) -> None:
-        cell = enumerate_cells(_CONFIG)[0]
+        cell = _cells(tmp_path)[0]
         assert is_cell_complete(cell, tmp_path) is False
         execute, _ = _make_light_execute(tmp_path)
         execute(cell, _CONFIG)
         assert is_cell_complete(cell, tmp_path) is True
+
+
+class TestExecuteCellSeedIsolation:
+    def test_checkpoint_seed_isolated_but_f_artifact_shared(self, tmp_path, monkeypatch) -> None:
+        # Fix #1: training/checkpoint use a seed-suffixed results dir so a
+        # replay never inherits the search seed's _best.pt; the F artifact
+        # still lands in the shared base results dir.
+        import src.battery.execute as ex
+        import src.steps.train as train_mod
+
+        proc, emb = _fixture(tmp_path)
+        config = {
+            "seed": 1,
+            "device": "cpu",
+            "paths": {
+                "data_processed": proc,
+                "embeddings": emb,
+                "results": str(tmp_path / "res"),
+            },
+        }
+        seen: dict = {}
+        monkeypatch.setattr(
+            train_mod,
+            "_optimize_one_cell",
+            lambda *a, **k: seen.__setitem__("train_results", k["config"]["paths"]["results"]),
+        )
+        monkeypatch.setattr(
+            ex,
+            "_evaluate_one_cell",
+            lambda cell, cfg, *a, **k: seen.update(
+                train_eval_results=cfg["paths"]["results"], f_out=k["f_out_dir"]
+            ),
+        )
+
+        ex.execute_cell(BatteryCell("synthetic", "resnet50", "vbpr", 7, "search"), config)
+
+        assert seen["train_results"] == str(tmp_path / "res") + "_seed7"
+        assert seen["train_eval_results"] == str(tmp_path / "res") + "_seed7"
+        assert seen["f_out"] == str(tmp_path / "res")
