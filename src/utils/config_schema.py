@@ -64,6 +64,22 @@ class PreprocessingConfig(BaseModel):
     n_min: int = Field(5, ge=1, description="Minimum interactions per user / item.")
 
 
+class DatasetContract(BaseModel):
+    """Per-dataset contract enforced during preprocessing.
+
+    ``expects_categories`` declares whether the dataset is required to
+    ship item category labels.  The preprocess step compares this
+    declaration against what the provider actually loads and raises when
+    they disagree, so a dataset silently gaining or losing categories
+    (which flips DeepStyle degeneration and fine-tuning transfer) fails
+    loud instead of changing results without a trace.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expects_categories: bool
+
+
 class DataLoaderConfig(BaseModel):
     """Optional manual override of the DataLoader autotune.
 
@@ -307,6 +323,13 @@ class FrameworkConfig(BaseModel):
     device: Literal["cuda", "cpu", "auto"] = "auto"
     paths: PathsConfig = Field(default_factory=PathsConfig)
     datasets: list[str] = Field(default_factory=list)
+    dataset_contracts: dict[str, DatasetContract] = Field(
+        default_factory=dict,
+        description=(
+            "Per-dataset category contract keyed by dataset name.  Datasets "
+            "without an entry skip the check (backwards compatible)."
+        ),
+    )
     preprocessing: PreprocessingConfig = Field(default_factory=PreprocessingConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
@@ -367,6 +390,7 @@ __all__ = [
     "CONDITION_VALUES",
     "CommonTrainingConfig",
     "DEVICE_VALUES",
+    "DatasetContract",
     "EvaluationConfig",
     "FineTuningConfig",
     "FrameworkConfig",

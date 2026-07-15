@@ -147,6 +147,69 @@ def write_categories_csv(mapping: dict[str, int], path: str | Path) -> None:
     logger.info("Wrote %d category rows to %s", len(mapping), target)
 
 
+class CategoryContractError(RuntimeError):
+    """Raised when a dataset's loaded categories violate its declared contract.
+
+    See :func:`enforce_category_contract` and the ``dataset_contracts``
+    block in ``configs/default.yaml``.
+    """
+
+
+def enforce_category_contract(
+    dataset_name: str,
+    expects_categories: bool,
+    categories: dict[str, int] | None,
+) -> None:
+    """Fail loud when loaded categories disagree with the declared contract.
+
+    ``categories`` is the value returned by
+    :meth:`DatasetProvider.load_categories` — the exact silent signal
+    that otherwise decides whether DeepStyle degenerates into VBPR and
+    whether fine-tuning falls back to transfer weights.  This function
+    turns a mismatch between that signal and the ``expects_categories``
+    declaration into an explicit error instead of a silent behaviour flip.
+
+    Parameters
+    ----------
+    dataset_name:
+        Name of the dataset being checked (for the error message).
+    expects_categories:
+        The contract declared in ``configs/default.yaml`` under
+        ``dataset_contracts.<name>.expects_categories``.
+    categories:
+        The ``{item_id: label}`` mapping (or ``None``/empty) the provider
+        actually loaded.
+
+    Raises
+    ------
+    CategoryContractError:
+        When the declaration and the loaded data disagree in either
+        direction.
+    """
+    n_categories = len(set(categories.values())) if categories else 0
+    has_categories = n_categories > 0
+
+    if expects_categories and not has_categories:
+        raise CategoryContractError(
+            f"{dataset_name!r} declares expects_categories=true in "
+            f"configs/default.yaml, but the provider loaded no category "
+            f"labels (load_categories() returned "
+            f"{'an empty mapping' if categories is not None else 'None'}). "
+            f"Either the raw data is missing its category taxonomy or the "
+            f"contract is wrong — resolve before running the pipeline."
+        )
+    if not expects_categories and has_categories:
+        raise CategoryContractError(
+            f"{dataset_name!r} declares expects_categories=false in "
+            f"configs/default.yaml, but the provider loaded "
+            f"{len(categories)} labelled items across {n_categories} "
+            f"categories. This would silently stop DeepStyle from "
+            f"degenerating into VBPR and disable fine-tuning transfer. "
+            f"Either the raw data unexpectedly ships a taxonomy or the "
+            f"contract is wrong — resolve before running the pipeline."
+        )
+
+
 def item_category_array(dataset_name: str, processed_dir: str | Path):
     """Build the ``(n_items,)`` category-index array for a dataset.
 

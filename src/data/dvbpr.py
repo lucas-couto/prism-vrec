@@ -473,13 +473,21 @@ class DVBPRDataLoader(DatasetProvider):
     def _ensure_categories_sidecar(self) -> None:
         """Derive ``categories.csv`` from textual taxonomy when ``c`` is absent.
 
-        DVBPR splits without the one-hot ``c`` field (amazon_men,
-        amazon_women, tradesy) still carry a McAuley textual taxonomy
-        per item.  When the sidecar CSV is missing AND the ``.npy``
-        lacks ``c``, we materialise the sidecar so fine-tuning has
-        canonical categories without a manual pre-processing step.
-        Already-present sidecars are left untouched (the researcher's
-        choice of level/min_samples wins).
+        The Amazon splits without the one-hot ``c`` field (amazon_men,
+        amazon_women) carry a McAuley textual taxonomy per item.  When
+        the sidecar CSV is missing AND the ``.npy`` lacks ``c``, we
+        materialise the sidecar so fine-tuning has canonical categories
+        without a manual pre-processing step.  Already-present sidecars
+        are left untouched (the researcher's choice of level/min_samples
+        wins).
+
+        Tradesy is category-less by contract (``dataset_contracts`` in
+        ``configs/default.yaml`` declares ``expects_categories: false``):
+        it ships no usable taxonomy, so :func:`derive_categories` finds
+        nothing and no sidecar is written — which is what keeps DeepStyle
+        degenerating into VBPR there.  Should a future Tradesy dump carry
+        a taxonomy, the preprocess-time contract check fails loud rather
+        than silently derive one.
         """
         sidecar = self.raw_dir / "categories.csv"
         if sidecar.exists():

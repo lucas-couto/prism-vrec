@@ -26,6 +26,27 @@ datasets:
   - "amazon_men"
   - "tradesy"
 
+# Per-dataset contract declaring whether the dataset is EXPECTED to ship
+# item category labels.  Category presence is otherwise auto-detected from
+# the raw data, and that silent decision controls two critical behaviours:
+# (a) whether DeepStyle degenerates into VBPR (expected on category-less
+# Tradesy) and (b) whether fine-tuning falls back to transfer weights.
+# Declaring the expectation here turns a silent content-driven flip into a
+# loud contract violation: preprocessing raises if the data disagrees.
+#   true  → amazon_* carry a per-item category (one-hot ``c`` or McAuley
+#           taxonomy), so DeepStyle is expected to differ from VBPR.
+#   false → Tradesy has no category, so DeepStyle must degenerate to VBPR
+#           and fine-tuning must transfer weights from another dataset.
+dataset_contracts:
+  amazon_fashion:
+    expects_categories: true
+  amazon_women:
+    expects_categories: true
+  amazon_men:
+    expects_categories: true
+  tradesy:
+    expects_categories: false
+
 # k-core filtering applied during preprocessing
 preprocessing:
   n_min: 5  # minimum interactions per user and per item
