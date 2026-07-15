@@ -30,14 +30,25 @@ class TestPcaTrainOnlyFit:
     def test_fit_rows_change_the_transform(self) -> None:
         # Fitting on a subset must generally differ from fitting on all
         # rows — proving the train_items argument is actually honoured.
+        # The all-rows fit requires the explicit transductive opt-in.
         sources = _sources()
         train = np.arange(6)
 
-        full = fuse_pca(sources, n_components=4, train_items=None)
+        full = fuse_pca(sources, n_components=4, train_items=None, allow_transductive=True)
         train_only = fuse_pca(sources, n_components=4, train_items=train)
 
         assert full.shape == train_only.shape == (N_ITEMS, 4)
         assert not np.allclose(full, train_only)
+
+    def test_none_train_items_without_opt_in_raises(self) -> None:
+        # The transductive fallback is a test→fit leak; it must not be
+        # reachable by accident (default allow_transductive=False).
+        with pytest.raises(ValueError, match="transductive"):
+            fuse_pca(_sources(), n_components=4, train_items=None)
+
+    def test_opt_in_restores_all_rows_fit(self) -> None:
+        out = fuse_pca(_sources(), n_components=4, train_items=None, allow_transductive=True)
+        assert out.shape == (N_ITEMS, 4)
 
     def test_pca_per_model_concatenates(self) -> None:
         out = fuse_pca_per_model(_sources(), n_components=3, train_items=np.arange(6))

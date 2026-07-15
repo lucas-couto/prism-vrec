@@ -403,22 +403,37 @@ def _fit_pca_train_only(
     random_state: int | None,
     train_items: np.ndarray | None,
     label: str,
+    allow_transductive: bool = False,
 ) -> np.ndarray:
     """Fit PCA on train-item rows only, transform every row.
 
     Fitting on the full item matrix would leak information from items
     that only appear in validation/test interactions into the learned
     components.  ``train_items`` is the array of item indices with at
-    least one *training* interaction; when ``None`` (e.g. unit tests on
-    synthetic matrices) the fit falls back to all rows with a warning.
+    least one *training* interaction.
+
+    ``train_items=None`` raises unless ``allow_transductive=True`` is
+    passed explicitly: a transductive fit over all rows is the exact
+    test→fit leak the v2 protocol eliminated, so it must be opted into
+    (intended for synthetic unit tests), never reached by accident.
     Logs the cumulative explained variance for the chosen ``k``.
     """
     n_components = min(n_components, *matrix.shape)
     pca = PCA(n_components=n_components, random_state=random_state)
     if train_items is None:
+        if not allow_transductive:
+            raise ValueError(
+                f"{label}: train_items is None. A transductive PCA fit over "
+                "ALL rows leaks validation/test-only item structure into the "
+                "components — the exact leak the v2 protocol eliminated. Pass "
+                "the train item indices, or set allow_transductive=True to opt "
+                "into the fit-on-all-rows behaviour explicitly (synthetic unit "
+                "tests only)."
+            )
         logger.warning(
             "%s: no train_items provided — PCA fit on ALL rows "
-            "(transductive). Pass train item indices for a train-only fit.",
+            "(transductive, explicitly opted in). Pass train item indices "
+            "for a train-only fit.",
             label,
         )
         fit_rows = matrix
@@ -444,6 +459,7 @@ def pca_align(
     *,
     train_items: np.ndarray | None = None,
     random_state: int | None = 42,
+    allow_transductive: bool = False,
 ) -> list[np.ndarray]:
     """Align sources of differing native dims to *dim* via per-source PCA.
 
@@ -452,9 +468,14 @@ def pca_align(
     reduced to ``dim`` (fit on train items only), so equal-dim
     operations become applicable.  The learned counterpart is
     :class:`src.fusions.online.LearnedAlignmentFusion`.
+
+    ``allow_transductive`` is forwarded to :func:`_fit_pca_train_only`;
+    leave it ``False`` in every production path (see that function).
     """
     return [
-        _fit_pca_train_only(emb, dim, random_state, train_items, f"pca_align[src{i}]")
+        _fit_pca_train_only(
+            emb, dim, random_state, train_items, f"pca_align[src{i}]", allow_transductive
+        )
         for i, emb in enumerate(embeddings)
     ]
 
@@ -466,6 +487,7 @@ def fuse_pca(
     n_components: int = 128,
     random_state: int | None = 42,
     train_items: np.ndarray | None = None,
+    allow_transductive: bool = False,
     **kwargs,
 ) -> np.ndarray:
     """PCA on the concatenation of all embeddings.
@@ -489,6 +511,10 @@ def fuse_pca(
     train_items:
         Indices of items appearing in the training split; the PCA fit
         set.
+    allow_transductive:
+        Opt-in escape hatch for ``train_items=None`` (fit on all rows).
+        Leave ``False`` in production; ``True`` is for synthetic tests
+        only (see :func:`_fit_pca_train_only`).
 
     Returns
     -------
@@ -500,7 +526,9 @@ def fuse_pca(
     embeddings = _maybe_normalize(embeddings, normalize)
     concatenated = np.concatenate(embeddings, axis=1)
 
-    return _fit_pca_train_only(concatenated, n_components, random_state, train_items, "pca")
+    return _fit_pca_train_only(
+        concatenated, n_components, random_state, train_items, "pca", allow_transductive
+    )
 
 
 def fuse_pca_per_model(
@@ -510,6 +538,7 @@ def fuse_pca_per_model(
     n_components: int = 64,
     random_state: int | None = 42,
     train_items: np.ndarray | None = None,
+    allow_transductive: bool = False,
     **kwargs,
 ) -> np.ndarray:
     """Separate PCA per source, then **concatenate**.
@@ -533,6 +562,10 @@ def fuse_pca_per_model(
     train_items:
         Indices of items appearing in the training split; the PCA fit
         set.
+    allow_transductive:
+        Opt-in escape hatch for ``train_items=None`` (fit on all rows).
+        Leave ``False`` in production; ``True`` is for synthetic tests
+        only (see :func:`_fit_pca_train_only`).
 
     Returns
     -------
@@ -544,7 +577,10 @@ def fuse_pca_per_model(
     embeddings = _maybe_normalize(embeddings, normalize)
 
     reduced = [
-        _fit_pca_train_only(emb, n_components, random_state, train_items, f"pca_per_model[src{i}]")
+        _fit_pca_train_only(
+            emb, n_components, random_state, train_items,
+            f"pca_per_model[src{i}]", allow_transductive,
+        )
         for i, emb in enumerate(embeddings)
     ]
     return np.concatenate(reduced, axis=1)
