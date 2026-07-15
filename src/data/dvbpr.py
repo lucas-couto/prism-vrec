@@ -156,26 +156,30 @@ class DVBPRDataLoader(DatasetProvider):
                 ):
                     # tqdm's \r bar is invisible in non-TTY logs (docker compose
                     # logs, nohup files), so also emit a throttled logger line
-                    # that flows through the normal logging handlers.
+                    # that flows through the normal logging handlers.  Track the
+                    # byte count ourselves: a tqdm disabled off a TTY freezes
+                    # ``pbar.n`` at ``initial``, so it cannot drive the log line.
                     last_progress_log = time.time()
+                    progress_bytes = downloaded
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         fout.write(chunk)
                         pbar.update(len(chunk))
+                        progress_bytes += len(chunk)
                         now = time.time()
                         if now - last_progress_log >= 15:
                             if total:
                                 logger.info(
                                     "  %s: %.1f%% (%.0f / %.0f MB)",
                                     self.dataset_name,
-                                    100 * pbar.n / total,
-                                    pbar.n / 1e6,
+                                    100 * progress_bytes / total,
+                                    progress_bytes / 1e6,
                                     total / 1e6,
                                 )
                             else:
                                 logger.info(
                                     "  %s: %.0f MB downloaded",
                                     self.dataset_name,
-                                    pbar.n / 1e6,
+                                    progress_bytes / 1e6,
                                 )
                             last_progress_log = now
 
