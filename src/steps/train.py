@@ -706,7 +706,7 @@ def _train_one_optuna_trial(
         n_items=n_items,
         visual_embeddings=visual_embeddings,
         train_interactions=train_interactions,
-        test_interactions=val_interactions,
+        selection_interactions=val_interactions,
         hyperparams=hyperparams,
         config=config,
         checkpoint_mgr=checkpoint_mgr,
