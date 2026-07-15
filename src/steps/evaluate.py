@@ -242,15 +242,14 @@ def _evaluate_cell(
         **ctor_kwargs,
     ).to(device)
     model.load_state_dict(state_dict)
-    per_user = evaluator.evaluate_per_user(model, device=device)
 
     # Task F: persist the per-user sufficient statistic (held-out rank +
-    # top-20) when a destination is given. Full-ranking only; a second
-    # scoring pass (final eval is a small fraction of the battery).
+    # top-20) when a destination is given, from the SAME scoring pass as
+    # the metrics — no recompute, no second pass. Full-ranking only.
     if per_user_out_dir is not None and evaluator.protocol == "full_ranking":
         from src.evaluation.persistence import CellMetadata, write_cell_artifact
 
-        records = evaluator.per_user_records(model, device=device)
+        per_user, records = evaluator.evaluate_with_records(model, device=device)
         metadata = CellMetadata(
             dataset=dataset_name,
             visual_config=model_info["embedding_name"],
@@ -262,6 +261,8 @@ def _evaluate_cell(
             n_items=n_items,
         )
         write_cell_artifact(records, metadata, per_user_out_dir)
+    else:
+        per_user = evaluator.evaluate_per_user(model, device=device)
 
     # Provenance columns required by the v2 protocol: every recorded
     # result must say which evaluation protocol produced it, the visual

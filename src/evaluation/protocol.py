@@ -95,6 +95,8 @@ class Evaluator:
         self._tiebreak_order_np = np.argsort(self._tiebreak_key).astype(np.int64)
         self._tiebreak_order_gpu: torch.Tensor | None = None
         self._tiebreak_order_device: torch.device | None = None
+        self._tiebreak_key_gpu: torch.Tensor | None = None
+        self._tiebreak_key_device: torch.device | None = None
 
         # Lazy GPU cache: per-user training-item indices as a LongTensor on
         # the same device used during evaluation.  Built once on first
@@ -181,12 +183,24 @@ class Evaluator:
         pd.DataFrame
             Per-user metric values.
         """
+        frame = self._per_user_frame(model, device, batch_size)
+        self._log_tie_stats(frame)
+        return self._metrics_view(frame)
+
+    def _per_user_frame(self, model: Any, device: str, batch_size: int) -> pd.DataFrame:
+        """Run the ranking dispatch ONCE, returning the raw per-user frame.
+
+        Rows carry both the metric columns and the ``_``-prefixed
+        diagnostics/records (``_rank``, ``_n_candidates``,
+        ``_tie_block_size``, ``_top_items``).  Every public entry point
+        derives its result from this single pass — the sufficient
+        statistic is never recomputed in a second scoring pass.
+        """
         device_obj = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         all_items = torch.arange(self.n_items, device=device_obj)
         per_user_results: list[dict] = []
 
         model.eval()
-
         has_batch = hasattr(model, "predict_batch") and callable(model.predict_batch)
 
         with torch.no_grad():
@@ -197,15 +211,38 @@ class Evaluator:
             else:
                 per_user_results = self._evaluate_single(model, all_items)
 
-        df = pd.DataFrame(per_user_results)
-        self._log_tie_stats(df)
-        # ``_tie_block_size`` is diagnostic instrumentation, not a metric —
-        # drop it so it never leaks into the per-user metric matrix the
-        # statistical step consumes.
-        if "_tie_block_size" in df.columns:
-            df = df.drop(columns=["_tie_block_size"])
+        return pd.DataFrame(per_user_results)
+
+    @staticmethod
+    def _metrics_view(frame: pd.DataFrame) -> pd.DataFrame:
+        """Metric matrix: drop the ``_``-prefixed diagnostic/record columns.
+
+        Keeps them out of the per-user matrix the statistical step consumes.
+        """
+        df = frame.drop(columns=[c for c in frame.columns if c.startswith("_")])
         cols = ["user_id"] + [c for c in df.columns if c != "user_id"]
         return df[cols]
+
+    @staticmethod
+    def _records_view(frame: pd.DataFrame) -> pd.DataFrame:
+        """Per-user sufficient-statistic records (``_x`` columns → ``x``)."""
+        rename = {c: c[1:] for c in frame.columns if c.startswith("_")}
+        return frame[["user_id", *rename]].rename(columns=rename)
+
+    def evaluate_with_records(
+        self,
+        model: Any,
+        device: str = "cuda",
+        batch_size: int = 512,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Single pass → ``(metrics_df, records_df)`` (Task F).
+
+        Used by the final evaluate step so the per-user artifact is written
+        WITHOUT a second scoring pass.
+        """
+        frame = self._per_user_frame(model, device, batch_size)
+        self._log_tie_stats(frame)
+        return self._metrics_view(frame), self._records_view(frame)
 
     def _log_tie_stats(self, df: pd.DataFrame) -> None:
         """Log how often the held-out item lands in an exact-score tie.
@@ -248,65 +285,7 @@ class Evaluator:
         """
         if self.protocol != "full_ranking":
             raise ValueError("per_user_records requires protocol='full_ranking'.")
-
-        device_obj = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
-        all_items = torch.arange(self.n_items, device=device_obj)
-        key = torch.as_tensor(self._tiebreak_key, dtype=torch.long, device=device_obj)
-        order = self._tiebreak_order_on(device_obj)
-        self._ensure_train_idx_cache(device_obj)
-        model.eval()
-
-        has_batch = hasattr(model, "predict_batch") and callable(model.predict_batch)
-        rows: list[dict] = []
-        neg_inf = float("-inf")
-        with torch.no_grad():
-            for start in tqdm(range(0, len(self.test_users), batch_size), desc="Recording"):
-                batch = self.test_users[start : start + batch_size]
-                if has_batch:
-                    uids = torch.tensor(batch, dtype=torch.long, device=device_obj)
-                    scores = model.predict_batch(uids, all_items)
-                else:
-                    scores = torch.stack(
-                        [torch.as_tensor(model.predict(u, all_items)) for u in batch]
-                    ).to(device_obj)
-                for i, user_id in enumerate(batch):
-                    idx = self._train_idx_gpu.get(user_id)
-                    if idx is not None:
-                        scores[i].index_fill_(0, idx, neg_inf)
-                rows.extend(self._records_for_batch(batch, scores, key, order))
-        return pd.DataFrame(rows)
-
-    def _records_for_batch(self, batch, scores, key, order):
-        """Vectorised rank / n_candidates / tie-block / top-20 per user."""
-        held = torch.tensor(
-            [next(iter(self.test_interactions[u])) for u in batch],
-            dtype=torch.long,
-            device=scores.device,
-        )
-        held_score = scores.gather(1, held[:, None])  # (B,1)
-        tie_mask = scores == held_score
-        greater = (scores > held_score).sum(dim=1)
-        held_key = key[held][:, None]
-        tied_lower = (tie_mask & (key[None, :] < held_key)).sum(dim=1)
-        rank = (1 + greater + tied_lower).cpu().numpy()
-        n_cand = torch.isfinite(scores).sum(dim=1).cpu().numpy()
-        tie_block = tie_mask.sum(dim=1).cpu().numpy()
-        top = order[
-            torch.sort(scores.index_select(1, order), dim=1, descending=True, stable=True).indices[
-                :, :20
-            ]
-        ]
-        top_np = top.cpu().numpy()
-        return [
-            {
-                "user_id": int(u),
-                "rank": int(rank[i]),
-                "n_candidates": int(n_cand[i]),
-                "tie_block_size": int(tie_block[i]),
-                "top_items": top_np[i].tolist(),
-            }
-            for i, u in enumerate(batch)
-        ]
+        return self._records_view(self._per_user_frame(model, device, batch_size))
 
     def _evaluate_single(
         self,
@@ -368,28 +347,41 @@ class Evaluator:
             # with the single and sampled paths.
             order = self._tiebreak_order_on(device)  # (n_items,)
             reordered = batch_scores.index_select(1, order)
-            top_in_perm = torch.sort(reordered, dim=1, descending=True, stable=True).indices[
-                :, : self.max_k
-            ]  # (B, K) — indices into the reordered columns
-            top_indices_np = order[top_in_perm].cpu().numpy()  # map back to item ids
+            sorted_perm = torch.sort(
+                reordered, dim=1, descending=True, stable=True
+            ).indices  # (B, N) — full order (torch.sort already sorts the whole row)
+            full_ranked = order[sorted_perm]  # map back to item ids
+            metrics_top_np = full_ranked[:, : self.max_k].cpu().numpy()
+            top20_np = full_ranked[:, :20].cpu().numpy()  # persisted top-20 (D3)
 
-            # Tie instrumentation (batched, single transfer): block size of
-            # the held-out's exact score per user.  Assumes leave-one-out
-            # (one held item per user).
+            # Per-user sufficient statistics + tie instrumentation, computed
+            # ONCE here and reused by the metric path (dropped) and the
+            # persistence writer (Task F). Single transfer per batch;
+            # assumes leave-one-out (one held item per user).
+            key = self._tiebreak_key_on(device)
             held_ids = torch.tensor(
                 [next(iter(self.test_interactions[u])) for u in batch_user_ids],
                 dtype=torch.long,
                 device=device,
             )
-            held_scores = batch_scores.gather(1, held_ids[:, None]).squeeze(1)  # (B,)
-            tie_blocks_np = (batch_scores == held_scores[:, None]).sum(dim=1).cpu().numpy()
+            held_scores = batch_scores.gather(1, held_ids[:, None])  # (B,1)
+            tie_mask = batch_scores == held_scores
+            greater = (batch_scores > held_scores).sum(dim=1)
+            tied_lower = (tie_mask & (key[None, :] < key[held_ids][:, None])).sum(dim=1)
+            rank_np = (1 + greater + tied_lower).cpu().numpy()
+            n_cand_np = torch.isfinite(batch_scores).sum(dim=1).cpu().numpy()
+            tie_blocks_np = tie_mask.sum(dim=1).cpu().numpy()
 
             for i, user_id in enumerate(batch_user_ids):
-                ranked_list = top_indices_np[i].tolist()
                 ground_truth = self.test_interactions[user_id]
-                user_metrics = compute_all_metrics(ranked_list, ground_truth, self.k_values)
+                user_metrics = compute_all_metrics(
+                    metrics_top_np[i].tolist(), ground_truth, self.k_values
+                )
                 user_metrics["user_id"] = user_id
+                user_metrics["_rank"] = int(rank_np[i])
+                user_metrics["_n_candidates"] = int(n_cand_np[i])
                 user_metrics["_tie_block_size"] = int(tie_blocks_np[i])
+                user_metrics["_top_items"] = top20_np[i].tolist()
                 results.append(user_metrics)
         return results
 
@@ -401,6 +393,15 @@ class Evaluator:
             )
             self._tiebreak_order_device = device
         return self._tiebreak_order_gpu
+
+    def _tiebreak_key_on(self, device: torch.device) -> torch.Tensor:
+        """Per-item tie-break key, as a LongTensor on *device*."""
+        if self._tiebreak_key_device != device or self._tiebreak_key_gpu is None:
+            self._tiebreak_key_gpu = torch.as_tensor(
+                self._tiebreak_key, dtype=torch.long, device=device
+            )
+            self._tiebreak_key_device = device
+        return self._tiebreak_key_gpu
 
     def _ensure_train_idx_cache(self, device: torch.device) -> None:
         """Build per-user train-item index tensors on the target device.
@@ -463,14 +464,21 @@ class Evaluator:
             # id (which correlates with popularity).
             pool_ids = np.asarray(pool)
             order = np.lexsort((self._tiebreak_key[pool_ids], -scores_np))
-            top_k = order[: self.max_k]
-            ranked_list = pool_ids[top_k].tolist()
+            ranked_list = pool_ids[order[: self.max_k]].tolist()
 
             user_metrics = compute_all_metrics(ranked_list, positives, self.k_values)
             user_metrics["user_id"] = user_id
             held = next(iter(positives))
             held_pos = pool.index(held)
-            user_metrics["_tie_block_size"] = int(np.sum(scores_np == scores_np[held_pos]))
+            held_score = scores_np[held_pos]
+            tie_mask = scores_np == held_score
+            tied_lower = int(
+                np.sum(tie_mask & (self._tiebreak_key[pool_ids] < self._tiebreak_key[held]))
+            )
+            user_metrics["_rank"] = 1 + int(np.sum(scores_np > held_score)) + tied_lower
+            user_metrics["_n_candidates"] = len(pool)
+            user_metrics["_tie_block_size"] = int(tie_mask.sum())
+            user_metrics["_top_items"] = pool_ids[order[:20]].tolist()
             results.append(user_metrics)
         return results
 
@@ -516,11 +524,22 @@ class Evaluator:
         # whose boundaries split tied scores arbitrarily) with exact-score
         # ties broken by the random ``_tiebreak_key`` — the unified rule
         # shared with the batched and sampled paths.
-        ranked_list = np.lexsort((self._tiebreak_key, -user_scores))[: self.max_k].tolist()
+        ranked = np.lexsort((self._tiebreak_key, -user_scores))
 
         ground_truth = self.test_interactions[user_id]
-        user_metrics = compute_all_metrics(ranked_list, ground_truth, self.k_values)
+        user_metrics = compute_all_metrics(
+            ranked[: self.max_k].tolist(), ground_truth, self.k_values
+        )
         user_metrics["user_id"] = user_id
+
+        # Per-user sufficient statistics, computed once (Task F): reused by
+        # the persistence writer, dropped from the metric matrix.
         held = next(iter(ground_truth))
-        user_metrics["_tie_block_size"] = int(np.sum(user_scores == user_scores[held]))
+        held_score = user_scores[held]
+        tie_mask = user_scores == held_score
+        tied_lower = int(np.sum(tie_mask & (self._tiebreak_key < self._tiebreak_key[held])))
+        user_metrics["_rank"] = 1 + int(np.sum(user_scores > held_score)) + tied_lower
+        user_metrics["_n_candidates"] = int(np.sum(np.isfinite(user_scores)))
+        user_metrics["_tie_block_size"] = int(tie_mask.sum())
+        user_metrics["_top_items"] = ranked[:20].tolist()
         return user_metrics
