@@ -49,7 +49,9 @@ def _tied_scores() -> np.ndarray:
 
 
 class TestDeriveEquivalence:
-    @pytest.mark.parametrize("scores_fn", [_distinct_scores, _tied_scores], ids=["distinct", "tied"])
+    @pytest.mark.parametrize(
+        "scores_fn", [_distinct_scores, _tied_scores], ids=["distinct", "tied"]
+    )
     def test_derived_metrics_equal_online(self, scores_fn) -> None:
         from src.evaluation.derive_metrics import metrics_frame
 
@@ -63,9 +65,7 @@ class TestDeriveEquivalence:
         shared = [c for c in online.columns if c in derived.columns and c != "user_id"]
         assert len(shared) == len(_KS) * 5  # precision/recall/f1/map/ndcg per k
         for col in shared:
-            np.testing.assert_allclose(
-                online[col].to_numpy(), derived[col].to_numpy(), atol=1e-12
-            )
+            np.testing.assert_allclose(online[col].to_numpy(), derived[col].to_numpy(), atol=1e-12)
 
 
 class TestIdentities:

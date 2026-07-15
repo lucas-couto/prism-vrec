@@ -8,6 +8,48 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-07-15
+
+Battery-readiness build: four new capabilities to run the full battery
+on interruptible cloud instances. No change to how models train/evaluate
+beyond persistence and gating.
+
+### Added
+
+- **Feature sanity gate (G).** ``src/steps/validate_features.py`` +
+  ``--validate-features`` command: validate every feature matrix (shape,
+  native dim from the extractor registry, dtype, NaN/Inf, zero-norm
+  rows) with stats logging; fail loud, never warn. An automatic gate
+  runs at the entry of ``fuse`` (native inputs) and ``train`` (all
+  consumed backbone + fused ``.npy``).
+- **Per-user persistence (F).** Final evaluation writes a per-cell
+  artifact (``results/per_user/<dataset>/<key>.csv.gz`` + metadata JSON)
+  holding the held-out rank (a sufficient statistic under LOO),
+  n_candidates, tie_block_size and top-20 items. ``derive_metrics``
+  recomputes any metric at any k without a GPU (equivalence to the
+  online Evaluator is tested); ``paired_loader`` assembles the
+  users×systems matrix and refuses to intersect mismatched user sets.
+  Format is csv.gz (avoids the pyarrow dependency).
+- **HP-search budget fairness (H).** ``src/recommenders/hp_budget.py``:
+  one shared protocol budget per dataset (n_trials/selection metric/
+  patience/epochs/eval_sample_size), a guard-rail that rejects any
+  per-model budget key, and ``train_replay`` — the D2 "train one fixed
+  config, no search" entry point. D1 (final eval consumes the best-trial
+  checkpoint) documented; no post-search retrain.
+- **Battery runner (I).** ``src/battery/``: declarative cell enumerator
+  (BPR once per dataset/seed; AVBPR excluded; DeepStyle on Tradesy;
+  primary seed searches, others replay), an inspectable JSON state
+  manifest with idempotency + resume + failure isolation + retry, cost
+  projection, git/duration metadata, and ``--battery`` / ``--battery-status``
+  commands. Optuna storage migrated to persistent SQLite for resume.
+  Smoke + resume + failure/retry tests; ``docs/battery_runbook.md``.
+
+### Changed
+
+- ``docs/protocol.md`` §10.6: uniform HP-search budget per dataset,
+  selection in validation, search on the primary seed + best config
+  replayed on the others, best-trial checkpoint, test untouched.
+
 ## [2.3.0] - 2026-07-15
 
 Evaluation-protocol changes decided by the two diagnostic audits. They
