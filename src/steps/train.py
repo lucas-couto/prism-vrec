@@ -20,6 +20,7 @@ training loop in :mod:`src.utils.training` is unchanged.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import product
@@ -577,13 +578,44 @@ def _run_optuna(
         procs.append(p)
 
     results: list[dict] = []
-    while len(results) < len(cells):
+    total = len(cells)
+    start_time = time.time()
+    last_log = start_time
+
+    def _log_progress() -> None:
+        """Cell-level battery forecast: done / total, %, workers, ETA.
+
+        Parent-side observability only — mirrors the grid orchestrator's
+        line (:class:`src.utils.parallel.TrainingOrchestrator`) so both
+        backends report identically. Never touches worker computation.
+        """
+        completed = len(results)
+        elapsed = time.time() - start_time
+        eta_h = (elapsed / max(completed, 1)) * (total - completed) / 3600
+        alive = sum(1 for p in procs if p.is_alive())
+        logger.info(
+            "Progress: %d/%d cells (%.1f%%) | %d workers | ETA: ~%.1f h",
+            completed,
+            total,
+            100 * completed / total,
+            alive,
+            eta_h,
+        )
+
+    while len(results) < total:
         try:
             results.append(result_queue.get(timeout=30))
         except Exception:  # noqa: BLE001, queue.Empty from a spawn context
             if not any(p.is_alive() for p in procs):
                 logger.warning("All Optuna workers exited early.")
                 break
+            _log_progress()  # heartbeat while a long cell is still running
+            continue
+
+        now = time.time()
+        if now - last_log >= 30 or len(results) == total:
+            _log_progress()
+            last_log = now
     for p in procs:
         p.join(timeout=30)
 
