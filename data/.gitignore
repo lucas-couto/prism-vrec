@@ -1,0 +1,6 @@
+# Keep the data/ directory in the repo, but never version its contents:
+# raw datasets, processed splits, embeddings and smoke artifacts are all
+# large/regenerable and stay out of Git. Ignore everything here except
+# this file itself.
+*
+!.gitignore

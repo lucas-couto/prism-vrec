@@ -1,10 +1,5 @@
-# Data (large files, not versioned)
-data/raw/
-data/processed/
-data/embeddings/
-data/smoke_raw/
-data/smoke_processed/
-data/smoke_embeddings/
+# Data (large files, not versioned). The data/ directory is kept in the
+# repo but all of its contents are ignored — see data/.gitignore.
 
 # Checkpoints (extraction, training, finetune, grid search state).
 # Regenerable, opaque binaries.

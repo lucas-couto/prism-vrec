@@ -1,20 +1,21 @@
-# v2 Experimental Protocol — Declarations
+# Experimental Protocol — Declarations
 
-This document records every methodological decision the v2 protocol
-fixes explicitly, in the order a reviewer would ask about them. Each
-item is implemented in code (pointers included) and must be restated in
-the dissertation's methodology chapter.
+This document records every methodological decision the protocol fixes
+explicitly, in the order a reviewer would ask about them. Each item is
+implemented in code (pointers included) and must be restated in the
+dissertation's methodology chapter.
 
 ## 1. Native dimensionality at extraction; learned projection `E` in the recommender
 
 Comparing backbones is only valid if the backbone is the sole variable.
-v1.x forced every extractor through a shared `Linear+ReLU` projection to
-a common dim — and in the frozen condition that projection was **never
-trained** (a seeded random projection), so the benchmark compared
-"backbone × random compression", not backbones.
+An earlier version of the framework forced every extractor through a
+shared `Linear+ReLU` projection to a common dim — and in the frozen
+condition that projection was **never trained** (a seeded random
+projection), so the benchmark compared "backbone × random compression",
+not backbones.
 
-v2: extraction saves the **native** feature of each backbone; the
-learned projection `E` inside each recommender (VBPR's `W_vis`,
+This protocol saves the **native** feature of each backbone at
+extraction; the learned projection `E` inside each recommender (VBPR's `W_vis`,
 DeepStyle's linear style projection, VNPR's visual transform, ACF's
 component projection) maps `D_backbone → d`, trained jointly by the BPR loss with
 the backbone frozen (fine-tuning end-to-end would be DVBPR, out of
@@ -48,10 +49,10 @@ normalisations** coexist across the 8 backbones:
 - Inception-style (`0.5/0.5/0.5`): **ViT-B/16 (augreg2)**, **CoAtNet-0 (sw_in1k)**
 - CLIP (`0.48145466/…`): CLIP ViT-B/32
 
-v1.x applied ImageNet normalisation + direct bilinear 224 resize to all
-timm backbones — ViT-B/16 and CoAtNet-0 ran silently degraded, and no
-backbone used its canonical bicubic resize+crop. v2 resolves each
-transform from the library that ships the weights (torchvision
+That earlier version applied ImageNet normalisation + direct bilinear
+224 resize to all timm backbones — ViT-B/16 and CoAtNet-0 ran silently
+degraded, and no backbone used its canonical bicubic resize+crop. This
+protocol resolves each transform from the library that ships the weights (torchvision
 `weights.transforms()`, `timm.data.resolve_model_data_config`,
 `AutoImageProcessor`, open_clip's `preprocess`; DINOv2 is the one
 hand-built recipe, matching its reference eval transform: resize 256
@@ -173,7 +174,7 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   pairwise comparison, so DeepStyle **analytically degenerates into
   VBPR**. This is the expected, verified behaviour (see
   `tests/recommenders/test_deepstyle_paper.py::TestTradesyDegeneration`),
-  not a bug. The earlier 1.x MLP-style variant (which did not subtract a
+  not a bug. An earlier MLP-style variant (which did not subtract a
   category vector) was removed in commit `60c7436`.
 - **Trainable-parameter counts differ across backbones** because `E`'s
   input is the native dim — an expected second-order effect, reported
