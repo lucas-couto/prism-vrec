@@ -177,6 +177,8 @@ def _evaluate_cell(
     embeddings_dir: str,
     device: str,
     train_interactions: dict[int, set[int]] | None = None,
+    per_user_out_dir: str | None = None,
+    seed: int = 42,
 ) -> pd.DataFrame | None:
     """Load a cell's best checkpoint and return its per-user metrics.
 
@@ -241,6 +243,25 @@ def _evaluate_cell(
     ).to(device)
     model.load_state_dict(state_dict)
     per_user = evaluator.evaluate_per_user(model, device=device)
+
+    # Task F: persist the per-user sufficient statistic (held-out rank +
+    # top-20) when a destination is given. Full-ranking only; a second
+    # scoring pass (final eval is a small fraction of the battery).
+    if per_user_out_dir is not None and evaluator.protocol == "full_ranking":
+        from src.evaluation.persistence import CellMetadata, write_cell_artifact
+
+        records = evaluator.per_user_records(model, device=device)
+        metadata = CellMetadata(
+            dataset=dataset_name,
+            visual_config=model_info["embedding_name"],
+            recommender=model_info["model_name"],
+            seed=seed,
+            d=int(model_config.get("latent_dim", 0)),
+            split="test",
+            n_users=n_users,
+            n_items=n_items,
+        )
+        write_cell_artifact(records, metadata, per_user_out_dir)
 
     # Provenance columns required by the v2 protocol: every recorded
     # result must say which evaluation protocol produced it, the visual
@@ -337,6 +358,8 @@ def run(condition: str = "frozen") -> None:
                     embeddings_dir,
                     device,
                     train_interactions=train_only_inter,
+                    per_user_out_dir=str(results_root),
+                    seed=int(config.get("seed", 42)),
                 )
             if per_user is None:
                 continue

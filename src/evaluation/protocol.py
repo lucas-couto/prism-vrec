@@ -230,6 +230,84 @@ class Evaluator:
             len(blocks),
         )
 
+    def per_user_records(
+        self,
+        model: Any,
+        device: str = "cuda",
+        batch_size: int = 512,
+    ) -> pd.DataFrame:
+        """Per-user sufficient statistics for permanent persistence (F/D3).
+
+        Under leave-one-out the held-out's rank is a sufficient statistic
+        for every accuracy metric at any k.  Returns one row per test
+        user with: ``user_id``; ``rank`` (1-indexed, post-mask,
+        post-tiebreak — the seeded permutation resolves ties); effective
+        ``n_candidates`` (post-mask, varies per user); ``tie_block_size``
+        (exact-score block of the held-out); ``top_items`` (first 20
+        item_idx of the masked ranking).  Full-ranking only.
+        """
+        if self.protocol != "full_ranking":
+            raise ValueError("per_user_records requires protocol='full_ranking'.")
+
+        device_obj = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+        all_items = torch.arange(self.n_items, device=device_obj)
+        key = torch.as_tensor(self._tiebreak_key, dtype=torch.long, device=device_obj)
+        order = self._tiebreak_order_on(device_obj)
+        self._ensure_train_idx_cache(device_obj)
+        model.eval()
+
+        has_batch = hasattr(model, "predict_batch") and callable(model.predict_batch)
+        rows: list[dict] = []
+        neg_inf = float("-inf")
+        with torch.no_grad():
+            for start in tqdm(range(0, len(self.test_users), batch_size), desc="Recording"):
+                batch = self.test_users[start : start + batch_size]
+                if has_batch:
+                    uids = torch.tensor(batch, dtype=torch.long, device=device_obj)
+                    scores = model.predict_batch(uids, all_items)
+                else:
+                    scores = torch.stack(
+                        [torch.as_tensor(model.predict(u, all_items)) for u in batch]
+                    ).to(device_obj)
+                for i, user_id in enumerate(batch):
+                    idx = self._train_idx_gpu.get(user_id)
+                    if idx is not None:
+                        scores[i].index_fill_(0, idx, neg_inf)
+                rows.extend(self._records_for_batch(batch, scores, key, order))
+        return pd.DataFrame(rows)
+
+    def _records_for_batch(self, batch, scores, key, order):
+        """Vectorised rank / n_candidates / tie-block / top-20 per user."""
+        held = torch.tensor(
+            [next(iter(self.test_interactions[u])) for u in batch],
+            dtype=torch.long,
+            device=scores.device,
+        )
+        held_score = scores.gather(1, held[:, None])  # (B,1)
+        tie_mask = scores == held_score
+        greater = (scores > held_score).sum(dim=1)
+        held_key = key[held][:, None]
+        tied_lower = (tie_mask & (key[None, :] < held_key)).sum(dim=1)
+        rank = (1 + greater + tied_lower).cpu().numpy()
+        n_cand = torch.isfinite(scores).sum(dim=1).cpu().numpy()
+        tie_block = tie_mask.sum(dim=1).cpu().numpy()
+        top = order[
+            torch.sort(scores.index_select(1, order), dim=1, descending=True, stable=True).indices[
+                :, :20
+            ]
+        ]
+        top_np = top.cpu().numpy()
+        return [
+            {
+                "user_id": int(u),
+                "rank": int(rank[i]),
+                "n_candidates": int(n_cand[i]),
+                "tie_block_size": int(tie_block[i]),
+                "top_items": top_np[i].tolist(),
+            }
+            for i, u in enumerate(batch)
+        ]
+
     def _evaluate_single(
         self,
         model: Any,
