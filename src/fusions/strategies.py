@@ -578,8 +578,12 @@ def fuse_pca_per_model(
 
     reduced = [
         _fit_pca_train_only(
-            emb, n_components, random_state, train_items,
-            f"pca_per_model[src{i}]", allow_transductive,
+            emb,
+            n_components,
+            random_state,
+            train_items,
+            f"pca_per_model[src{i}]",
+            allow_transductive,
         )
         for i, emb in enumerate(embeddings)
     ]
