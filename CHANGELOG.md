@@ -8,6 +8,31 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.4.2] - 2026-07-15
+
+### Fixed
+
+Three gaps in the production battery ``execute_cell`` path, surfaced by a
+CPU pilot on synthetic data.
+
+- **Replay checkpoint isolation.** The Optuna study is shared across
+  seeds (D2), but ``_best.pt`` was not seed-isolated, so a replay whose
+  validation metric fell below the search seed's would silently keep the
+  search seed's checkpoint (``_save_best_model`` only overwrites on
+  ``>=``). ``execute_cell`` now trains and reads under a seed-suffixed
+  results dir; the F artifact still lands in the shared, seed-keyed
+  ``per_user`` directory.
+- **Fusion cell resolution.** The battery enumerator used the fusion
+  strategy name (``mean``) as the visual config, but the fused artifact
+  is ``hybrid_mean_*`` — so every fusion cell failed to resolve its
+  embedding/checkpoint. ``enumerate_cells`` now reuses the pipeline's
+  cell discovery (``_iter_cells``), so the visual config is the real
+  embedding stem used everywhere (training, eval, checkpoint, artifact).
+- **Extraction checkpoint path.** It was hardcoded to
+  ``checkpoints/extraction/``, ignoring ``paths.checkpoints`` — a run
+  under one profile could resume from another profile's stale extraction
+  state. It now honours the configured checkpoints path.
+
 ## [2.4.1] - 2026-07-15
 
 Follow-up corrections. No behaviour or artifact change.

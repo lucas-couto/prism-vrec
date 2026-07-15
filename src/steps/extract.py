@@ -172,7 +172,11 @@ def _extract_for_config(
         num_workers=extract_settings.num_workers,
     )
 
-    ckpt_base = f"checkpoints/extraction/{dataset_name}_{extractor_name}"
+    # Honour the configured checkpoints path (e.g. checkpoints/smoke) instead
+    # of a fixed 'checkpoints/' — otherwise a run under a different profile
+    # resumes from another profile's stale extraction checkpoint.
+    checkpoints_dir = config.get("paths", {}).get("checkpoints", "checkpoints")
+    ckpt_base = f"{checkpoints_dir}/extraction/{dataset_name}_{extractor_name}"
     Path(ckpt_base).parent.mkdir(parents=True, exist_ok=True)
 
     if need_pooled:

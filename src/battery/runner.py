@@ -47,6 +47,8 @@ def run_battery(
     execute: CellExecutor,
     *,
     retry_failed: bool = False,
+    processed_dir: str | None = None,
+    embeddings_dir: str | None = None,
 ) -> BatteryManifest:
     """Enumerate + run the battery, updating the state manifest.
 
@@ -54,7 +56,7 @@ def run_battery(
     skipped.  ``retry_failed`` re-runs ``failed`` cells.  Safe to re-invoke
     after an interruption — completed cells are not repeated.
     """
-    cells = enumerate_cells(config)
+    cells = enumerate_cells(config, processed_dir=processed_dir, embeddings_dir=embeddings_dir)
     manifest = BatteryManifest.load(manifest_path(results_dir))
     manifest.sync_cells(cells)
     manifest.save()
