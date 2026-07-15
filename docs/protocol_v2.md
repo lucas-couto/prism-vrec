@@ -15,8 +15,8 @@ trained** (a seeded random projection), so the benchmark compared
 
 v2: extraction saves the **native** feature of each backbone; the
 learned projection `E` inside each recommender (VBPR's `W_vis`,
-DeepStyle's style MLP, VNPR's visual transform, ACF's component
-projection) maps `D_backbone → d`, trained jointly by the BPR loss with
+DeepStyle's linear style projection, VNPR's visual transform, ACF's
+component projection) maps `D_backbone → d`, trained jointly by the BPR loss with
 the backbone frozen (fine-tuning end-to-end would be DVBPR, out of
 scope). `d` (`common.visual_dim`) is fixed and identical across all
 backbones of a comparison.
@@ -161,10 +161,20 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   component artifacts (`*_comp.npy`; M = 49–256 depending on the
   backbone), so component-level attention has real components to
   attend. Its user-history side is built from train interactions only.
-- **DeepStyle variant**: this implementation uses an MLP style
-  projector and does **not** subtract a category vector (the original
-  paper does). It therefore does not degenerate into VBPR on Tradesy,
-  but it is a variant and must be cited as such in the dissertation.
+- **DeepStyle (paper-faithful)**: the item style term is
+  `θ_i = E·f_i − c_cat(i)` — a linear projection `E` (`D_backbone → d`)
+  minus a **learned category embedding** subtracted in the style space,
+  as in the original paper. On the Amazon datasets, whose per-item
+  category varies (declared `expects_categories: true`), this makes
+  DeepStyle differ from VBPR. On Tradesy, which has no category
+  (`expects_categories: false`, enforced at preprocess), every item maps
+  to a single null category, so `c_cat(i)` is constant across items;
+  the `α_u·c₀` term is item-independent and cancels in every BPR
+  pairwise comparison, so DeepStyle **analytically degenerates into
+  VBPR**. This is the expected, verified behaviour (see
+  `tests/recommenders/test_deepstyle_paper.py::TestTradesyDegeneration`),
+  not a bug. The earlier 1.x MLP-style variant (which did not subtract a
+  category vector) was removed in commit `60c7436`.
 - **Trainable-parameter counts differ across backbones** because `E`'s
   input is the native dim — an expected second-order effect, reported
   per cell (`n_trainable_params` column), never hidden.
