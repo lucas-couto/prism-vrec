@@ -8,6 +8,19 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.4] - 2026-07-15
+
+### Added
+
+- **Battery progress + ETA for the Optuna backend.** The parallel
+  Optuna search (`src/steps/train.py::_run_optuna`) now logs a
+  cell-level forecast — ``Progress: 145/580 cells (25.0%) | 3 workers |
+  ETA: ~3.6 h`` — every 30 s and on each cell completion, bringing it to
+  parity with the grid orchestrator's existing progress line
+  (`src/utils/parallel.py`). Parent-side observability only: it never
+  touches worker computation, RNG, or cell ordering, so runs stay
+  bit-identical. The grid backend already reported this.
+
 ## [2.2.3] - 2026-07-15
 
 Documentation only; no code change.
