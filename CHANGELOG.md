@@ -8,6 +8,19 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.5] - 2026-07-15
+
+### Fixed
+
+- **Download progress invisible in non-TTY logs.** The dataset download
+  (`src/data/dvbpr.py`) rendered progress only through a tqdm bar, whose
+  ``\r`` in-place updates do not show in Docker Compose / pod / nohup
+  logs — users saw the "Resuming download…" line but no progress. The
+  bar now auto-disables off a TTY (``disable=None``) and a throttled
+  ``logger`` line (every 15 s: ``amazon_fashion: 47.8% (2102 / 4400
+  MB)``) is emitted through the normal logging handlers, so progress is
+  visible in both interactive terminals and captured logs.
+
 ## [2.2.4] - 2026-07-15
 
 ### Added

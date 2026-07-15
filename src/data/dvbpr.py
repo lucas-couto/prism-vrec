@@ -19,6 +19,7 @@ them by name without importing this module directly.
 from __future__ import annotations
 
 import json
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -48,8 +49,7 @@ class DVBPRDataLoader(DatasetProvider):
     def __init__(self, dataset_name: str, raw_dir: str = "data/raw") -> None:
         if dataset_name not in DATASETS:
             raise ValueError(
-                f"Unknown dataset: {dataset_name!r}. "
-                f"Available: {list(DATASETS.keys())}"
+                f"Unknown dataset: {dataset_name!r}. Available: {list(DATASETS.keys())}"
             )
         super().__init__(name=dataset_name, raw_dir=raw_dir)
         self.dataset_name = dataset_name
@@ -92,12 +92,15 @@ class DVBPRDataLoader(DatasetProvider):
             if expected_size is None or local_size == expected_size:
                 logger.info(
                     "File already exists, skipping download: %s (%.1f MB)",
-                    self.npy_path, local_size / 1e6,
+                    self.npy_path,
+                    local_size / 1e6,
                 )
                 return
             logger.warning(
                 "Existing %s is %d bytes but server reports %d — re-downloading.",
-                self.npy_path, local_size, expected_size,
+                self.npy_path,
+                local_size,
+                expected_size,
             )
             self.npy_path.unlink()
 
@@ -108,14 +111,19 @@ class DVBPRDataLoader(DatasetProvider):
             if downloaded:
                 logger.info(
                     "Resuming download from %.1f MB (attempt %d/%d)...",
-                    downloaded / 1e6, attempt, max_retries,
+                    downloaded / 1e6,
+                    attempt,
+                    max_retries,
                 )
             else:
                 logger.info("Downloading %s from %s ...", self.dataset_name, url)
 
             try:
                 response = requests.get(
-                    url, stream=True, timeout=600, headers=headers,
+                    url,
+                    stream=True,
+                    timeout=600,
+                    headers=headers,
                 )
                 response.raise_for_status()
             except requests.RequestException as exc:
@@ -140,18 +148,45 @@ class DVBPRDataLoader(DatasetProvider):
                         unit="B",
                         unit_scale=True,
                         desc=f"Downloading {self.dataset_name}",
+                        # Auto-disable the live bar when not attached to a TTY
+                        # (Docker/pod logs) — its \r updates don't render there;
+                        # the throttled logger line below is used instead.
+                        disable=None,
                     ) as pbar,
                 ):
+                    # tqdm's \r bar is invisible in non-TTY logs (docker compose
+                    # logs, nohup files), so also emit a throttled logger line
+                    # that flows through the normal logging handlers.
+                    last_progress_log = time.time()
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         fout.write(chunk)
                         pbar.update(len(chunk))
+                        now = time.time()
+                        if now - last_progress_log >= 15:
+                            if total:
+                                logger.info(
+                                    "  %s: %.1f%% (%.0f / %.0f MB)",
+                                    self.dataset_name,
+                                    100 * pbar.n / total,
+                                    pbar.n / 1e6,
+                                    total / 1e6,
+                                )
+                            else:
+                                logger.info(
+                                    "  %s: %.0f MB downloaded",
+                                    self.dataset_name,
+                                    pbar.n / 1e6,
+                                )
+                            last_progress_log = now
 
                 final_size = partial_path.stat().st_size
                 if expected_size is not None and final_size != expected_size:
                     logger.warning(
                         "Truncated download: got %d bytes, expected %d.  "
                         "Keeping %s for the next retry to resume from.",
-                        final_size, expected_size, partial_path,
+                        final_size,
+                        expected_size,
+                        partial_path,
                     )
                     if attempt == max_retries:
                         raise RuntimeError(
@@ -163,14 +198,17 @@ class DVBPRDataLoader(DatasetProvider):
                 partial_path.rename(self.npy_path)
                 logger.info(
                     "Saved %s to %s (%.1f MB)",
-                    self.dataset_name, self.npy_path, final_size / 1e6,
+                    self.dataset_name,
+                    self.npy_path,
+                    final_size / 1e6,
                 )
                 return
 
             except requests.RequestException as exc:
                 logger.warning(
                     "Download interrupted at %.1f MB (%s). Will retry...",
-                    partial_path.stat().st_size / 1e6, exc,
+                    partial_path.stat().st_size / 1e6,
+                    exc,
                 )
                 if attempt == max_retries:
                     raise
@@ -182,8 +220,7 @@ class DVBPRDataLoader(DatasetProvider):
 
         if not self.npy_path.exists():
             raise FileNotFoundError(
-                f"Dataset file not found: {self.npy_path}. "
-                "Call download() first."
+                f"Dataset file not found: {self.npy_path}. Call download() first."
             )
 
         logger.info("Loading %s (this may take a moment)...", self.npy_path.name)
@@ -227,8 +264,7 @@ class DVBPRDataLoader(DatasetProvider):
         test = _parse_split(user_test_raw)
 
         logger.info(
-            "Loaded splits: %d users, %d items, "
-            "train=%d interactions, val=%d users, test=%d users",
+            "Loaded splits: %d users, %d items, train=%d interactions, val=%d users, test=%d users",
             int(usernum),
             int(itemnum),
             sum(len(v) for v in train.values()),
@@ -286,7 +322,9 @@ class DVBPRDataLoader(DatasetProvider):
 
         n_classes = len(set(categories.values()))
         logger.info(
-            "Loaded categories for %d items (%d classes)", len(categories), n_classes,
+            "Loaded categories for %d items (%d classes)",
+            len(categories),
+            n_classes,
         )
         return categories
 
@@ -519,4 +557,3 @@ class DVBPRDataLoader(DatasetProvider):
 
 for _name in DATASETS:
     register_dataset_provider(_name, partial(DVBPRDataLoader, _name))
-

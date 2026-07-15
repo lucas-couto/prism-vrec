@@ -884,7 +884,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.2.4},
+  version = {2.2.5},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }
