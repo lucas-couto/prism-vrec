@@ -8,6 +8,47 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-07-15
+
+Evaluation-protocol changes decided by the two diagnostic audits. They
+change model selection and tie-breaking; no battery had run yet, so
+nothing is invalidated retroactively — but see the tie-break note below
+on cross-version comparability.
+
+### Changed
+
+- **Model selection runs on validation, never on the test set.** The
+  Optuna trial path (`src/steps/train.py`) loaded `test.csv` and chose
+  hyperparameters + the early-stopping epoch by maximising ndcg@10 on a
+  test-user subsample — an optimistic bias. It now loads `val.csv` and
+  scores validation held-outs (train items as the mask), matching the
+  grid worker (`src/utils/parallel.py`) which already did so. The test
+  set is read only by the final evaluate step. The ~2000-user selection
+  subsample keeps its dedicated-RNG mechanics, now over the validation
+  population.
+- **Exact-score ties broken by a seed-fixed random permutation.**
+  Previously ties were broken by lower item id; a pod check found
+  item_idx correlates with popularity (Spearman -0.34 to -0.45 across
+  the 4 datasets), so an id tie-break systematically favoured popular
+  items inside a tie block — hurting pure BPR (mass cold-item ties) more
+  than visual models. All three ranking paths
+  (`src/evaluation/protocol.py`) now break ties by a permutation drawn
+  once per run from the global seed, shared by every model/trial of a
+  (dataset, seed) run. When the held-out is not tied the rank is
+  unchanged. **Comparability note: metrics from evaluations that contain
+  exact-score ties are NOT comparable to versions ≤ 2.2.7.**
+
+### Added
+
+- **Exact-tie instrumentation.** Each evaluation logs the fraction of
+  held-outs sitting in an exact-score tie plus the mean/max tie-block
+  size (`src/evaluation/protocol.py`), turning the audit's unmeasured
+  tie frequency into a number recorded during the battery.
+- Guards/tests: model selection reads `val.csv` only (structural +
+  behavioural), validation-population subsample determinism (updated),
+  tie-break permutation determinism, non-tied-rank invariance,
+  tied-rank follows the key and varies by seed, and tie instrumentation.
+
 ## [2.2.7] - 2026-07-15
 
 ### Changed

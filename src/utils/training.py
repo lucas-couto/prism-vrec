@@ -293,6 +293,7 @@ def train_single_run(
         k_values=[10],
         sample_size=eval_sample_size,
         sample_seed=eval_sample_seed,
+        tiebreak_seed=base_seed,
     )
 
     loss_device = torch.device(device) if use_cuda else torch.device("cpu")

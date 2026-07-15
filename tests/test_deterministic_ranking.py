@@ -1,7 +1,9 @@
 """Deterministic tie-breaking + Wilcoxon zero handling (v2).
 
-The unified rule: score ties are broken by the LOWER item index, in all
-three ranking paths (batched torch, sampled numpy, single-user numpy).
+The unified rule: exact-score ties are broken by the random, seed-fixed
+``_tiebreak_key`` permutation, in all three ranking paths (batched torch,
+sampled numpy, single-user numpy). These tests assert the mechanism (the
+all-tied ranking follows the key, not item id) and cross-path agreement.
 """
 
 from __future__ import annotations
@@ -37,26 +39,32 @@ def _evaluator(**kwargs) -> Evaluator:
 
 
 class TestUnifiedTieBreak:
-    def test_batched_path_ranks_lower_index_first_on_ties(self) -> None:
+    def test_all_tied_ranks_by_tiebreak_key_not_id(self) -> None:
         evaluator = _evaluator()
-        results = evaluator.evaluate(_TiedScoresModel(), device="cpu")
+        # All scores tie; item 9 is masked (train). Under the random rule
+        # the top-5 are the 5 unmasked items with the smallest tie-break
+        # key — NOT ids 0..4. The held-out (item 1) is hit iff it is one.
+        key = evaluator._tiebreak_key
+        unmasked = [i for i in range(N_ITEMS) if i != 9]
+        top5 = sorted(unmasked, key=lambda i: key[i])[:5]
+        expected = 1.0 if 1 in top5 else 0.0
 
-        # All scores tie; item 9 is masked (train). Expected top-5 by the
-        # unified rule: items 0,1,2,3,4 — so the positive (item 1) is hit.
-        assert results["recall@5"] == 1.0
+        results = evaluator.evaluate(_TiedScoresModel(), device="cpu")
+        assert results["recall@5"] == expected
 
     def test_single_user_path_matches_batched_rule(self) -> None:
         evaluator = _evaluator()
-        scores = np.zeros(N_ITEMS, dtype=np.float64)
+        batched = evaluator.evaluate(_TiedScoresModel(), device="cpu")["recall@5"]
 
-        metrics = evaluator._rank_and_score(0, scores)
+        single = evaluator._rank_and_score(0, np.zeros(N_ITEMS, dtype=np.float64))["recall@5"]
 
-        assert metrics["recall@5"] == 1.0
+        # Both paths apply the same key, so they must agree exactly.
+        assert single == batched
 
     def test_sampled_path_does_not_favor_positives_on_ties(self) -> None:
-        # Positive is item 8: under all-tied scores the top-5 of the
-        # sampled pool must be the 5 LOWEST item ids in the pool, not the
-        # positives-first pool order (which would inflate metrics).
+        # Positive is item 8: under all-tied scores its rank must follow
+        # the tie-break key over the pool, never the positives-first pool
+        # order (which would inflate metrics).
         evaluator = Evaluator(
             train_interactions={0: set()},
             test_interactions={0: {8}},
@@ -65,12 +73,12 @@ class TestUnifiedTieBreak:
             protocol="sampled",
             n_negatives=8,
         )
-        results = evaluator.evaluate(_TiedScoresModel(), device="cpu")
+        pool = [8] + evaluator._sample_negatives(0, {8})
+        top5 = sorted(pool, key=lambda i: evaluator._tiebreak_key[i])[:5]
+        expected = 1.0 if 8 in top5 else 0.0
 
-        # Pool = {8} + 8 sampled negatives from the other 9 items — at
-        # least 5 of them have an id lower than 8, so item 8 must NOT be
-        # in the deterministic top-5.
-        assert results["recall@5"] == 0.0
+        results = evaluator.evaluate(_TiedScoresModel(), device="cpu")
+        assert results["recall@5"] == expected
 
     def test_distinct_scores_are_unaffected(self) -> None:
         evaluator = _evaluator()

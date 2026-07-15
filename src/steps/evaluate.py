@@ -282,6 +282,7 @@ def run(condition: str = "frozen") -> None:
     protocol = eval_cfg.get("protocol", "full_ranking")
     n_negatives = eval_cfg.get("n_negatives", 100)
     neg_seed = eval_cfg.get("negative_sampling_seed", 42)
+    tiebreak_seed = config.get("seed", 42)
     if protocol == "sampled":
         logger.warning(
             "evaluate: protocol='sampled' selected (n_negatives=%d).  "
@@ -308,6 +309,7 @@ def run(condition: str = "frozen") -> None:
             protocol=protocol,
             n_negatives=n_negatives,
             negative_sampling_seed=neg_seed,
+            tiebreak_seed=tiebreak_seed,
         )
 
         done_path = _done_path(results_dir, dataset_name)

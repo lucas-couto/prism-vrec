@@ -63,6 +63,7 @@ class Evaluator:
         protocol: ProtocolName = "full_ranking",
         n_negatives: int = 100,
         negative_sampling_seed: int = 42,
+        tiebreak_seed: int = 42,
     ) -> None:
         if protocol not in ("full_ranking", "sampled"):
             raise ValueError(f"protocol must be 'full_ranking' or 'sampled'; got {protocol!r}")
@@ -77,6 +78,23 @@ class Evaluator:
         self.protocol: ProtocolName = protocol
         self.n_negatives = n_negatives
         self.negative_sampling_seed = negative_sampling_seed
+
+        # Random tie-break key: exact-score ties are broken by ascending
+        # ``_tiebreak_key[item]`` instead of ascending item_idx.  item_idx
+        # correlates with popularity in the DVBPR splits (Spearman -0.34 to
+        # -0.45), so an id tie-break would systematically favour popular
+        # items inside a tie block.  A fixed permutation seeded from the
+        # run's global seed breaks ties uniformly at random yet
+        # reproducibly, and is identical for every model/trial of a
+        # (dataset, seed) run — so it never becomes between-model variance.
+        # ``_tiebreak_order`` lists item ids in ascending key: a stable
+        # descending sort over columns reordered by it breaks ties by the
+        # key (used by the batched torch path).
+        rng = np.random.default_rng(tiebreak_seed)
+        self._tiebreak_key = rng.permutation(n_items).astype(np.int64)
+        self._tiebreak_order_np = np.argsort(self._tiebreak_key).astype(np.int64)
+        self._tiebreak_order_gpu: torch.Tensor | None = None
+        self._tiebreak_order_device: torch.device | None = None
 
         # Lazy GPU cache: per-user training-item indices as a LongTensor on
         # the same device used during evaluation.  Built once on first
@@ -180,8 +198,37 @@ class Evaluator:
                 per_user_results = self._evaluate_single(model, all_items)
 
         df = pd.DataFrame(per_user_results)
+        self._log_tie_stats(df)
+        # ``_tie_block_size`` is diagnostic instrumentation, not a metric —
+        # drop it so it never leaks into the per-user metric matrix the
+        # statistical step consumes.
+        if "_tie_block_size" in df.columns:
+            df = df.drop(columns=["_tie_block_size"])
         cols = ["user_id"] + [c for c in df.columns if c != "user_id"]
         return df[cols]
+
+    def _log_tie_stats(self, df: pd.DataFrame) -> None:
+        """Log how often the held-out item lands in an exact-score tie.
+
+        The audit could not measure real exact-tie frequency (it depends
+        on a trained model); this turns that unknown into a number logged
+        during the battery — the empirical basis for the tie-break note in
+        the dissertation.
+        """
+        if "_tie_block_size" not in df.columns or df.empty:
+            return
+        blocks = df["_tie_block_size"].to_numpy()
+        tied = blocks > 1
+        frac_tied = float(tied.mean())
+        mean_block = float(blocks[tied].mean()) if tied.any() else 0.0
+        logger.info(
+            "Tie-break: %.2f%% of held-outs in an exact-score tie "
+            "(mean block %.2f, max block %d, over %d users)",
+            100.0 * frac_tied,
+            mean_block,
+            int(blocks.max()),
+            len(blocks),
+        )
 
     def _evaluate_single(
         self,
@@ -237,20 +284,45 @@ class Evaluator:
             # Stable descending sort instead of topk: torch.topk's tie
             # order is backend-dependent (CPU vs GPU can rank tied items
             # differently), which breaks reproducibility across devices.
-            # A stable sort guarantees the unified rule used by every
-            # evaluation path: ties broken by LOWER item index.
-            top_indices = torch.sort(batch_scores, dim=1, descending=True, stable=True).indices[
+            # Columns are first reordered by ``_tiebreak_order`` (ascending
+            # random key), so the stable sort breaks exact-score ties by
+            # that key rather than by item index — the unified rule shared
+            # with the single and sampled paths.
+            order = self._tiebreak_order_on(device)  # (n_items,)
+            reordered = batch_scores.index_select(1, order)
+            top_in_perm = torch.sort(reordered, dim=1, descending=True, stable=True).indices[
                 :, : self.max_k
-            ]  # (B, K)
-            top_indices_np = top_indices.cpu().numpy()
+            ]  # (B, K) — indices into the reordered columns
+            top_indices_np = order[top_in_perm].cpu().numpy()  # map back to item ids
+
+            # Tie instrumentation (batched, single transfer): block size of
+            # the held-out's exact score per user.  Assumes leave-one-out
+            # (one held item per user).
+            held_ids = torch.tensor(
+                [next(iter(self.test_interactions[u])) for u in batch_user_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            held_scores = batch_scores.gather(1, held_ids[:, None]).squeeze(1)  # (B,)
+            tie_blocks_np = (batch_scores == held_scores[:, None]).sum(dim=1).cpu().numpy()
 
             for i, user_id in enumerate(batch_user_ids):
                 ranked_list = top_indices_np[i].tolist()
                 ground_truth = self.test_interactions[user_id]
                 user_metrics = compute_all_metrics(ranked_list, ground_truth, self.k_values)
                 user_metrics["user_id"] = user_id
+                user_metrics["_tie_block_size"] = int(tie_blocks_np[i])
                 results.append(user_metrics)
         return results
+
+    def _tiebreak_order_on(self, device: torch.device) -> torch.Tensor:
+        """Item ids in ascending tie-break key, as a LongTensor on *device*."""
+        if self._tiebreak_order_device != device or self._tiebreak_order_gpu is None:
+            self._tiebreak_order_gpu = torch.as_tensor(
+                self._tiebreak_order_np, dtype=torch.long, device=device
+            )
+            self._tiebreak_order_device = device
+        return self._tiebreak_order_gpu
 
     def _ensure_train_idx_cache(self, device: torch.device) -> None:
         """Build per-user train-item index tensors on the target device.
@@ -307,16 +379,20 @@ class Evaluator:
             else:
                 scores_np = np.asarray(scores)
 
-            # Unified deterministic tie-break: ties by LOWER catalogue
-            # item id.  Breaking ties by pool position would favour the
-            # positives (listed first in the pool) and inflate metrics.
+            # Unified tie-break: exact-score ties broken by the random
+            # ``_tiebreak_key`` (seeded permutation), NOT by pool position
+            # (which would favour the positives, listed first) nor by item
+            # id (which correlates with popularity).
             pool_ids = np.asarray(pool)
-            order = np.lexsort((pool_ids, -scores_np))
+            order = np.lexsort((self._tiebreak_key[pool_ids], -scores_np))
             top_k = order[: self.max_k]
             ranked_list = pool_ids[top_k].tolist()
 
             user_metrics = compute_all_metrics(ranked_list, positives, self.k_values)
             user_metrics["user_id"] = user_id
+            held = next(iter(positives))
+            held_pos = pool.index(held)
+            user_metrics["_tie_block_size"] = int(np.sum(scores_np == scores_np[held_pos]))
             results.append(user_metrics)
         return results
 
@@ -358,14 +434,15 @@ class Evaluator:
             train_idx = np.array(list(train_items), dtype=np.int64)
             user_scores[train_idx] = -np.inf
 
-        # Stable full sort instead of argpartition: partition boundaries
-        # split tied scores arbitrarily, so tied items could enter or
-        # miss the top-k nondeterministically.  Stable sort implements
-        # the unified rule (ties broken by lower item index) shared with
-        # the batched and sampled paths.
-        ranked_list = np.argsort(-user_scores, kind="stable")[: self.max_k].tolist()
+        # lexsort over (tiebreak_key, -score): full sort (not argpartition,
+        # whose boundaries split tied scores arbitrarily) with exact-score
+        # ties broken by the random ``_tiebreak_key`` — the unified rule
+        # shared with the batched and sampled paths.
+        ranked_list = np.lexsort((self._tiebreak_key, -user_scores))[: self.max_k].tolist()
 
         ground_truth = self.test_interactions[user_id]
         user_metrics = compute_all_metrics(ranked_list, ground_truth, self.k_values)
         user_metrics["user_id"] = user_id
+        held = next(iter(ground_truth))
+        user_metrics["_tie_block_size"] = int(np.sum(user_scores == user_scores[held]))
         return user_metrics
