@@ -363,6 +363,15 @@ class FrameworkConfig(BaseModel):
     recommenders_enabled: list[str] = Field(default_factory=list)
     common: CommonTrainingConfig = Field(default_factory=CommonTrainingConfig)
     hp_search: HpSearchConfig = Field(default_factory=HpSearchConfig)
+    hp_budget: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Optional per-dataset override of the shared HP-search budget "
+            "(n_trials, early_stopping_*, epochs, eval_sample_size).  Keyed "
+            "by dataset name; all recommenders of a dataset share it.  See "
+            "src/recommenders/hp_budget.py."
+        ),
+    )
 
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     k_values: list[int] = Field(

@@ -271,3 +271,18 @@ A avaliação é full ranking sobre o catálogo inteiro, incluindo itens sem
 qualquer interação de treino — itens frios com representação visual real
 fazem parte do objeto de estudo do benchmark. Na validação, o item de
 teste do usuário permanece como candidato (ver 10.2).
+
+### 10.6. Orçamento e fluxo da busca de hiperparâmetros
+
+O orçamento da busca de hiperparâmetros (número de trials, métrica de
+seleção ndcg@10 em validação, paciência, épocas máximas, tamanho do
+subsample de validação) é **uniforme para todos os recomendadores de um
+mesmo dataset** — configurado numa fonte compartilhada única, nunca por
+modelo; apenas os espaços de busca são por modelo, pois cada um tem seus
+próprios hiperparâmetros. A busca completa é executada **apenas na seed
+primária** de cada dataset; nas demais seeds, a melhor configuração
+encontrada é re-treinada (replay), com parada antecipada em validação
+ativa por seed. A avaliação final de cada célula consome o checkpoint do
+melhor trial (cujo early stopping já rodou em validação) — não há
+re-treino pós-busca, e o procedimento é idêntico para todos os modelos.
+O conjunto de teste permanece intocado até a avaliação final.
