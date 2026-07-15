@@ -8,6 +8,28 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.7] - 2026-07-15
+
+### Changed
+
+- **Live in-place progress bars across the pipeline.** The compose
+  ``pipeline`` service now allocates a pseudo-TTY (``tty: true`` +
+  ``stdin_open: true``), so tqdm renders live redrawing bars for every
+  long step — download, image extraction, feature extraction,
+  evaluation, and training. Follow them with a raw stream (``docker
+  logs -f prism-vrec`` or ``docker attach prism-vrec``), **not** ``docker
+  compose logs``, whose per-line ``service |`` prefix buffers the ``\r``
+  the bar uses to redraw.
+- **Training shows an Optuna-cell bar.** ``_run_optuna`` now drives a
+  ``tqdm`` bar (``Training (Optuna cells): 145/580 [1.2h<3.6h,
+  1.9cell/h]``) instead of periodic log lines, giving %, elapsed, ETA
+  and rate on a single redrawing line. Parent-side observability only —
+  worker computation, RNG and cell ordering are untouched.
+- **Download reverts to the tqdm bar.** The per-line percentage logging
+  added in 2.2.5/2.2.6 (a non-TTY workaround that appended a line every
+  15 s) is removed; under the new TTY the native bar redraws in place.
+  Off a TTY the bar auto-disables (``disable=None``), keeping CI quiet.
+
 ## [2.2.6] - 2026-07-15
 
 ### Fixed

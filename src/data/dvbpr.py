@@ -19,7 +19,6 @@ them by name without importing this module directly.
 from __future__ import annotations
 
 import json
-import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -148,40 +147,16 @@ class DVBPRDataLoader(DatasetProvider):
                         unit="B",
                         unit_scale=True,
                         desc=f"Downloading {self.dataset_name}",
-                        # Auto-disable the live bar when not attached to a TTY
-                        # (Docker/pod logs) — its \r updates don't render there;
-                        # the throttled logger line below is used instead.
+                        # Auto-disable off a TTY so CI / non-interactive runs
+                        # stay quiet; with the compose service's ``tty: true``
+                        # the bar renders live when followed via ``docker logs
+                        # -f`` / ``docker attach``.
                         disable=None,
                     ) as pbar,
                 ):
-                    # tqdm's \r bar is invisible in non-TTY logs (docker compose
-                    # logs, nohup files), so also emit a throttled logger line
-                    # that flows through the normal logging handlers.  Track the
-                    # byte count ourselves: a tqdm disabled off a TTY freezes
-                    # ``pbar.n`` at ``initial``, so it cannot drive the log line.
-                    last_progress_log = time.time()
-                    progress_bytes = downloaded
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         fout.write(chunk)
                         pbar.update(len(chunk))
-                        progress_bytes += len(chunk)
-                        now = time.time()
-                        if now - last_progress_log >= 15:
-                            if total:
-                                logger.info(
-                                    "  %s: %.1f%% (%.0f / %.0f MB)",
-                                    self.dataset_name,
-                                    100 * progress_bytes / total,
-                                    progress_bytes / 1e6,
-                                    total / 1e6,
-                                )
-                            else:
-                                logger.info(
-                                    "  %s: %.0f MB downloaded",
-                                    self.dataset_name,
-                                    progress_bytes / 1e6,
-                                )
-                            last_progress_log = now
 
                 final_size = partial_path.stat().st_size
                 if expected_size is not None and final_size != expected_size:

@@ -30,6 +30,14 @@ services:
     entrypoint: ["python", "main.py"]
     restart: on-failure:3
     shm_size: "4g"
+    # Allocate a pseudo-TTY so tqdm renders live in-place progress bars
+    # (download, image extraction, feature extraction, evaluation,
+    # training). Follow them with a raw stream — ``docker logs -f
+    # prism-vrec`` or ``docker attach prism-vrec`` — NOT ``docker compose
+    # logs``, whose per-line ``service |`` prefix buffers the ``\r`` the
+    # bar uses to redraw in place.
+    tty: true
+    stdin_open: true
     logging:
       driver: "json-file"
       options:
