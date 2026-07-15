@@ -39,17 +39,17 @@ previously silent decisions into loud, declared ones.
   ``_fit_pca_train_only`` (and ``fuse_pca`` / ``fuse_pca_per_model`` /
   ``pca_align``) raise when ``train_items=None`` unless
   ``allow_transductive=True`` is passed explicitly. A fit over all rows
-  is the test→fit leak the v2 protocol eliminated; it was previously a
+  is the test→fit leak the native-dim protocol eliminated; it was previously a
   warning (which does not fail CI). No production path passes ``None``
   (``src.steps.fuse`` always supplies train item indices), so behaviour
   there is unchanged; only synthetic tests opt in.
 
 ### Fixed
 
-- **DeepStyle documentation.** ``docs/protocol_v2.md`` described the
-  removed 1.x DeepStyle (MLP projector, no category subtraction, "does
-  not degenerate on Tradesy"). Rewritten to the paper-faithful v2
-  formulation ``θ_i = E·f_i − c_cat(i)`` with the analytic degeneration
+- **DeepStyle documentation.** ``docs/protocol.md`` described the
+  removed MLP-projector DeepStyle (no category subtraction, "does not
+  degenerate on Tradesy"). Rewritten to the paper-faithful formulation
+  ``θ_i = E·f_i − c_cat(i)`` with the analytic degeneration
   to VBPR on category-less Tradesy. Also corrected the contradictory
   ``_ensure_categories_sidecar`` docstring that listed tradesy among
   taxonomy-bearing datasets.
@@ -77,7 +77,7 @@ not how models are trained. No training artifact is invalidated.
   ``map@k = 1/rank`` are deterministic transforms under leave-one-out
   and are only analysed with ``include_derived_metrics: true`` — never
   as independent evidence. The derivation is documented in the module
-  and in ``docs/protocol_v2.md`` §5.
+  and in ``docs/protocol.md`` §5.
 - **Cliff's delta promoted to primary effect size (C3).** Cohen's d is
   parametric and inflates on zero-dominated paired differences (the
   same property that motivated Wilcoxon ``pratt``); it is now off by
@@ -219,7 +219,7 @@ remain traceable via the ``v1.1.2`` tag and the Zenodo archive.
 
 ### Added
 
-- ``docs/protocol_v2.md`` - every methodological declaration (CLIP 512,
+- ``docs/protocol.md`` - every methodological declaration (CLIP 512,
   CvT CLS token, resolution posture, PCA protocol, DeepStyle variant
   without category subtraction, ACF fed with real components, the
   architecture-vs-pretraining confounder) with code pointers.

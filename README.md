@@ -530,7 +530,7 @@ A non-empty list reports schema violations.
 | 7   | **DINOv2 ViT-B/14** | ViT (self-supervised)                        | Foundation |        768 |
 | 8   | **ConvNeXt-Base**   | Modernised CNN (ImageNet-22k → 1k)           | Hybrid     |       1024 |
 
-Extraction saves each backbone's **native** pooled feature (v2 protocol) with the backbone's canonical preprocessing, resolved from the library that ships the weights. There is no shared projection head at extraction time: the learned projection `E` inside each recommender maps the native dim to the common latent dim (`common.visual_dim`), trained jointly by the BPR loss. Every artifact carries a `.meta.json` sidecar (backbone, native dim, extraction point, exact weights id, transform recipe) that the loader cross-checks on read. See `docs/protocol_v2.md` for every methodological declaration.
+Extraction saves each backbone's **native** pooled feature with the backbone's canonical preprocessing, resolved from the library that ships the weights. There is no shared projection head at extraction time: the learned projection `E` inside each recommender maps the native dim to the common latent dim (`common.visual_dim`), trained jointly by the BPR loss. Every artifact carries a `.meta.json` sidecar (backbone, native dim, extraction point, exact weights id, transform recipe) that the loader cross-checks on read. See `docs/protocol.md` for every methodological declaration.
 
 ---
 
