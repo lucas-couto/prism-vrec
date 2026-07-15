@@ -103,10 +103,20 @@ those users. The final evaluate step constructs its `Evaluator` without
 ## 4. Deterministic tie-breaking
 
 All three ranking paths (batched torch, sampled numpy, single-user
-numpy) implement one rule: **stable sort, ties broken by the lower item
-id**. In the sampled path, ties are explicitly NOT broken by pool
-position (positives come first in the pool — that would inflate
-metrics).
+numpy) implement one rule: exact-score ties are broken by a **fixed
+random permutation of the item ids**, drawn once per run from a
+dedicated `np.random.default_rng(seed)` (global run seed, not the
+per-trial job seed) and shared by every model/trial of a `(dataset,
+seed)` run. Item id is NOT used as the tie-break: `item_idx` correlates
+with popularity in the DVBPR splits (Spearman −0.34 to −0.45), so an id
+tie-break would systematically favour popular items inside a tie block —
+penalising models with mass exact-ties (pure BPR over cold items) more
+than models with distinct visual scores. In the sampled path ties are
+likewise NOT broken by pool position (positives come first — that would
+inflate metrics). When the held-out item is not tied, the returned rank
+is identical to a plain descending sort. Each evaluation logs the
+fraction of held-outs in an exact-score tie and the mean/max tie-block
+size, so the real exact-tie frequency is measured during the battery.
 
 ## 5. Statistics
 
@@ -206,3 +216,58 @@ Run the comparison at ≥2 values of `d` (64, 128), under both protocols,
 and with multiple seeds (`seeds: [...]` is supported), verifying the
 backbone ranking is stable. Each of these preempts a standard committee
 question.
+
+## 10. Declarações de protocolo (pt-BR — para a dissertação)
+
+Declarações fechadas pelas auditorias de diagnóstico, em tom de
+protocolo, prontas para migrar ao capítulo de metodologia.
+
+### 10.1. Escopo do ajuste fino (fine-tuning) dos backbones
+
+O ajuste fino dos backbones visuais é supervisionado exclusivamente pela
+categoria dos itens e utiliza, de forma transdutiva, as imagens e os
+rótulos de categoria de todo o catálogo — incluindo itens posteriormente
+reservados para validação e teste da tarefa de recomendação —, sem em
+nenhum momento acessar as interações usuário-item nem quais itens compõem
+os conjuntos de validação/teste. Trata-se de uso a priori de metadados de
+catálogo (equivalente ao emprego de representações pré-treinadas sobre
+todos os itens), e não de vazamento de sinal de interação; a partição de
+recomendação (treino/validação/teste do DVBPR) permanece fixa e é
+consumida apenas nas etapas posteriores.
+
+### 10.2. Seleção de modelo em validação
+
+A seleção de hiperparâmetros e a parada antecipada (early stopping,
+ndcg@10) são conduzidas sobre os usuários de **validação**, mascarando os
+itens de treino de cada usuário. O conjunto de teste não é acessado em
+nenhum momento do treinamento ou da seleção — é consumido apenas na
+avaliação final —, de modo que as métricas reportadas são uma estimativa
+fora da amostra, não enviesada pela seleção. Durante a validação, o item
+de teste do usuário permanece no conjunto de candidatos e compete como um
+item qualquer; isso é neutro entre os modelos e nada revela ao modelo.
+
+### 10.3. Normalização pré-fusão
+
+Antes de qualquer fusão element-wise, cada fonte é L2-normalizada por
+vetor (`normalize_before_fusion: true`, padrão). Justificativa: a razão
+entre as normas médias das fontes medida é de ~16× nas features brutas e
+~9× após o alinhamento por PCA — sem a normalização, a fonte de maior
+norma dominaria as fusões aditivas, tornando a comparação entre
+estratégias um artefato de escala.
+
+### 10.4. Desempate no ranking
+
+Empates exatos de score são resolvidos por uma permutação aleatória fixa
+dos itens, seedada a partir do seed global do run e compartilhada por
+todos os modelos e trials de uma execução `(dataset, seed)`.
+Justificativa: a correlação de Spearman entre `item_idx` e popularidade é
+de −0,34 a −0,45 nos quatro datasets, o que tornaria o desempate por id
+equivalente a um desempate por popularidade. A frequência real de empates
+exatos é medida e registrada durante a própria bateria.
+
+### 10.5. Conjunto de candidatos
+
+A avaliação é full ranking sobre o catálogo inteiro, incluindo itens sem
+qualquer interação de treino — itens frios com representação visual real
+fazem parte do objeto de estudo do benchmark. Na validação, o item de
+teste do usuário permanece como candidato (ver 10.2).
