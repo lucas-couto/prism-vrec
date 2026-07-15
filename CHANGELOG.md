@@ -8,6 +8,20 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.6] - 2026-07-15
+
+### Fixed
+
+- **Download progress frozen at the resume offset (regression from
+  2.2.5).** 2.2.5 read ``pbar.n`` for the throttled log line, but the
+  tqdm bar auto-disables off a TTY (``disable=None``) and a disabled
+  bar freezes ``pbar.n`` at ``initial`` — so the log showed ``0.0% (0 /
+  N MB)`` on a fresh download and ``X% (resume_offset MB)`` on a resume
+  for the entire transfer, even though bytes were flowing to disk. The
+  progress line now tracks its own byte counter
+  (`src/data/dvbpr.py`), so the percentage advances in non-TTY logs
+  regardless of tqdm's enabled/disabled state.
+
 ## [2.2.5] - 2026-07-15
 
 ### Fixed
