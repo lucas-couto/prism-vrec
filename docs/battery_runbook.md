@@ -19,6 +19,12 @@ tratar falhas.
 3. **Storage do Optuna persistente.** Já configurado em
    `configs/recommenders.yaml` (`storage: sqlite:///results/optuna/battery.db`)
    — os trials sobrevivem a um restart e a busca retoma de onde parou.
+4. **Condições (frozen / finetuned).** O runner enumera as duas quando
+   `pipeline.condition: both` (padrão) — as células finetuned só aparecem
+   se as features finetuned existirem em disco (rode o passo `finetune`
+   antes). Para rodar só uma, use `pipeline.condition: frozen` ou
+   `finetuned`. Frozen e finetuned são células distintas (o stem carrega o
+   sufixo `_finetuned`), com artefatos e checkpoints separados.
 
 ## Lançar
 

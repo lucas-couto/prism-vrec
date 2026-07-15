@@ -65,6 +65,30 @@ class TestEnumeration:
         assert roles[1] == "search"
         assert roles[2] == "replay"
 
+    def test_finetuned_condition_adds_distinct_cells(self, tmp_path) -> None:
+        proc, emb = _fixture(tmp_path)
+        # A finetuned feature appears as a distinct '_finetuned' stem.
+        np.save(Path(emb) / "synthetic" / "resnet50_finetuned.npy", np.zeros((_NI, 4), np.float32))
+
+        stems = {
+            c.visual_config
+            for c in enumerate_cells(_CONFIG, processed_dir=proc, embeddings_dir=emb)
+        }
+
+        assert "resnet50" in stems  # frozen kept
+        assert "resnet50_finetuned" in stems  # finetuned added (condition axis)
+
+    def test_bpr_not_duplicated_for_finetuned(self, tmp_path) -> None:
+        proc, emb = _fixture(tmp_path)
+        np.save(Path(emb) / "synthetic" / "resnet50_finetuned.npy", np.zeros((_NI, 4), np.float32))
+
+        cells = enumerate_cells(_CONFIG, processed_dir=proc, embeddings_dir=emb)
+        bpr = [c for c in cells if c.recommender == "bpr"]
+
+        # BPR is feature-blind: 'none' in frozen only, never a finetuned twin.
+        assert len(bpr) == 2  # one per seed
+        assert all(c.visual_config == "none" for c in bpr)
+
 
 class TestManifest:
     def test_state_transitions_and_summary(self, tmp_path) -> None:
