@@ -215,12 +215,22 @@ def create_study(
     optuna_cfg = config.get("hp_search", {}).get("optuna", {})
     base_seed = int(config.get("seed", 42))
 
+    storage = optuna_cfg.get("storage")
+    # A persistent SQLite study survives a spot-instance restart (resume).
+    # sqlite creates the file but not the directory — make it exist first.
+    if isinstance(storage, str) and storage.startswith("sqlite:///"):
+        from pathlib import Path
+
+        db_path = Path(storage[len("sqlite:///") :])
+        if db_path.parent != Path():
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+
     return optuna.create_study(
         study_name=cell.study_name(),
         direction="maximize",
         sampler=build_sampler(optuna_cfg, base_seed),
         pruner=build_pruner(optuna_cfg),
-        storage=optuna_cfg.get("storage"),
+        storage=storage,
         load_if_exists=True,
     )
 

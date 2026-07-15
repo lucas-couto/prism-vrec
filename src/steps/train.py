@@ -296,6 +296,24 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
 
     logger.info("Condition: %s", condition)
 
+    # Fairness guard-rail (Task H): no recommender may declare its own
+    # protocol budget — the budget is shared per dataset. Fail before
+    # training rather than confound the comparison silently.
+    from src.recommenders.hp_budget import assert_uniform_budget
+
+    assert_uniform_budget(config)
+
+    # Feature sanity gate (Task G): fail loud before burning battery time
+    # on a corrupt matrix. Validates every backbone + fused .npy consumed.
+    from src.steps.validate_features import gate_dataset_features
+
+    gate_dataset_features(
+        config.get("datasets", []),
+        config,
+        embeddings_dir=config["paths"]["embeddings"],
+        processed_dir=config["paths"]["data_processed"],
+    )
+
     startup_mgr = CheckpointManager()
     removed = startup_mgr.clear_all_training_checkpoints()
     if removed > 0:
@@ -389,8 +407,12 @@ def _optimize_one_cell(
     """
     import optuna
 
+    from src.recommenders.hp_budget import resolve_hp_budget
+
     optuna_cfg = config["hp_search"]["optuna"]
-    n_trials = int(optuna_cfg["n_trials"])
+    # Single source of the protocol budget, shared by every recommender of
+    # this dataset (Task H); per-dataset override via ``hp_budget:``.
+    n_trials = int(resolve_hp_budget(config, cell.dataset_name)["n_trials"])
     timeout = optuna_cfg.get("timeout_seconds")
 
     log.info("=== Optuna cell: %s ===", cell.study_name())
@@ -637,7 +659,7 @@ def _train_one_optuna_trial(
     processed_dir: str,
     device: str,
     config: dict,
-    trial,
+    trial=None,
 ) -> float:
     """Single trial entry point: load data, train one model, return metric."""
     from src.fusions import load_embedding
@@ -693,4 +715,36 @@ def _train_one_optuna_trial(
         device=device,
         optuna_trial=trial,
         item_categories=item_categories,
+    )
+
+
+def train_replay(
+    *,
+    cell: CellKey,
+    hyperparams: dict,
+    n_users: int,
+    n_items: int,
+    embeddings_path: str | None,
+    processed_dir: str,
+    device: str,
+    config: dict,
+) -> float:
+    """D2 replay: train ONE fixed config (no search), early stopping on val.
+
+    The clean "train with a given config" entry point the battery runner
+    (Task I) invokes to replicate a search's best config on the
+    non-primary seeds.  Validation early stopping is active (via
+    ``train_single_run``); ``config['seed']`` selects the seed.  Returns
+    the best validation metric.  Orchestration across seeds is Task I's.
+    """
+    return _train_one_optuna_trial(
+        cell=cell,
+        hyperparams=hyperparams,
+        n_users=n_users,
+        n_items=n_items,
+        embeddings_path=embeddings_path,
+        processed_dir=processed_dir,
+        device=device,
+        config=config,
+        trial=None,
     )

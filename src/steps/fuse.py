@@ -331,6 +331,20 @@ def run(condition: str = "frozen") -> None:
         )
         return
 
+    # Feature sanity gate (Task G): validate the native input matrices
+    # before fusing them (missing files are skipped — extraction may be
+    # partial; present ones must pass).
+    from src.steps.validate_features import gate_backbone_features
+
+    gate_backbone_features(
+        datasets,
+        extractors,
+        config,
+        embeddings_dir=embeddings_dir,
+        processed_dir=processed_dir,
+        suffix=suffix,
+    )
+
     logger.info(
         "Condition: %s (suffix=%r) | alignment: %s D=%d",
         condition,

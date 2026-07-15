@@ -87,8 +87,10 @@ hp_search:
     n_startup_trials: 5
     warm_start: true
     timeout_seconds: null
-    storage: null            # set to e.g. "sqlite:///optuna.db" to persist
-                              # studies across pod restarts
+    # Persistent study storage so the HP search resumes after a spot-
+    # instance restart (completed trials survive; the battery skips
+    # finished cells). The parent dir is created automatically.
+    storage: "sqlite:///results/optuna/battery.db"
 
 # --- Optional: declare continuous / log-uniform search spaces ---------------
 # Uncomment and adjust under each recommender to use Optuna's smart sampling
