@@ -8,6 +8,15 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.4.4] - 2026-07-15
+
+### Fixed
+
+- **Battery runbook translated to English.** ``docs/battery_runbook.md``
+  had been written in Portuguese, violating the docs-in-English rule; its
+  content is now fully in English (commands, paths, and structure
+  unchanged).
+
 ## [2.4.3] - 2026-07-15
 
 ### Added
