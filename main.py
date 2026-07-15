@@ -90,6 +90,7 @@ from src.steps import (  # noqa: E402
     preprocess,
     statistical,
     train,
+    validate_features,
 )
 from src.utils.config import load_config  # noqa: E402
 from src.utils.logging import get_logger  # noqa: E402
@@ -256,6 +257,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Run schema and image-coverage checks on dataset NAME and "
             "exit with non-zero status if problems are found.  Useful "
             "before launching a multi-day grid search."
+        ),
+    )
+    selection.add_argument(
+        "--validate-features",
+        nargs="*",
+        metavar="DATASET BACKBONE",
+        help=(
+            "Sanity-check extracted feature matrices (shape, native dim, "
+            "dtype, NaN/Inf, zero-norm rows) and exit non-zero on any "
+            "failure.  No args = every enabled (dataset, backbone); pass "
+            "DATASET or DATASET BACKBONE to narrow.  Run before the battery."
         ),
     )
     selection.add_argument(
@@ -607,6 +619,10 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.validate_dataset:
         sys.exit(_validate_dataset(args.validate_dataset))
+    if args.validate_features is not None:
+        ds = args.validate_features[0] if len(args.validate_features) >= 1 else None
+        bb = args.validate_features[1] if len(args.validate_features) >= 2 else None
+        sys.exit(validate_features.run(dataset=ds, backbone=bb))
     if args.report:
         from src.utils.report import write_report
 

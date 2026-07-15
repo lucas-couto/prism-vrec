@@ -296,6 +296,17 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
 
     logger.info("Condition: %s", condition)
 
+    # Feature sanity gate (Task G): fail loud before burning battery time
+    # on a corrupt matrix. Validates every backbone + fused .npy consumed.
+    from src.steps.validate_features import gate_dataset_features
+
+    gate_dataset_features(
+        config.get("datasets", []),
+        config,
+        embeddings_dir=config["paths"]["embeddings"],
+        processed_dir=config["paths"]["data_processed"],
+    )
+
     startup_mgr = CheckpointManager()
     removed = startup_mgr.clear_all_training_checkpoints()
     if removed > 0:
