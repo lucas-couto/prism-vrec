@@ -77,8 +77,14 @@ on cross-version comparability.
   (`src/evaluation/protocol.py`) now break ties by a permutation drawn
   once per run from the global seed, shared by every model/trial of a
   (dataset, seed) run. When the held-out is not tied the rank is
-  unchanged. **Comparability note: metrics from evaluations that contain
-  exact-score ties are NOT comparable to versions ≤ 2.2.7.**
+  unchanged.
+
+  **Comparability note (two independent reasons results from ≤ 2.2.7 are
+  not comparable):** (1) model selection moved from the test set to
+  validation — any number produced with an HP search on ≤ 2.2.7 selected
+  hyperparameters/early-stopping on the test set and is optimistically
+  biased; and (2) evaluations that contain exact-score ties now break
+  them by a seeded permutation instead of by item id.
 
 ### Added
 
