@@ -8,6 +8,19 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.2.3] - 2026-07-15
+
+Documentation only; no code change.
+
+### Fixed
+
+- **Citation version.** The README BibTeX still pinned ``version =
+  {2.1.0}``, telling users to cite an outdated release. Bumped to the
+  current version and documented the ``dataset_contracts`` config block
+  (added in 2.2.0) in the ``configs/default.yaml`` section. Version
+  reconciled across ``pyproject.toml`` / ``CITATION.cff`` / ``uv.lock``
+  / README so the declared version matches the tag.
+
 ## [2.2.2] - 2026-07-15
 
 Housekeeping; no runtime behaviour change.
