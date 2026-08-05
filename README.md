@@ -91,7 +91,14 @@ echo "HF_TOKEN=hf_your_token_here" > .env
 
 ### Cloud, one block, copy-paste
 
-Works on any pod with a CUDA + PyTorch image (e.g. `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`) with a persistent volume mounted at `/workspace`:
+Works on any pod with a CUDA + PyTorch image (e.g. `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-devel-ubuntu22.04`) with a persistent volume mounted at `/workspace`:
+
+The image must ship **CUDA 12.8 or newer**: `torch` is pinned to the 2.8
+series, the earliest that provides `sm_120` kernels for Blackwell cards
+(RTX 5090, RTX PRO 6000). Older CUDA images abort with "no kernel image
+is available for execution on the device" on that hardware. Only the
+host **driver** has to satisfy this — the `torch` wheel bundles its own
+CUDA runtime, so a plain base image plus `pip install -e .` works too.
 
 ```bash
 cd /workspace
