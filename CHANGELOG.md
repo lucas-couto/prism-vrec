@@ -8,6 +8,46 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-08-05
+
+### Changed
+
+- **PyTorch pinned to the 2.8 series (Blackwell support).** ``torch`` moved
+  from ``>=2.1.0,<2.6`` to ``>=2.8,<2.9`` and ``torchvision`` from
+  ``>=0.16.0,<0.21`` to ``>=0.23,<0.24``. The previous ceiling predates
+  ``sm_120``, so the pipeline aborted with "no kernel image is available
+  for execution on the device" on Blackwell cards (RTX 5090, RTX PRO
+  6000) — the current price/throughput sweet spot on interruptible cloud
+  marketplaces. 2.8 is the earliest range that ships those kernels; the
+  window is deliberately narrow because it is exactly what was
+  re-validated. Cloud image guidance in ``README.md`` updated to require
+  CUDA 12.8+.
+
+  Re-validation performed on macOS/arm64 (CPU + MPS), comparing a clean
+  end-to-end ``--all --config-dir configs/smoke`` run on each stack:
+
+  - full suite green on both (519 passed, same single pre-existing
+    ``scipy`` warning, no new deprecations);
+  - each stack is reproducible run-to-run (identical embedding digest
+    across repeated clean runs);
+  - frozen ``resnet50`` embeddings differ between stacks by float32
+    rounding noise only — ``max |Δ| = 1.43e-06`` against ``max |x| =
+    8.02`` (relative ``1.78e-07``, ≈1 float32 ULP), ``mean |Δ| =
+    1.9e-09``, per-item ``cosine ≥ 0.9999999``, ``allclose(rtol=1e-5)``
+    true;
+  - every downstream table under ``results/smoke/tables`` (evaluation,
+    bootstrap CIs, Friedman, pairwise) is **bit-identical** across the
+    two stacks.
+
+  Only ``torch``, ``torchvision`` and ``sympy`` changed in the lock file —
+  ``timm``, ``transformers``, ``numpy`` and the rest resolve unchanged.
+  No battery has been run under the 2.x protocol yet, so no existing
+  result artifact is invalidated by this change.
+
+  Not covered by this validation: ``sm_120`` kernels themselves, which
+  have no macOS wheel. First run on Blackwell hardware must be smoke-
+  tested before committing to a full battery.
+
 ## [2.4.4] - 2026-07-15
 
 ### Fixed
