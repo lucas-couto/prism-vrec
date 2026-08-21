@@ -3,8 +3,10 @@
 Captures wall-clock durations at two granularities:
 
 * **Per pipeline step**, a flat list of
-  ``{name, started_at, duration_seconds}`` embedded in the run
-  manifest under the ``steps`` key.  Always recorded by ``main.py``.
+  ``{name, started_at, duration_seconds, telemetry}`` embedded in the
+  run manifest under the ``steps`` key.  Always recorded by
+  ``main.py``.  The ``telemetry`` block carries throughput and cost
+  aggregates for the step's window; see :mod:`src.utils.telemetry`.
 * **Per cell**, opt-in finer-grained log written to
   ``results/runs/<run_id>/step_timings.json``.  Hot loops in the
   expensive steps (extract, finetune, train, ...) wrap each cell
@@ -34,6 +36,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from src.utils import telemetry
 from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 
@@ -57,15 +60,22 @@ class _TimingRecorder:
         with self._lock:
             self._run_dir = Path(run_dir)
 
-    def record_step(self, name: str, started_at: str, duration_seconds: float) -> None:
+    def record_step(
+        self,
+        name: str,
+        started_at: str,
+        duration_seconds: float,
+        metrics: dict[str, Any] | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "name": name,
+            "started_at": started_at,
+            "duration_seconds": round(duration_seconds, 3),
+        }
+        if metrics:
+            entry["telemetry"] = metrics
         with self._lock:
-            self._steps.append(
-                {
-                    "name": name,
-                    "started_at": started_at,
-                    "duration_seconds": round(duration_seconds, 3),
-                }
-            )
+            self._steps.append(entry)
 
     def steps(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -86,19 +96,24 @@ class _TimingRecorder:
     def time_cell(self, step: str, **labels: Any) -> Iterator[None]:
         started_at = _now_iso()
         start_perf = time.perf_counter()
+        marker = telemetry.mark()
         try:
             yield
         finally:
             duration = round(time.perf_counter() - start_perf, 3)
+            entry: dict[str, Any] = {
+                "step": step,
+                "started_at": started_at,
+                "duration_seconds": duration,
+                "labels": labels,
+            }
+            # The cell slices the same run-wide sample series the enclosing
+            # step will slice, so nesting costs nothing extra.
+            metrics = telemetry.summarise_since(marker)
+            if metrics:
+                entry["telemetry"] = metrics
             with self._lock:
-                self._cells.append(
-                    {
-                        "step": step,
-                        "started_at": started_at,
-                        "duration_seconds": duration,
-                        "labels": labels,
-                    }
-                )
+                self._cells.append(entry)
                 self._flush_unsafe()
 
     def _flush_unsafe(self) -> None:
@@ -127,9 +142,20 @@ def bind_run_dir(run_dir: Path | str) -> None:
     _RECORDER.bind(run_dir)
 
 
-def record_step(name: str, started_at: str, duration_seconds: float) -> None:
-    """Append a top-level step timing (one entry per ``_run_step`` call)."""
-    _RECORDER.record_step(name, started_at, duration_seconds)
+def record_step(
+    name: str,
+    started_at: str,
+    duration_seconds: float,
+    metrics: dict[str, Any] | None = None,
+) -> None:
+    """Append a top-level step timing (one entry per ``_run_step`` call).
+
+    ``metrics`` is the telemetry summary for the step's window, as
+    returned by :func:`src.utils.telemetry.summarise_since`.  It is
+    optional so callers that do not sample (tests, embedders) keep the
+    three-argument form.
+    """
+    _RECORDER.record_step(name, started_at, duration_seconds, metrics)
 
 
 def time_cell(step: str, **labels: Any):

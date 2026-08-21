@@ -70,6 +70,15 @@ dev = [
 carbon = [
     "codecarbon>=2.4,<3.0",
 ]
+# Optional high-fidelity probes for src/utils/telemetry.py.  Without
+# them telemetry still runs: GPU readings fall back to a long-lived
+# ``nvidia-smi`` reader and CPU accounting to ``resource.getrusage``,
+# which undercounts DataLoader workers still alive.  With them, both
+# are read in-process.
+telemetry = [
+    "nvidia-ml-py>=12.535,<13.0; platform_system == 'Linux'",
+    "psutil>=5.9,<7.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

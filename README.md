@@ -764,16 +764,19 @@ Every `main.py` invocation writes a manifest to `results/runs/<run_id>/manifest.
 - `dataloader_autotune`: tier picked from the cgroup memory budget plus the resolved `num_workers`, `prefetch_factor`, `batch_size`.
 - `package_versions`: versions of `torch`, `transformers`, `numpy`, and the other pinned dependencies.
 - `config_snapshot`: every YAML merged into a single dict.
-- `steps`: list of `{name, started_at, duration_seconds}`, one entry per step. Condition-aware, so `fuse (frozen)` and `fuse (finetuned)` are separate entries.
+- `steps`: list of `{name, started_at, duration_seconds, telemetry}`, one entry per step. Condition-aware, so `fuse (frozen)` and `fuse (finetuned)` are separate entries.
+- `telemetry`: run-level rollup — total GPU energy, total FLOPs, bytes downloaded, plus the probe backends and FLOP calibrations that produced them.
 - `started_at`, `finished_at`, `duration_seconds`, `exit_status`.
 
-A sidecar `results/runs/<run_id>/step_timings.json` records per-cell wall-time: one entry per `(dataset, extractor, dim)` for `extract`, per `(dataset, extractor)` for `finetune` and `evaluate_finetuning`, per `(dataset, model_key)` for `evaluate`. Each entry carries a `labels` dict with the cell identity for direct use in downstream notebooks.
+Each step's `telemetry` block answers how fast it ran and what it cost, not just how long it took: min / max / mean of GPU utilisation, power and memory, CPU usage and the relevant throughput series (`network_mb_per_s` for `download`, `flops_per_s` and `items_per_s` for the model steps), plus `energy_joules` integrated from sampled GPU power. Sampling is on by default at 1 Hz and configurable under `telemetry:` in `configs/default.yaml`.
+
+A sidecar `results/runs/<run_id>/step_timings.json` records per-cell wall-time and the same telemetry block, scoped to the cell: one entry per `(dataset, extractor, dim)` for `extract`, per `(dataset, extractor)` for `finetune` and `evaluate_finetuning`, per `(dataset, model_key)` for `evaluate`. Each entry carries a `labels` dict with the cell identity for direct use in downstream notebooks.
 
 To cite specific results, archive the manifest alongside the publication (for example as a Zenodo release with a DOI). Anyone can then reproduce the run with `git checkout <sha>` plus the recorded package versions.
 
 Manifests where `exit_status` is not `"ok"` document an aborted run and should not be cited as authoritative results.
 
-See [`docs/observability.md`](docs/observability.md) for the full schema and recipes for plotting the timings in `pandas`.
+See [`docs/observability.md`](docs/observability.md) for the full schema and recipes for plotting the timings and telemetry in `pandas`.
 
 ---
 

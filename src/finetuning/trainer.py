@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.finetuning.checkpoint import split_state_dict
+from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
 from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import capture_rng_states, restore_rng_states
@@ -166,6 +167,19 @@ class FineTuner:
         for module in self._frozen_norms:
             module.eval()
 
+    def _account_flops(self, images: torch.Tensor, *, training: bool = False) -> None:
+        """Attribute this batch's compute to the run's telemetry counters.
+
+        Training batches are charged ``TRAINING_MULTIPLIER x`` the
+        forward cost to account for the backward pass; validation
+        batches are charged the forward only.
+        """
+        key = f"{self.extractor_name}::finetune::{tuple(images.shape[1:])}"
+        flops.calibrate(key, self.model, images[:1])
+        n = int(images.shape[0])
+        flops.record(key, n, training=training)
+        telemetry.add_items(n)
+
     def train(
         self,
         train_loader: DataLoader,
@@ -259,6 +273,7 @@ class FineTuner:
                 with cuda_autocast(enabled=use_amp):
                     logits = self.model(images)
                     loss = criterion(logits, labels)
+                self._account_flops(images, training=True)
 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -347,6 +362,7 @@ class FineTuner:
                 labels = labels.to(self.device, non_blocking=True)
                 with cuda_autocast(enabled=use_amp):
                     logits = self.model(images)
+                self._account_flops(images)
                 correct += (logits.argmax(1) == labels).sum().item()
                 total += len(labels)
         return correct / max(total, 1)

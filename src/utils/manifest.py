@@ -7,9 +7,11 @@ working tree was dirty, the merged config snapshot, the random seed,
 the hardware, and the curated package versions.
 
 :func:`finish_run` is called at the end (in a ``finally`` block in
-``main.py``) and adds the finish timestamp plus the wall-clock
-duration.  A manifest without a ``finished_at`` field is, by
-construction, the trace of an interrupted run.
+``main.py``) and adds the finish timestamp, the wall-clock duration,
+the per-step timing + telemetry list and a run-level ``telemetry``
+rollup (energy, FLOPs, bytes downloaded).  A manifest without a
+``finished_at`` field is, by construction, the trace of an interrupted
+run.
 
 Manifests are deliberately *not* committed: they are execution
 artefacts, not source.  The ``results/`` directory is gitignored.
@@ -134,6 +136,7 @@ def finish_run(
     # Per-cell durations live in the sidecar step_timings.json so the
     # manifest stays small.
     manifest["steps"] = collect_step_timings()
+    manifest["telemetry"] = _telemetry_summary(manifest["steps"])
     manifest["duration_seconds"] = round(finished_epoch - started_epoch, 3)
     manifest["exit_status"] = exit_status
 
@@ -144,6 +147,53 @@ def finish_run(
         exit_status,
         manifest["duration_seconds"],
     )
+
+
+def _telemetry_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run-level rollup of the per-step telemetry blocks.
+
+    Individual steps carry their own ``telemetry`` entry; this adds the
+    totals a reader wants without summing by hand — which steps were
+    measured, the FLOP calibrations that produced the compute figures,
+    and the energy of the run as a whole.
+    """
+    from src.utils import flops
+    from src.utils import telemetry as telemetry_mod
+
+    summary: dict[str, Any] = {"probes": telemetry_mod.probes()}
+
+    calibrations = flops.calibrated()
+    if calibrations:
+        summary["flops_per_sample"] = {k: round(v, 1) for k, v in calibrations.items()}
+        summary["training_multiplier"] = flops.TRAINING_MULTIPLIER
+
+    measured = [s for s in steps if s.get("telemetry")]
+    if not measured:
+        return summary
+
+    total_energy = 0.0
+    total_flops = 0.0
+    total_bytes = 0
+    for step in measured:
+        block = step["telemetry"]
+        cost = block.get("cost") or {}
+        throughput = block.get("throughput") or {}
+        total_energy += float(cost.get("energy_joules") or 0.0)
+        total_flops += float(throughput.get("total_flops") or 0.0)
+        total_bytes += int(throughput.get("total_bytes") or 0)
+
+    totals: dict[str, Any] = {"steps_measured": len(measured)}
+    if total_energy:
+        totals["energy_joules"] = round(total_energy, 2)
+        totals["energy_wh"] = round(total_energy / 3600.0, 5)
+    if total_flops:
+        totals["total_flops"] = total_flops
+        totals["total_petaflops"] = round(total_flops / 1e15, 6)
+    if total_bytes:
+        totals["total_downloaded_gb"] = round(total_bytes / (1024**3), 3)
+    summary["totals"] = totals
+
+    return summary
 
 
 def _make_run_id() -> str:

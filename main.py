@@ -155,6 +155,7 @@ def _slice_steps(start: str | None, stop: str | None) -> list[str]:
 
 def _run_step(name: str, condition: str | None) -> None:
     """Invoke a step, passing ``condition`` only when the step accepts it."""
+    from src.utils import telemetry
     from src.utils.timing import now_iso, record_step
 
     fn = STEP_FUNCTIONS[name]
@@ -162,15 +163,57 @@ def _run_step(name: str, condition: str | None) -> None:
     logger.info("===== %s =====", label)
     started_iso = now_iso()
     started = time.time()
-    if name in CONDITION_STEPS:
-        fn(condition=condition)
-    elif name == "statistical":
-        fn(condition=condition or "frozen")
-    else:
-        fn()
-    duration = time.time() - started
+    marker = telemetry.mark()
+    try:
+        if name in CONDITION_STEPS:
+            fn(condition=condition)
+        elif name == "statistical":
+            fn(condition=condition or "frozen")
+        else:
+            fn()
+    finally:
+        # Record in a finally block so a step that raises still leaves its
+        # partial throughput / cost window in the manifest — that is exactly
+        # the run a reader needs telemetry for.
+        duration = time.time() - started
+        metrics = telemetry.summarise_since(marker)
+        record_step(label, started_iso, duration, metrics)
     logger.info("===== %s done in %.1fs =====", label, duration)
-    record_step(label, started_iso, duration)
+    _log_step_telemetry(label, metrics)
+
+
+def _log_step_telemetry(label: str, metrics: dict[str, Any] | None) -> None:
+    """Echo the headline throughput / cost figures into the run log.
+
+    The manifest holds the full breakdown; this one line exists so a
+    researcher watching ``docker logs -f`` sees immediately whether a
+    step was network-bound, compute-bound or idle.
+    """
+    if not metrics:
+        return
+
+    parts: list[str] = []
+    throughput = metrics.get("throughput") or {}
+    net = throughput.get("network_mb_per_s")
+    if net:
+        parts.append(f"net {net['mean']:.1f} MB/s (min {net.get('min', net['mean']):.1f})")
+    flops = throughput.get("flops_per_s")
+    if flops:
+        parts.append(f"compute {flops['mean'] / 1e12:.2f} TFLOP/s")
+
+    cost = metrics.get("cost") or {}
+    gpu = cost.get("gpu_util_percent")
+    if gpu:
+        parts.append(f"gpu {gpu['mean']:.0f}%")
+    power = cost.get("gpu_power_watts")
+    if power:
+        parts.append(f"{power['mean']:.0f} W")
+    energy = cost.get("energy_wh")
+    if energy:
+        parts.append(f"{energy:.2f} Wh")
+
+    if parts:
+        logger.info("      %s telemetry: %s", label, " | ".join(parts))
 
 
 def _run_steps(names: list[str], condition: str | None, run_both_conditions: bool) -> None:
@@ -724,6 +767,7 @@ def _run_single(
     run_both: bool,
 ) -> Path:
     """Execute the full pipeline once and return the run directory."""
+    from src.utils import telemetry
     from src.utils.carbon import tracker as carbon_tracker
     from src.utils.manifest import finish_run, start_run
     from src.utils.timing import bind_run_dir
@@ -731,6 +775,9 @@ def _run_single(
     results_root = Path(config.get("paths", {}).get("results", "results"))
     run_dir = start_run(config_snapshot=config, results_root=results_root / "runs")
     bind_run_dir(run_dir)
+    # One sampler for the whole invocation; every step and cell slices its
+    # own window out of the shared series.
+    telemetry.start(config, run_dir)
     exit_status = "ok"
     try:
         with carbon_tracker(run_dir):
@@ -743,6 +790,9 @@ def _run_single(
         exit_status = "error"
         raise
     finally:
+        # Stop before finish_run: the manifest records the probe backends
+        # and the sampler flushes its raw series here.
+        telemetry.stop()
         finish_run(run_dir, exit_status=exit_status)
         _print_post_run_summary(run_dir, exit_status)
     return run_dir
@@ -834,10 +884,24 @@ def _print_post_run_summary(run_dir: Path, exit_status: str) -> None:
         print(" Most expensive steps:")
         for s in top:
             print(f"   {s['name']:32s}  {_format_duration(s['duration_seconds'])}")
+
+    totals = (manifest.get("telemetry") or {}).get("totals") or {}
+    if totals:
+        print(" Measured cost:")
+        if "energy_wh" in totals:
+            print(f"   GPU energy                        {totals['energy_wh']:.2f} Wh")
+        if "total_petaflops" in totals:
+            print(f"   Compute                           {totals['total_petaflops']:.4f} PFLOPs")
+        if "total_downloaded_gb" in totals:
+            print(f"   Downloaded                        {totals['total_downloaded_gb']:.2f} GB")
+
     print(f" Manifest:        {manifest_path}")
     sidecar = Path(run_dir) / "step_timings.json"
     if sidecar.exists():
         print(f" Per-cell timings: {sidecar}")
+    samples = Path(run_dir) / "telemetry_samples.jsonl"
+    if samples.exists():
+        print(f" Telemetry series: {samples}")
     print("=" * 72)
 
 

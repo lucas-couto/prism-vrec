@@ -39,8 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml ./
 COPY src ./src
 COPY plugins ./plugins
+# The ``telemetry`` extra adds NVML + psutil so per-step GPU power and
+# multi-process CPU accounting are read in-process.  Both are small,
+# pure-binding wheels; without them telemetry degrades to an
+# ``nvidia-smi`` subprocess and getrusage (see src/utils/telemetry.py).
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -e .
+    && python -m pip install -e ".[telemetry]"
 
 # Copy the rest of the source tree.
 COPY . .

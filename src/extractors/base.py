@@ -8,6 +8,7 @@ import torch.nn as nn
 from torchvision import transforms
 from tqdm import tqdm
 
+from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast
 from src.utils.atomic_io import atomic_np_save
 from src.utils.logging import get_logger
@@ -230,6 +231,28 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
             embedding = self.model(tensor)
         return embedding.float().squeeze(0).cpu().numpy()
 
+    def _account_flops(
+        self,
+        images: torch.Tensor,
+        *,
+        forward=None,
+        tag: str = "pooled",
+        training: bool = False,
+    ) -> None:
+        """Attribute this batch's compute to the run's telemetry counters.
+
+        The first call for a given ``(extractor, tag, input shape)``
+        measures one sample under the dispatch counter; every later call
+        is a multiplication.  Keying on ``shape[1:]`` rather than the full
+        shape keeps a trailing partial batch from forcing a second
+        calibration, since the cached value is already per-sample.
+        """
+        key = f"{type(self).__name__}::{tag}::{tuple(images.shape[1:])}"
+        flops.calibrate(key, forward or self.model, images[:1])
+        n = int(images.shape[0])
+        flops.record(key, n, training=training)
+        telemetry.add_items(n)
+
     def extract_batch(
         self,
         dataloader,
@@ -291,6 +314,7 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
                 images = images.to(self.device)
                 with cuda_autocast(enabled=use_amp):
                     embeddings = self.model(images)
+                self._account_flops(images)
                 embeddings = embeddings.float().cpu().numpy()
 
                 all_embeddings.append(embeddings)
@@ -382,6 +406,7 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
                 images = images.to(self.device)
                 with cuda_autocast(enabled=use_amp):
                     components = self._forward_components(images)
+                self._account_flops(images, forward=self._forward_components, tag="components")
                 all_components.append(components.float().cpu().numpy())
                 if isinstance(item_ids, torch.Tensor):
                     all_item_ids.extend(item_ids.tolist())

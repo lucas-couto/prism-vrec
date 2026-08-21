@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from src.evaluation.protocol import Evaluator
+from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
 from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import (
@@ -188,6 +189,22 @@ def _save_best_model(
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
+def _account_flops(model, users, pos_items, neg_items) -> None:
+    """Attribute one BPR training batch to the run's telemetry counters.
+
+    Matrix-factorisation recommenders are embedding lookups plus
+    elementwise products, which the FLOP counter deliberately does not
+    attribute; those models therefore contribute ``items_per_s`` and no
+    ``flops_per_s``.  Attention-based recommenders dispatch real
+    matmuls and are counted.  See :mod:`src.utils.flops`.
+    """
+    key = f"{type(model).__name__}::train"
+    flops.calibrate(key, model, (users[:1], pos_items[:1], neg_items[:1]))
+    n = int(users.shape[0])
+    flops.record(key, n, training=True)
+    telemetry.add_items(n)
+
+
 def train_single_run(
     model_cls,
     model_name: str,
@@ -318,6 +335,7 @@ def train_single_run(
                 with cuda_autocast(enabled=use_cuda):
                     score_pos, score_neg = model(users, pos_items, neg_items)
                     loss = model.bpr_loss(score_pos, score_neg)
+                _account_flops(model, users, pos_items, neg_items)
 
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()

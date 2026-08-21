@@ -49,7 +49,7 @@ dataset_contracts:
 
 # k-core filtering applied during preprocessing
 preprocessing:
-  n_min: 5  # minimum interactions per user and per item
+  n_min: 5 # minimum interactions per user and per item
 
 # =============================================================================
 # Pipeline orchestration (consumed by main.py)
@@ -78,6 +78,25 @@ pipeline:
   # Which condition to run for fuse / train / evaluate steps.
   # "frozen", "finetuned" or "both" (runs each twice in order).
   condition: "both"
+
+# =============================================================================
+# Per-step throughput and cost telemetry
+# =============================================================================
+# A background thread samples GPU utilisation / power / memory and CPU
+# usage while the pipeline runs; every step and every cell records the
+# min / max / mean of that window plus the integrated GPU energy into
+# the run manifest.  Overhead is one thread at 1 Hz.
+#
+# GPU power requires NVML: install the `telemetry` extra
+# (`pip install -e .[telemetry]`) for the in-process binding, otherwise
+# the framework falls back to a long-lived `nvidia-smi` reader, and
+# finally to torch (memory only, no energy).
+telemetry:
+  enabled: true
+  sample_interval_seconds: 1.0
+  # Set to true to also dump the raw per-sample series to
+  # results/runs/<run_id>/telemetry_samples.jsonl for plotting.
+  save_samples: true
 
 # =============================================================================
 # DataLoader sizing (optional)

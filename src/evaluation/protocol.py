@@ -26,6 +26,7 @@ import torch
 from tqdm import tqdm
 
 from src.evaluation.metrics import compute_all_metrics
+from src.utils import telemetry
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -296,6 +297,7 @@ class Evaluator:
         results: list[dict] = []
         for user_id in tqdm(self.test_users, desc="Evaluating"):
             scores = model.predict(user_id, all_items)
+            telemetry.add_items(1)
             if isinstance(scores, torch.Tensor):
                 user_scores = scores.cpu().numpy()
             else:
@@ -332,6 +334,10 @@ class Evaluator:
             user_ids_tensor = torch.tensor(batch_user_ids, dtype=torch.long, device=device)
 
             batch_scores = model.predict_batch(user_ids_tensor, all_items)
+            # Inference throughput is measured in users ranked per second;
+            # see src.utils.flops on why scoring dispatches no counted FLOPs
+            # for factorisation models.
+            telemetry.add_items(len(batch_user_ids))
 
             for i, user_id in enumerate(batch_user_ids):
                 idx = self._train_idx_gpu.get(user_id)
@@ -442,6 +448,7 @@ class Evaluator:
         """
         results: list[dict] = []
         for user_id in tqdm(self.test_users, desc="Evaluating (sampled)"):
+            telemetry.add_items(1)
             positives = self.test_interactions[user_id]
             if not positives:
                 continue

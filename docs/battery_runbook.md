@@ -76,7 +76,9 @@ uv run python main.py --battery --retry-failed
   rank, n_candidates, tie_block_size, top-20) + `<cell_key>.meta.json`
   (dataset, visual config, recommender, seed, d, protocol version).
 - **Manifest:** `results/battery/manifest.json` (state + `git_sha`,
-  `git_dirty`, per-cell durations).
+  `git_dirty`, per-cell durations and a per-cell `telemetry` block with
+  GPU utilisation / power / memory, CPU usage and integrated energy —
+  see [`observability.md`](observability.md)).
 - **Best-trial checkpoints:** `results/models/<dataset>/`.
 - **Optuna studies:** `results/optuna/battery.db`.
 

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from src.battery.cells import BatteryCell, enumerate_cells
 from src.battery.manifest import BatteryManifest, is_cell_complete, project_cost
+from src.utils import telemetry
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,6 +63,29 @@ def run_battery(
     manifest.save()
     git = _git_meta()
 
+    # The battery does not go through ``main._run_single``, so it starts its
+    # own sampler; without this a battery run — the framework's main
+    # experimental workhorse — would be the one path with no cost figures.
+    telemetry.start(config, results_dir)
+    try:
+        _run_cells(cells, manifest, config, results_dir, execute, retry_failed, git)
+    finally:
+        telemetry.stop()
+
+    logger.info("Battery run finished: %s", manifest.summary())
+    return manifest
+
+
+def _run_cells(
+    cells: list,
+    manifest: BatteryManifest,
+    config: dict,
+    results_dir: str | Path,
+    execute: CellExecutor,
+    retry_failed: bool,
+    git: dict,
+) -> None:
+    """Execute every not-yet-done cell, recording state as it goes."""
     for cell in cells:
         key = cell.key()
         state = manifest.state_of(key)
@@ -76,12 +100,14 @@ def run_battery(
         manifest.set_state(key, "running", **git)
         manifest.save()
         started = time.perf_counter()
+        marker = telemetry.mark()
         try:
             extra = execute(cell, config) or {}
             manifest.set_state(
                 key,
                 "done",
                 duration_seconds=round(time.perf_counter() - started, 3),
+                telemetry=telemetry.summarise_since(marker),
                 error=None,
                 **extra,
             )
@@ -91,12 +117,10 @@ def run_battery(
                 key,
                 "failed",
                 duration_seconds=round(time.perf_counter() - started, 3),
+                telemetry=telemetry.summarise_since(marker),
                 error=str(exc),
             )
         manifest.save()
-
-    logger.info("Battery run finished: %s", manifest.summary())
-    return manifest
 
 
 def battery_status(results_dir: str | Path) -> dict:
