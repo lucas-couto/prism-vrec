@@ -30,7 +30,7 @@ from src.utils.artifact_names import (
 from src.utils.config import load_config
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
-from src.utils.timing import time_cell
+from src.utils.timing import note_skipped_cell, time_cell
 
 logger = get_logger(__name__)
 
@@ -346,6 +346,7 @@ def run(condition: str = "frozen") -> None:
             pending = [t for t in targets if (t, mn, en) not in done]
             if not pending:
                 logger.info("  %s/%s: already done, skipping.", mn, en)
+                note_skipped_cell()
                 continue
 
             logger.info("  Evaluating: %s/%s -> %s", mn, en, pending)

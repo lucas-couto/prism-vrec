@@ -160,3 +160,83 @@ def test_reset_clears_steps_cells_and_bind(tmp_path):
     with timing.time_cell("extract", x=2):
         pass
     assert (tmp_path / "step_timings.json").read_text()
+
+
+# ---------------------------------------------------------------------
+# Skipped cells: work that was already done on an earlier run must not
+# be timed or costed, otherwise re-running a finished pipeline reports a
+# fraction of a second and zero energy for an hour-long extraction.
+# ---------------------------------------------------------------------
+
+
+def test_skipped_cell_leaves_no_entry():
+    with timing.time_cell("extract", dataset="tradesy", extractor="resnet50") as cell:
+        cell.skip("embeddings already on disk")
+
+    assert timing.cell_timings() == []
+
+
+def test_skipped_cell_is_still_counted():
+    with timing.time_cell("extract", dataset="tradesy", extractor="resnet50") as cell:
+        cell.skip()
+
+    assert timing.cell_counts() == (0, 1)
+
+
+def test_unskipped_cell_is_recorded_as_before():
+    with timing.time_cell("extract", dataset="tradesy", extractor="resnet50") as cell:
+        assert cell.skipped is False
+
+    assert len(timing.cell_timings()) == 1
+    assert timing.cell_counts() == (1, 0)
+
+
+def test_skipped_cell_is_not_written_to_the_sidecar(tmp_path):
+    timing.bind_run_dir(tmp_path)
+
+    with timing.time_cell("extract", dataset="tradesy", extractor="resnet50") as cell:
+        cell.skip()
+
+    assert not (tmp_path / "step_timings.json").exists()
+
+
+def test_note_skipped_cell_counts_without_a_timer():
+    timing.note_skipped_cell()
+    timing.note_skipped_cell()
+
+    assert timing.cell_counts() == (0, 2)
+
+
+def test_record_step_marks_skipped_and_drops_telemetry():
+    timing.record_step(
+        "extract",
+        "2026-05-14T10:00:00Z",
+        0.4,
+        {"cost": {"energy_wh": 0.0}},
+        skipped=True,
+    )
+
+    [entry] = timing.step_timings()
+    assert entry["skipped"] is True
+    assert "telemetry" not in entry
+
+
+def test_record_step_keeps_telemetry_when_not_skipped():
+    timing.record_step(
+        "extract",
+        "2026-05-14T10:00:00Z",
+        900.0,
+        {"cost": {"energy_wh": 42.0}},
+    )
+
+    [entry] = timing.step_timings()
+    assert entry["telemetry"] == {"cost": {"energy_wh": 42.0}}
+    assert "skipped" not in entry
+
+
+def test_reset_clears_the_skipped_counter():
+    timing.note_skipped_cell()
+
+    timing.reset_for_tests()
+
+    assert timing.cell_counts() == (0, 0)

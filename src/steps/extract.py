@@ -129,7 +129,7 @@ def _extract_for_config(
     device: str,
     config: dict,
     extract_components: bool = False,
-) -> None:
+) -> bool:
     """Extract native-dim embeddings for a single ``(extractor, dataset)`` cell.
 
     Writes the pooled ``<extractor>.npy`` at the backbone's native
@@ -138,6 +138,11 @@ def _extract_for_config(
     ``supports_components``, additionally writes the 3-D
     ``<extractor>_comp.npy`` (native per-item components) consumed by
     ACF.  Both outputs are skipped independently when already present.
+
+    :returns:
+        ``True`` when something was actually extracted, ``False`` when
+        every output already existed.  The caller uses this to keep
+        no-op cells out of ``step_timings.json``.
     """
     out_dir = Path(embeddings_dir) / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,7 +155,7 @@ def _extract_for_config(
 
     if not need_pooled and not need_components:
         logger.info("  %s: already exists, skipping.", extractor_name)
-        return
+        return False
 
     logger.info("  Extracting %s (native dim)...", extractor_name)
     extractor = extractor_cls(device=device)
@@ -211,6 +216,8 @@ def _extract_for_config(
             components.shape,
         )
 
+    return True
+
 
 def run() -> None:
     """Extract native-dim embeddings for every configured ``(extractor, dataset)``."""
@@ -265,8 +272,8 @@ def run() -> None:
                 "extract",
                 dataset=dataset_name,
                 extractor=extractor_name,
-            ):
-                _extract_for_config(
+            ) as cell:
+                did_work = _extract_for_config(
                     extractor_cls=extractor_cls,
                     extractor_name=extractor_name,
                     dataset_name=dataset_name,
@@ -279,5 +286,7 @@ def run() -> None:
                     config=config,
                     extract_components=extract_components,
                 )
+                if not did_work:
+                    cell.skip("embeddings already on disk")
 
     logger.info("Embedding extraction complete.")

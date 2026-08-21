@@ -221,6 +221,7 @@ def train_single_run(
     device: str,
     optuna_trial=None,
     item_categories=None,
+    ranking_budget_bytes: int | None = None,
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -233,6 +234,13 @@ def train_single_run(
         metric is reported every ``eval_every_epochs`` and the loop
         raises :class:`optuna.TrialPruned` whenever the configured
         Optuna pruner decides the trial is not promising.
+    ranking_budget_bytes:
+        GPU bytes the periodic validation ranking may hold, forwarded to
+        :class:`~src.evaluation.protocol.Evaluator`.  A parallel worker
+        runs under ``torch.cuda.set_per_process_memory_fraction``, a cap
+        the device query cannot see, so the worker states its own
+        allowance here.  ``None`` lets the evaluator derive one from the
+        device.
     """
     logger = get_logger(f"train_{model_name}")
 
@@ -314,6 +322,7 @@ def train_single_run(
         sample_size=eval_sample_size,
         sample_seed=eval_sample_seed,
         tiebreak_seed=base_seed,
+        ranking_budget_bytes=ranking_budget_bytes,
     )
 
     loss_device = torch.device(device) if use_cuda else torch.device("cpu")

@@ -353,12 +353,61 @@ def _run_grid(
         n_workers=n_workers,
         device=device,
         log_dir="logs",
+        per_worker_bytes=_estimate_worker_bytes(jobs, processed_dir),
     )
 
     results = orchestrator.run(jobs)
 
     ok = sum(1 for r in results if r.get("status") == "ok")
     logger.info("Training complete: %d/%d experiments succeeded.", ok, len(jobs))
+
+
+#: Host RAM a training worker needs on top of its data: the Python
+#: interpreter, the imported torch stack and the process's CUDA context.
+_WORKER_BASE_BYTES = 1536 * 1024**2
+
+#: Interaction dicts (``{user: set(items)}``) are far larger in memory
+#: than the CSV they come from — boxed ints inside per-user sets.  This
+#: multiplier converts the on-disk CSV size into a resident estimate.
+_INTERACTIONS_MEMORY_FACTOR = 40
+
+
+def _estimate_worker_bytes(jobs: list[TrainingJob], processed_dir: str) -> int:
+    """Estimate the host RAM one training worker holds.
+
+    Workers are spawned, not forked, so nothing is shared: each one
+    caches the full visual embedding matrix plus the train/val
+    interaction dicts for the datasets it touches.  The estimate takes
+    the worst case across *jobs* (largest embedding file, largest
+    interaction file) so the pool is sized for the heaviest cell rather
+    than the average one.
+
+    Returns ``0`` when nothing can be measured, which
+    :func:`src.utils.parallel.detect_max_workers` reads as "unknown"
+    and leaves the VRAM heuristic untouched.
+    """
+
+    def _size(path: str | Path) -> int:
+        try:
+            return Path(path).stat().st_size
+        except OSError:
+            return 0
+
+    emb_bytes = max(
+        (_size(job.embeddings_path) for job in jobs if job.embeddings_path),
+        default=0,
+    )
+    inter_bytes = max(
+        (
+            _size(Path(processed_dir) / job.dataset_name / "train.csv")
+            + _size(Path(processed_dir) / job.dataset_name / "val.csv")
+            for job in jobs
+        ),
+        default=0,
+    )
+    if emb_bytes == 0 and inter_bytes == 0:
+        return 0
+    return _WORKER_BASE_BYTES + emb_bytes + inter_bytes * _INTERACTIONS_MEMORY_FACTOR
 
 
 def _legit_trial_count(study) -> int:
