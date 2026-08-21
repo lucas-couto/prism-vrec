@@ -8,6 +8,16 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **GPU reservation in `docker-compose.yml`.** The `pipeline` and
+  `shell` services now declare a `deploy.resources.reservations.devices`
+  entry for the NVIDIA driver. The file previously assumed a host whose
+  Docker daemon uses `nvidia-container-runtime` *as its default runtime*
+  (RunPod, lab servers); on a workstation with the toolkit installed the
+  normal way, no GPU was passed through and `device: "auto"` silently
+  resolved to `cpu`.
+
 ## [2.5.0] - 2026-08-05
 
 ### Changed
