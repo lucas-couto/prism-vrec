@@ -96,6 +96,29 @@ class DataLoaderConfig(BaseModel):
     batch_size: int | None = Field(None, ge=1)
 
 
+class TelemetryConfig(BaseModel):
+    """Per-step throughput and cost sampling (``src.utils.telemetry``).
+
+    Enabled by default: one background thread at 1 Hz is negligible
+    next to the work the pipeline does, and a run whose manifest lacks
+    cost figures cannot be compared against one that has them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    sample_interval_seconds: float = Field(1.0, gt=0, le=60)
+    save_samples: bool = Field(
+        False,
+        description=(
+            "Also write the raw per-sample series to "
+            "``telemetry_samples.jsonl`` in the run directory, for "
+            "plotting utilisation over time.  The manifest always "
+            "carries the aggregates regardless."
+        ),
+    )
+
+
 class PipelineConfig(BaseModel):
     """Pipeline orchestration knobs consumed by ``main.py``."""
 
@@ -333,6 +356,7 @@ class FrameworkConfig(BaseModel):
     preprocessing: PreprocessingConfig = Field(default_factory=PreprocessingConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
 
     extractors_enabled: list[str] = Field(default_factory=list)
     extractors: dict[str, dict[str, Any]] = Field(default_factory=dict)

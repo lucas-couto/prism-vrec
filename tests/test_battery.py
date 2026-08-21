@@ -253,3 +253,34 @@ class TestExecuteCellSeedIsolation:
         assert seen["train_results"] == str(tmp_path / "res") + "_seed7"
         assert seen["train_eval_results"] == str(tmp_path / "res") + "_seed7"
         assert seen["f_out"] == str(tmp_path / "res")
+
+
+class TestBatteryTelemetry:
+    """The battery bypasses main._run_single, so it samples on its own."""
+
+    def test_should_record_telemetry_per_cell(self, tmp_path) -> None:
+        from src.utils import telemetry
+
+        telemetry.reset_for_tests()
+        proc, emb = _fixture(tmp_path)
+        execute, _ = _make_light_execute(tmp_path)
+
+        config = {**_CONFIG, "telemetry": {"enabled": True, "sample_interval_seconds": 0.05}}
+        manifest = run_battery(config, tmp_path, execute, processed_dir=proc, embeddings_dir=emb)
+
+        entries = list(manifest.cells.values())
+        assert entries
+        assert all("telemetry" in e for e in entries)
+        assert all(e["telemetry"]["sample_interval_seconds"] == 0.05 for e in entries)
+
+    def test_should_stop_the_sampler_when_the_battery_finishes(self, tmp_path) -> None:
+        from src.utils import telemetry
+
+        telemetry.reset_for_tests()
+        proc, emb = _fixture(tmp_path)
+        execute, _ = _make_light_execute(tmp_path)
+
+        run_battery(_CONFIG, tmp_path, execute, processed_dir=proc, embeddings_dir=emb)
+
+        # A leaked sampler thread would outlive the run and keep sampling.
+        assert telemetry.is_active() is False

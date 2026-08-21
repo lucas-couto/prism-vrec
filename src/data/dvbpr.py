@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from src.data.base import DatasetProvider, register_dataset_provider
 from src.data.categories import derive_categories, write_categories_csv
+from src.utils import telemetry
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -157,6 +158,11 @@ class DVBPRDataLoader(DatasetProvider):
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         fout.write(chunk)
                         pbar.update(len(chunk))
+                        # Feeds the network-throughput series in the run
+                        # manifest.  Counting here rather than reading
+                        # /proc/net/dev isolates this download from any
+                        # other traffic sharing the host interface.
+                        telemetry.add_bytes(len(chunk))
 
                 final_size = partial_path.stat().st_size
                 if expected_size is not None and final_size != expected_size:
@@ -416,6 +422,8 @@ class DVBPRDataLoader(DatasetProvider):
 
                 dest.write_bytes(img_bytes)
                 extracted += 1
+                # Preprocessing is disk-bound; items/s is its throughput.
+                telemetry.add_items(1)
             except Exception as exc:  # noqa: BLE001 — count and keep going
                 # A genuine extraction failure (corrupt bytes, disk full,
                 # permission) is distinct from an item that simply has no

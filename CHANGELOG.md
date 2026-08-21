@@ -8,6 +8,65 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-08-21
+
+### Added
+
+- **Per-step throughput and cost telemetry.** Every pipeline step and
+  every profiled cell now records, alongside its wall-time, how fast it
+  ran and what it cost. A background sampler (`src/utils/telemetry.py`,
+  1 Hz by default) reads GPU utilisation / power / memory and
+  process-tree CPU / RSS; each step reports the min, max and mean of
+  those series over its own window plus the trapezoidal integral of GPU
+  power as `energy_joules`. Download steps additionally report
+  `network_mb_per_s`; model steps report `flops_per_s` and
+  `items_per_s`. The manifest gains a run-level `telemetry` rollup
+  (total energy, total FLOPs, bytes downloaded) and names the probe
+  backends that produced the readings, so a manifest is self-describing
+  about its own measurement quality.
+
+  FLOPs are accounted analytically: the first batch through a given
+  `(model, input shape)` is measured once under torch's
+  `FlopCounterMode` and the hot loop then multiplies that per-sample
+  constant by the number of samples (`src/utils/flops.py`). Leaving the
+  dispatch counter active would cost 10-30 % of pipeline wall-clock for
+  a number that is fixed in advance, since every backbone here runs at
+  a fixed resolution. The measured constants are recorded in the
+  manifest so the arithmetic is auditable. Training batches are charged
+  the customary `3 x` forward approximation, flagged as such rather
+  than presented as measured.
+
+  Coverage includes the battery runner, which does not go through
+  `main._run_single`: it starts its own sampler and records a
+  `telemetry` block per cell in `results/battery/manifest.json`,
+  alongside the per-cell duration already tracked there.
+
+  One documented limitation: throughput *counters* (FLOPs, items,
+  bytes) are incremented in-process, so work done inside forked workers
+  — Optuna inter-cell parallelism, DataLoader workers — does not reach
+  them; a parallel `train` step reports accurate energy and utilisation
+  but no `items_per_s`. The sampled *gauges* (GPU, CPU, RSS) do cover
+  the whole process tree. This mirrors the existing constraint on
+  per-cell timings for parallel HP search.
+
+  Enabled by default and configurable under `telemetry:` in
+  `configs/default.yaml`. A new `telemetry` extra
+  (`pip install -e .[telemetry]`, already in the Docker image) installs
+  NVML and psutil for in-process probing; without it telemetry degrades
+  to a long-lived `nvidia-smi` reader and `getrusage` rather than
+  switching off. Complements — does not replace — the optional
+  codecarbon integration, which reports whole-system energy and CO2 for
+  the whole run rather than GPU energy per step. See
+  `docs/observability.md`.
+
+- **GPU reservation in `docker-compose.yml`.** The `pipeline` and
+  `shell` services now declare a `deploy.resources.reservations.devices`
+  entry for the NVIDIA driver. The file previously assumed a host whose
+  Docker daemon uses `nvidia-container-runtime` *as its default runtime*
+  (RunPod, lab servers); on a workstation with the toolkit installed the
+  normal way, no GPU was passed through and `device: "auto"` silently
+  resolved to `cpu`.
+
 ## [2.5.0] - 2026-08-05
 
 ### Changed

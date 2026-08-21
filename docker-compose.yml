@@ -28,6 +28,17 @@ services:
       - model_cache:/root/.cache
     working_dir: /app
     entrypoint: ["python", "main.py"]
+    # Expose the host GPU.  Requires nvidia-container-toolkit on the host
+    # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
+    # toolkit this reservation makes the failure loud instead of silently
+    # falling back to CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: on-failure:3
     shm_size: "4g"
     # Allocate a pseudo-TTY so tqdm renders live in-place progress bars
@@ -84,6 +95,17 @@ services:
       - model_cache:/root/.cache
     working_dir: /app
     entrypoint: ["bash"]
+    # Expose the host GPU.  Requires nvidia-container-toolkit on the host
+    # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
+    # toolkit this reservation makes the failure loud instead of silently
+    # falling back to CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     stdin_open: true
     tty: true
     shm_size: "4g"
