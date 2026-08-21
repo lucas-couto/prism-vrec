@@ -8,6 +8,8 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-08-21
+
 ### Added
 
 - **Per-step throughput and cost telemetry.** Every pipeline step and
