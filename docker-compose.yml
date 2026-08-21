@@ -41,6 +41,20 @@ services:
               capabilities: [gpu]
     restart: on-failure:3
     shm_size: "4g"
+    # Hard cap on container memory.  Without it the container's cgroup is
+    # unlimited: a runaway worker pool then exhausts the *host's* RAM and
+    # the kernel declares a global OOM, killing the desktop session
+    # instead of the run.  The cap is also what lets the in-container
+    # sizing heuristics (src/utils/memory.py, src/utils/dataloader.py)
+    # read a real budget rather than the host's total RAM.
+    #
+    # Default 24g suits a 32 GB workstation (8 GB left for the host).
+    # Override per host, e.g. on a 128 GB lab server:
+    #   PRISM_MEM_LIMIT=112g docker compose up -d
+    # memswap_limit equal to mem_limit disables swap for the container,
+    # so hitting the cap kills one worker instead of thrashing the disk.
+    mem_limit: ${PRISM_MEM_LIMIT:-24g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-24g}
     # Allocate a pseudo-TTY so tqdm renders live in-place progress bars
     # (download, image extraction, feature extraction, evaluation,
     # training). Follow them with a raw stream — ``docker logs -f
@@ -78,6 +92,8 @@ services:
         trap 'rm -f "$$OVERRIDE"' EXIT
         python main.py --from download --to preprocess
     shm_size: "2g"
+    mem_limit: ${PRISM_MEM_LIMIT:-24g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-24g}
 
   shell:
     build: .
@@ -109,6 +125,8 @@ services:
     stdin_open: true
     tty: true
     shm_size: "4g"
+    mem_limit: ${PRISM_MEM_LIMIT:-24g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-24g}
 
 volumes:
   model_cache:

@@ -14,6 +14,15 @@ Captures wall-clock durations at two granularities:
   audit how long every ``(dataset, extractor)`` or
   ``(dataset, embedding, recommender)`` combination took.
 
+A cell that found its output already on disk did no work, so timing
+and costing it is meaningless: it would report a fraction of a second
+and zero energy for an extraction that actually cost an hour on an
+earlier run.  Such a cell calls :meth:`Cell.skip` on the handle
+``time_cell`` yields and leaves no entry behind.  A step whose cells
+were *all* skipped is recorded as ``skipped`` with no telemetry block,
+so re-running a finished pipeline no longer dilutes the manifest with
+no-op windows.
+
 Both levels accumulate in a module-level singleton so a step
 deeply nested in a loop never has to thread a recorder through
 every function signature.  The recorder is thread-safe (multiple
@@ -47,12 +56,38 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class Cell:
+    """Handle yielded by :func:`time_cell` so a cell can disown itself.
+
+    A step that discovers its output already exists calls :meth:`skip`;
+    the surrounding context manager then records nothing at all.
+    """
+
+    __slots__ = ("skipped", "reason")
+
+    def __init__(self) -> None:
+        self.skipped = False
+        self.reason: str | None = None
+
+    def skip(self, reason: str | None = None) -> None:
+        """Mark this cell as "no work done" so it is never recorded.
+
+        :param reason:
+            Optional human-readable note (e.g. ``"embeddings exist"``).
+            Kept for the caller's own logging; it is not persisted,
+            because a skipped cell produces no entry.
+        """
+        self.skipped = True
+        self.reason = reason
+
+
 class _TimingRecorder:
     """Process-wide accumulator (thread-safe; not subprocess-safe)."""
 
     def __init__(self) -> None:
         self._steps: list[dict[str, Any]] = []
         self._cells: list[dict[str, Any]] = []
+        self._skipped_cells = 0
         self._run_dir: Path | None = None
         self._lock = Lock()
 
@@ -66,13 +101,18 @@ class _TimingRecorder:
         started_at: str,
         duration_seconds: float,
         metrics: dict[str, Any] | None = None,
+        skipped: bool = False,
     ) -> None:
         entry: dict[str, Any] = {
             "name": name,
             "started_at": started_at,
             "duration_seconds": round(duration_seconds, 3),
         }
-        if metrics:
+        if skipped:
+            # No new work: the window measured only the existence checks,
+            # so its throughput and cost figures describe nothing.
+            entry["skipped"] = True
+        elif metrics:
             entry["telemetry"] = metrics
         with self._lock:
             self._steps.append(entry)
@@ -85,36 +125,54 @@ class _TimingRecorder:
         with self._lock:
             return list(self._cells)
 
+    def cell_counts(self) -> tuple[int, int]:
+        """Return ``(recorded, skipped)`` cell counts so far."""
+        with self._lock:
+            return len(self._cells), self._skipped_cells
+
+    def note_skipped_cell(self) -> None:
+        with self._lock:
+            self._skipped_cells += 1
+
     def reset(self) -> None:
         """Clear all accumulated state.  Test-only escape hatch."""
         with self._lock:
             self._steps.clear()
             self._cells.clear()
+            self._skipped_cells = 0
             self._run_dir = None
 
     @contextmanager
-    def time_cell(self, step: str, **labels: Any) -> Iterator[None]:
+    def time_cell(self, step: str, **labels: Any) -> Iterator[Cell]:
+        cell = Cell()
         started_at = _now_iso()
         start_perf = time.perf_counter()
         marker = telemetry.mark()
         try:
-            yield
+            yield cell
         finally:
-            duration = round(time.perf_counter() - start_perf, 3)
-            entry: dict[str, Any] = {
-                "step": step,
-                "started_at": started_at,
-                "duration_seconds": duration,
-                "labels": labels,
-            }
-            # The cell slices the same run-wide sample series the enclosing
-            # step will slice, so nesting costs nothing extra.
-            metrics = telemetry.summarise_since(marker)
-            if metrics:
-                entry["telemetry"] = metrics
-            with self._lock:
-                self._cells.append(entry)
-                self._flush_unsafe()
+            if cell.skipped:
+                # Nothing ran: counted, not recorded.  The count is what
+                # lets ``_run_step`` tell "step did no new work" from
+                # "step has no cells at all" (download, preprocess).
+                with self._lock:
+                    self._skipped_cells += 1
+            else:
+                duration = round(time.perf_counter() - start_perf, 3)
+                entry: dict[str, Any] = {
+                    "step": step,
+                    "started_at": started_at,
+                    "duration_seconds": duration,
+                    "labels": labels,
+                }
+                # The cell slices the same run-wide sample series the
+                # enclosing step will slice, so nesting costs nothing extra.
+                metrics = telemetry.summarise_since(marker)
+                if metrics:
+                    entry["telemetry"] = metrics
+                with self._lock:
+                    self._cells.append(entry)
+                    self._flush_unsafe()
 
     def _flush_unsafe(self) -> None:
         """Persist the cell list to disk; caller already holds the lock."""
@@ -147,6 +205,7 @@ def record_step(
     started_at: str,
     duration_seconds: float,
     metrics: dict[str, Any] | None = None,
+    skipped: bool = False,
 ) -> None:
     """Append a top-level step timing (one entry per ``_run_step`` call).
 
@@ -154,8 +213,12 @@ def record_step(
     returned by :func:`src.utils.telemetry.summarise_since`.  It is
     optional so callers that do not sample (tests, embedders) keep the
     three-argument form.
+
+    ``skipped`` marks a step that found all of its work already done.
+    Its entry carries ``skipped: true`` and no telemetry, because the
+    measured window covers existence checks rather than computation.
     """
-    _RECORDER.record_step(name, started_at, duration_seconds, metrics)
+    _RECORDER.record_step(name, started_at, duration_seconds, metrics, skipped)
 
 
 def time_cell(step: str, **labels: Any):
@@ -165,6 +228,14 @@ def time_cell(step: str, **labels: Any):
 
         with time_cell("extract", dataset=name, extractor=ext, dim=d):
             do_extraction()
+
+    The manager yields a :class:`Cell`.  A cell that turns out to have
+    nothing to do disowns itself, leaving no entry in
+    ``step_timings.json``::
+
+        with time_cell("extract", dataset=name, extractor=ext) as cell:
+            if not _extract_for_config(...):
+                cell.skip("embeddings exist")
 
     *labels* are arbitrary keyword arguments that end up under
     ``labels`` in the JSON entry.  They make every line in
@@ -183,6 +254,27 @@ def step_timings() -> list[dict[str, Any]]:
 def cell_timings() -> list[dict[str, Any]]:
     """Return a copy of the recorded per-cell timings."""
     return _RECORDER.cells()
+
+
+def note_skipped_cell() -> None:
+    """Count one cell that was skipped *before* a timer was ever started.
+
+    Steps whose skip decision is available up front (``evaluate``,
+    ``evaluate_finetuning``) short-circuit before entering
+    :func:`time_cell`.  They call this instead so the step-level
+    "did no new work" verdict sees them, without paying for a context
+    manager that would record nothing.
+    """
+    _RECORDER.note_skipped_cell()
+
+
+def cell_counts() -> tuple[int, int]:
+    """Return ``(recorded, skipped)`` cell counts for the whole run.
+
+    ``main._run_step`` snapshots this before and after each step to tell
+    whether the step did any new work.
+    """
+    return _RECORDER.cell_counts()
 
 
 def reset_for_tests() -> None:

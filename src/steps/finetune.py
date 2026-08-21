@@ -73,13 +73,20 @@ def _finetune_and_extract(
     device: str,
     split_seed: int,
     backbone_weights_path: Path | None = None,
-) -> None:
-    """Fine-tune one extractor and re-extract native-dim embeddings."""
+) -> bool:
+    """Fine-tune one extractor and re-extract native-dim embeddings.
+
+    :returns:
+        ``True`` when fine-tuning and/or re-extraction actually ran,
+        ``False`` when the fine-tuned embeddings already existed.  The
+        caller uses this to keep no-op cells out of
+        ``step_timings.json``.
+    """
 
     output_path = Path(embeddings_dir) / dataset_name / f"{extractor_name}_finetuned.npy"
     if output_path.exists():
         logger.info("  %s finetuned embeddings already exist, skipping.", extractor_name)
-        return
+        return False
 
     weights_path = Path(f"checkpoints/finetuning/{extractor_name}_{dataset_name}_best.pt")
     weights_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +255,8 @@ def _finetune_and_extract(
     meta_path = output_path.with_suffix("").with_suffix(".meta.json")
     payload = json.dumps(meta, indent=2)
     atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
+
+    return True
     logger.info("  %s finetuned: saved (%s)", extractor_name, embeddings.shape)
 
 
@@ -323,9 +332,9 @@ def run() -> None:
                 continue
 
             try:
-                with time_cell("finetune", dataset=dataset_name, extractor=ext_name):
+                with time_cell("finetune", dataset=dataset_name, extractor=ext_name) as cell:
                     if has_categories:
-                        _finetune_and_extract(
+                        did_work = _finetune_and_extract(
                             extractor_name=ext_name,
                             dataset_name=dataset_name,
                             image_dir=image_dir,
@@ -352,6 +361,7 @@ def run() -> None:
                                     f"missing transfer weights from {tradesy_transfer_from}",
                                 ),
                             )
+                            cell.skip("no transfer weights available")
                             continue
 
                         logger.info(
@@ -359,7 +369,7 @@ def run() -> None:
                             dataset_name,
                             tradesy_transfer_from,
                         )
-                        _finetune_and_extract(
+                        did_work = _finetune_and_extract(
                             extractor_name=ext_name,
                             dataset_name=dataset_name,
                             image_dir=image_dir,
@@ -372,6 +382,8 @@ def run() -> None:
                             backbone_weights_path=transfer_weights,
                         )
 
+                    if not did_work:
+                        cell.skip("finetuned embeddings already on disk")
                     succeeded.append(job_label)
             except KeyboardInterrupt:
                 raise

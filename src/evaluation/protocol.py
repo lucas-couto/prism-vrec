@@ -34,6 +34,68 @@ logger = get_logger(__name__)
 
 ProtocolName = Literal["full_ranking", "sampled"]
 
+#: Number of top items persisted per user for downstream inspection
+#: (the ``_top_items`` column).  Together with ``max_k`` it bounds how
+#: much of each full ranking is ever read back.
+TOP_ITEMS_PERSISTED = 20
+
+#: Bytes of GPU memory the batched ranking holds per ``(user, item)``
+#: pair at its peak: the score matrix and its tie-break reordering
+#: (fp32, 4 B each), the sort permutation (int64, 8 B) and the workspace
+#: ``torch.sort`` allocates for a stable sort (~12 B, values + indices).
+#: Rounded up — overestimating costs a smaller batch, underestimating
+#: costs an OOM mid-grid.
+RANKING_BYTES_PER_ELEMENT = 28
+
+#: Share of a process's GPU allowance the ranking buffers may take when
+#: the caller does not state a budget.  The remainder covers the model,
+#: its embedding tables, the optimiser state and the autograd graph.
+_DEFAULT_RANKING_VRAM_FRACTION = 0.35
+
+
+def plan_ranking_batch(requested: int, n_items: int, budget_bytes: int) -> int:
+    """Clamp a user-batch size to what the ranking buffers can afford.
+
+    Scoring ``B`` users against ``N`` items allocates ``B * N`` elements
+    several times over (see :data:`RANKING_BYTES_PER_ELEMENT`), so a
+    batch size that is comfortable on a 166K-item catalogue overflows on
+    a 348K-item one.  This turns the caller's value into an upper bound
+    and derives the real one from the catalogue size.
+
+    Batching is a pure execution detail here: every row is sorted,
+    masked and scored independently, so the metrics are identical for
+    any batch size.  Only throughput and peak memory change.
+
+    :param requested: The caller's batch size, treated as a maximum.
+    :param n_items: Catalogue size ``N``.
+    :param budget_bytes: GPU bytes the ranking buffers may occupy.
+    :returns: Batch size in ``[1, requested]``.
+    """
+    if n_items <= 0 or budget_bytes <= 0:
+        return max(1, requested)
+    per_user = n_items * RANKING_BYTES_PER_ELEMENT
+    return max(1, min(requested, int(budget_bytes // per_user)))
+
+
+def default_ranking_budget(device: torch.device) -> int:
+    """GPU bytes one process may spend on ranking buffers, by default.
+
+    A fixed fraction of the device's *total* memory, so the value is
+    reproducible on a given host rather than depending on what else
+    happened to be resident.  Callers that know their real allowance —
+    a training worker capped by
+    ``torch.cuda.set_per_process_memory_fraction`` — pass it explicitly
+    instead.  Returns ``0`` on CPU, where the caller's batch size stands
+    (host RAM is an order of magnitude larger and not the constraint).
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 0
+    try:
+        total = torch.cuda.get_device_properties(device).total_memory
+    except Exception:  # noqa: BLE001 — probing must never break evaluation
+        return 0
+    return int(total * _DEFAULT_RANKING_VRAM_FRACTION)
+
 
 class Evaluator:
     """Full-ranking evaluator with per-user metric computation.
@@ -51,6 +113,13 @@ class Evaluator:
         integer-indexed from ``0`` to ``n_items - 1``).
     k_values:
         List of cut-off positions at which metrics are computed.
+    ranking_budget_bytes:
+        GPU bytes the batched full-ranking buffers may occupy.  Used to
+        derive the real user-batch size from the catalogue size (see
+        :func:`plan_ranking_batch`).  ``None`` derives a default from
+        the device's total memory; a process capped by
+        ``torch.cuda.set_per_process_memory_fraction`` must pass its own
+        allowance, because that cap is invisible to the device query.
     """
 
     def __init__(
@@ -65,6 +134,7 @@ class Evaluator:
         n_negatives: int = 100,
         negative_sampling_seed: int = 42,
         tiebreak_seed: int = 42,
+        ranking_budget_bytes: int | None = None,
     ) -> None:
         if protocol not in ("full_ranking", "sampled"):
             raise ValueError(f"protocol must be 'full_ranking' or 'sampled'; got {protocol!r}")
@@ -79,6 +149,11 @@ class Evaluator:
         self.protocol: ProtocolName = protocol
         self.n_negatives = n_negatives
         self.negative_sampling_seed = negative_sampling_seed
+        #: GPU bytes the batched ranking may hold.  ``None`` means "derive
+        #: from the device"; a training worker running under
+        #: ``set_per_process_memory_fraction`` passes its real allowance,
+        #: which the device cannot report.
+        self.ranking_budget_bytes = ranking_budget_bytes
 
         # Random tie-break key: exact-score ties are broken by ascending
         # ``_tiebreak_key[item]`` instead of ascending item_idx.  item_idx
@@ -316,11 +391,17 @@ class Evaluator:
 
         The hot path keeps everything on GPU as long as possible:
         ``predict_batch`` returns ``(B, N)`` scores, training items are
-        masked in place via ``index_fill_``, and ``torch.topk`` selects
-        the top-K candidates per user.  Only the resulting ``(B, K)``
-        index matrix is transferred to CPU, instead of the full ``(B, N)``
+        masked in place via ``index_fill_``, and only the head of each
+        ranking is transferred to CPU, instead of the full ``(B, N)``
         score matrix.  For amazon_women this shrinks the per-batch GPU→CPU
         transfer from hundreds of MB to ~40 KB.
+
+        *batch_size* is an upper bound, not the value used: ``B * N``
+        elements are allocated several times over, so the real batch is
+        derived from the catalogue size and the process's GPU allowance
+        (see :func:`plan_ranking_batch`).  Every row is ranked and scored
+        independently, so this changes throughput and peak memory only —
+        never the metrics.
         """
         device = all_items.device
         self._ensure_train_idx_cache(device)
@@ -328,6 +409,11 @@ class Evaluator:
         results: list[dict] = []
         n_users = len(self.test_users)
         neg_inf = float("-inf")
+
+        budget = self.ranking_budget_bytes
+        if budget is None:
+            budget = default_ranking_budget(device)
+        batch_size = plan_ranking_batch(batch_size, self.n_items, budget)
 
         for start in tqdm(range(0, n_users, batch_size), desc="Evaluating"):
             batch_user_ids = self.test_users[start : start + batch_size]
@@ -356,9 +442,20 @@ class Evaluator:
             sorted_perm = torch.sort(
                 reordered, dim=1, descending=True, stable=True
             ).indices  # (B, N) — full order (torch.sort already sorts the whole row)
-            full_ranked = order[sorted_perm]  # map back to item ids
-            metrics_top_np = full_ranked[:, : self.max_k].cpu().numpy()
-            top20_np = full_ranked[:, :20].cpu().numpy()  # persisted top-20 (D3)
+            del reordered
+
+            # Only the head of each ranking is ever read back.  Slicing
+            # the permutation BEFORE mapping it to item ids keeps the
+            # gather at (B, keep) instead of allocating a second (B, N)
+            # int64 — 1.4 GB per batch on amazon_women, for columns that
+            # are then thrown away.  The values are unchanged: taking the
+            # first `keep` columns commutes with the element-wise lookup.
+            keep = max(self.max_k, TOP_ITEMS_PERSISTED)
+            top_ranked = order[sorted_perm[:, :keep]]  # (B, keep) item ids
+            del sorted_perm
+
+            metrics_top_np = top_ranked[:, : self.max_k].cpu().numpy()
+            top20_np = top_ranked[:, :TOP_ITEMS_PERSISTED].cpu().numpy()  # persisted (D3)
 
             # Per-user sufficient statistics + tie instrumentation, computed
             # ONCE here and reused by the metric path (dropped) and the
@@ -377,6 +474,10 @@ class Evaluator:
             rank_np = (1 + greater + tied_lower).cpu().numpy()
             n_cand_np = torch.isfinite(batch_scores).sum(dim=1).cpu().numpy()
             tie_blocks_np = tie_mask.sum(dim=1).cpu().numpy()
+            # Everything below is numpy.  Release the (B, N) buffers now,
+            # so the next iteration's predict_batch does not allocate its
+            # scores while this one's are still resident.
+            del batch_scores, tie_mask, top_ranked
 
             for i, user_id in enumerate(batch_user_ids):
                 ground_truth = self.test_interactions[user_id]

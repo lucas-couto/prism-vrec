@@ -8,6 +8,157 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.6.3] - 2026-08-21
+
+### Fixed
+
+- **Full-ranking evaluation no longer OOMs on large catalogues.** A
+  hyperparameter grid failed on essentially every `amazon_women` and
+  `tradesy` cell — hundreds of `OOM on <job_id>` warnings — while
+  `amazon_fashion` passed. The model was never the cause: the same job
+  OOM-ed at `latent_dim=64` and `128`, and always immediately after
+  `Evaluator initialised`.
+
+  `_evaluate_batched` allocated the `(B, N)` matrix four times over: the
+  scores, their tie-break reordering (fp32), the sort permutation and
+  the permutation mapped back to item ids (int64). At 24 B per
+  `(user, item)` pair plus `torch.sort`'s stable-sort workspace, a fixed
+  batch of 512 users needs ~5.7 GB on `amazon_women` (347,591 items) —
+  against the ~6.25 GB each of three workers gets from
+  `set_per_process_memory_fraction(1/3 + 0.05)` on a 16 GB card.
+  `amazon_fashion` (166,270 items) needs ~2.7 GB and fit, which is
+  exactly the split the log shows.
+
+  Three changes, none of which alter a single metric:
+
+  - The full-width `order[sorted_perm]` is gone. Only the first
+    `max(max_k, 20)` columns of each ranking are ever read, so the
+    permutation is sliced *before* being mapped back to item ids — the
+    gather drops from `(B, N)` to `(B, 20)`, saving 1.4 GB per batch.
+    Taking the head commutes with the element-wise lookup, so the values
+    are identical.
+  - The `(B, N)` buffers are released as soon as they are dead, instead
+    of staying resident until rebound on the next iteration.
+  - The user batch is now derived from the catalogue size and the
+    process's GPU allowance (`plan_ranking_batch`) rather than fixed at
+    512, which the caller's value now merely bounds. Every row is
+    ranked, masked and scored independently, so batching is a pure
+    execution detail: `tests/test_ranking_batch_budget.py` pins that a
+    one-user batch produces the same per-user frame as a single big one.
+
+- **OOM retries now actually reduce something.** `TrainingOrchestrator`
+  incremented `retry_count` and put the *same* job back on the queue, so
+  a cell that overflowed once overflowed again on every attempt before
+  being declared unrecoverable. The worker now derives a ranking budget
+  from its own GPU allowance — a cap `torch.cuda.get_device_properties`
+  cannot report, so it is passed explicitly through `train_single_run`
+  to the `Evaluator` — and halves it per retry, which halves the user
+  batch that overflowed. Retries are still deferred to a sequential pass
+  at the end of the grid; that pass runs without the per-process cap, so
+  it also gets the whole device.
+
+## [2.6.2] - 2026-08-21
+
+### Changed
+
+- **Chunked, memory-mapped execution of the offline fusion strategies**
+  (`src/fusions/streaming.py`). The in-memory strategies hold every
+  source matrix, an L2-normalised copy of each, and the fused result at
+  once — ~11.5 GB for a single `concat` on `amazon_women` (resnet50
+  2.85 GB + vit_b16 0.99 GB, their normalised copies, and a 3.84 GB
+  output). `concat`, `pca` and `pca_per_model` now open their sources
+  with `mmap_mode="r"`, process 8192 rows at a time and write straight
+  into a memory-mapped `.npy` via the new
+  `atomic_io.atomic_np_memmap_save`. Peak memory becomes a function of
+  the chunk size rather than the catalogue size: ~200 MB per worker for
+  `concat`, down from ~11.5 GB. The `alignment.method: pca` route gets
+  the same treatment through `stream_pca_align`, which previously loaded
+  every native matrix into the *parent* process at once.
+
+  **The numbers do not change.** L2 normalisation and concatenation are
+  row-wise, so `concat` is bit-identical. The PCA strategies fit on an
+  identically-assembled matrix through the shared
+  `strategies.fit_pca_on_rows` (extracted from `_fit_pca_train_only`,
+  which keeps its behaviour), so the components are identical; only the
+  `transform` is chunked, and each output row depends solely on its own
+  input row. `tests/test_fusion_streaming.py` pins the equivalence
+  against the in-memory functions. Strategies without a row-wise
+  decomposition — including anything from `plugins/fusions/` — keep
+  running through the registry's in-memory path, which remains the
+  contract every strategy is written against.
+
+  The pool sizing added in 2.6.1 is now regime-aware: streamed tasks are
+  charged for one chunk (plus the PCA fit matrix, the one allocation an
+  exact fit cannot avoid), so a catalogue-sized `concat` no longer forces
+  the pool down to a single worker.
+
+### Fixed
+
+- **`pca_per_model` now honours its configured component count.**
+  `_expand_pca_per_model` emitted the kwarg under the YAML spelling
+  (`n_components_per_model`), but `fuse_pca_per_model` consumes
+  `n_components`. The mismatch left the value in `**kwargs`, where
+  `_warn_ignored_kwargs` discarded it, and every task fell back to the
+  signature default of 64. The documented sweep
+  `n_components_per_model: [32, 64, 128]` therefore wrote three
+  *identical* 64-dim matrices under `_nc32`, `_nc64` and `_nc128` — a
+  variable that appeared to be swept and never varied. The YAML key is
+  unchanged; only the kwarg the grid emits was corrected.
+
+  Outputs are unaffected under the shipped `configs/fusion.yaml`, whose
+  single value (64) already matched the default that was being used.
+  Any run that configured a *different* value produced embeddings that
+  do not match their filename and must be re-fused.
+
+## [2.6.1] - 2026-08-21
+
+### Fixed
+
+- **Worker pools are sized against host memory, not just CPU count.** A
+  full run could exhaust system RAM and take the host down with it: the
+  fusion step sized its `ProcessPoolExecutor` at `min(len(pending),
+  os.cpu_count())`, and each worker loads every source `.npy` fully into
+  memory plus a fused output of comparable size. On a 16-core host with
+  the reference catalogues that is 12 workers holding ~14 GB each. The
+  kernel log from the incident shows `constraint=CONSTRAINT_NONE,
+  global_oom` — because the container ran without a memory limit, the
+  OOM killer was not confined to the run and reaped the host's desktop
+  session instead.
+
+  New `src/utils/memory.py` centralises the memory budget (cgroup v2 ->
+  cgroup v1 -> host RAM -> 4 GB fallback, previously private to
+  `src/utils/dataloader.py`) and adds `plan_pool_workers()`, which
+  clamps a caller's CPU/task cap to what actually fits after a 4 GB
+  reserve for the parent process and the host. `src/steps/fuse.py`
+  estimates each task's peak from its source file sizes (sidecar-only
+  tasks cost nothing) and sizes the pool accordingly;
+  `detect_max_workers()` and `TrainingOrchestrator` gained an optional
+  `per_worker_bytes`, which `src/steps/train.py` fills from the largest
+  embedding matrix and interaction file across the pending jobs. The
+  DataLoader autotune is unchanged, it now shares the budget helper.
+
+- **The container can no longer take the host's memory.** All three
+  compose services declare `mem_limit` / `memswap_limit`
+  (`${PRISM_MEM_LIMIT:-24g}`), so an overshoot kills a worker inside the
+  container instead of triggering a global OOM. The limit is also what
+  lets the in-container sizing heuristics read a real cgroup budget
+  rather than the host's total RAM.
+
+### Changed
+
+- **Work that was already done is no longer timed or costed.** Re-running
+  a finished pipeline appended a cell to `step_timings.json` and a full
+  telemetry window to the manifest for every `(dataset, extractor)` that
+  merely found its `.npy` on disk, crediting the run with a fraction of a
+  second and zero energy for an extraction that had cost an hour
+  earlier. `time_cell` now yields a `Cell` handle whose `skip()` leaves
+  no entry behind; `extract` and `finetune` call it when their outputs
+  already exist, and `evaluate` / `evaluate_finetuning`, which
+  short-circuit before the timer starts, call `timing.note_skipped_cell()`
+  instead. A step whose cells were *all* skipped is recorded as
+  `"skipped": true` with no telemetry block. Steps that emit no cells at
+  all (`download`, `preprocess`, `report`) are timed exactly as before.
+
 ## [2.6.0] - 2026-08-21
 
 ### Added

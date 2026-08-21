@@ -202,22 +202,6 @@ def test_describe_captures_active_yaml_overrides(fake_host):
     assert snapshot["yaml_overrides"] == {"num_workers": 9}
 
 
-def test_cgroup_no_limit_sentinel_is_ignored(fake_host, monkeypatch, tmp_path):
-    """A huge cgroup-v1 limit value means 'no limit', not 'plenty of RAM'.
-
-    The kernel reports something close to ``2 ** 63`` when no limit
-    has been set; we must fall through to the next budget source.
-    """
-    # v2 unset, v1 reports the sentinel, host reports 12 GB.
-    monkeypatch.setattr(
-        autotune_mod,
-        "_read_int_file",
-        lambda p: (1 << 63) - 4096 if "memory.limit_in_bytes" in str(p) else None,
-    )
-    monkeypatch.setattr(
-        autotune_mod.os,
-        "sysconf",
-        lambda name: 1024 if name == "SC_PAGE_SIZE" else (12 * 1024**3 // 1024),
-    )
-
-    assert autotune_mod._memory_budget_bytes() == 12 * 1024**3
+# The memory-budget resolution itself (cgroup v2 -> v1 -> host RAM ->
+# fallback) now lives in ``src.utils.memory``, shared with the
+# process-pool sizing; it is covered by tests/test_memory_budget.py.

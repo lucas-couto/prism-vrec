@@ -37,7 +37,7 @@ from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
-from src.utils.timing import time_cell
+from src.utils.timing import note_skipped_cell, time_cell
 
 logger = get_logger(__name__)
 
@@ -160,6 +160,7 @@ def run() -> None:
             if output_path.exists():
                 logger.info("  %s, report exists, skipping.", job_label)
                 skipped.append(job_label)
+                note_skipped_cell()
                 continue
 
             checkpoint = _checkpoint_path(ext_name, dataset_name)

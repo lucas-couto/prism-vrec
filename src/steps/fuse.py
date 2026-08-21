@@ -44,14 +44,42 @@ from src.fusions import (
     iter_specs,
     registered_fusion_strategies,
 )
-from src.fusions.strategies import pca_align
+from src.fusions.streaming import (
+    CHUNK_ROWS,
+    is_streamable,
+    run_streamed,
+    stream_pca_align,
+)
 from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
 from src.utils.logging import get_logger
+from src.utils.memory import plan_pool_workers
 
 logger = get_logger(__name__)
 
 _PCA_STRATEGIES = {"pca", "pca_per_model"}
+
+#: Peak RSS of an *in-memory* fusion worker as a multiple of its source
+#: bytes.  Such a worker holds the loaded sources, the fused output
+#: (``concat`` is the worst case: as large as the sources combined) and
+#: one intermediate copy produced by ``normalize`` — three times the
+#: sources, rounded up because overestimating only costs throughput
+#: while underestimating costs the host.
+_FUSION_PEAK_FACTOR = 3.5
+
+#: Same idea for a streamed worker, applied to *one chunk* rather than
+#: the whole catalogue: the source rows, their normalised copies and the
+#: output slice.
+_STREAM_CHUNK_FACTOR = 3.0
+
+#: And for the one allocation streaming cannot avoid — the PCA fit
+#: matrix.  ``copy=False`` lets scikit-learn centre it in place, so the
+#: matrix itself plus a single source's training rows is the peak.
+_STREAM_FIT_FACTOR = 1.5
+
+#: Interpreter, numpy/scikit-learn and the memmap page cache a worker
+#: touches regardless of catalogue size.
+_WORKER_BASE_BYTES = 512 * 1024**2
 
 
 def _strategies_map(config: dict) -> dict:
@@ -80,6 +108,76 @@ def _train_item_indices(processed_dir: str, dataset_name: str) -> list[int]:
     return sorted(int(i) for i in df["item_idx"].unique())
 
 
+def _source_row_bytes(emb_list_paths: list[str]) -> tuple[int, int]:
+    """Return ``(n_rows, bytes_per_fused_row)`` for a task's sources.
+
+    Read from the ``.npy`` headers via a memory map, so no array data is
+    touched.  Returns ``(0, 0)`` when a source is unreadable — the task
+    will fail anyway, but a missing header must not silently shrink the
+    estimate to zero.
+    """
+    n_rows = 0
+    row_bytes = 0
+    for path in emb_list_paths:
+        try:
+            arr = np.load(path, mmap_mode="r")
+        except (OSError, ValueError):
+            continue
+        n_rows = max(n_rows, int(arr.shape[0]))
+        row_bytes += int(arr.shape[1]) * arr.dtype.itemsize
+    return n_rows, row_bytes
+
+
+def _task_peak_bytes(task: dict) -> int:
+    """Peak resident bytes one fusion *task* is expected to need.
+
+    Three regimes:
+
+    * **Sidecar** (online alignment) — writes a small JSON, never loads
+      an array.  Costs nothing.
+    * **Streamed** (``concat``, ``pca``, ``pca_per_model``) — bounded by
+      the chunk size, plus the PCA fit matrix for the two PCA
+      strategies, which is the one allocation an exact fit cannot avoid.
+    * **In-memory** (anything else, including plugin strategies) — the
+      whole catalogue, several times over.
+    """
+    if task.get("sidecar_payload") is not None:
+        return 0
+
+    n_rows, row_bytes = _source_row_bytes(task.get("emb_list_paths", []))
+    if row_bytes == 0:
+        return 0
+
+    strategy = task.get("strategy_name", "")
+    if not is_streamable(strategy):
+        return int(n_rows * row_bytes * _FUSION_PEAK_FACTOR)
+
+    peak = _WORKER_BASE_BYTES + int(min(n_rows, CHUNK_ROWS) * row_bytes * _STREAM_CHUNK_FACTOR)
+    train_items = task.get("train_items")
+    if train_items is not None:
+        peak += int(len(train_items) * row_bytes * _STREAM_FIT_FACTOR)
+    return peak
+
+
+def _plan_fusion_workers(pending: list[dict]) -> int:
+    """Size the fusion pool from the memory budget, not just the CPU count.
+
+    A worker fusing two native matrices for a 350K-item catalogue peaks
+    at several GB.  Sizing the pool at ``os.cpu_count()`` therefore asks
+    for tens of GB at once and, on a host whose container has no memory
+    limit, triggers a *global* OOM that kills processes outside the
+    container.  The CPU count stays the upper bound; the memory budget
+    lowers it whenever the sources do not fit.
+    """
+    cpu_cap = min(len(pending), os.cpu_count() or 4)
+    per_worker = max((_task_peak_bytes(t) for t in pending), default=0)
+    return plan_pool_workers(
+        per_worker_bytes=per_worker,
+        hard_cap=cpu_cap,
+        label="fusion pool",
+    )
+
+
 def _fuse_single(
     strategy_name: str,
     output_path: str,
@@ -106,6 +204,20 @@ def _fuse_single(
         atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), out)
         return f"{strategy_name} (online): sidecar written -> {out}"
 
+    if is_streamable(strategy_name):
+        # Row-wise strategies never materialise a full matrix: the peak
+        # is bounded by the chunk size instead of the catalogue size.
+        # Same arithmetic, same output (see src/fusions/streaming.py).
+        shape = run_streamed(
+            strategy_name,
+            emb_list_paths,
+            out,
+            normalize=normalize,
+            train_items=train_items,
+            **kwargs,
+        )
+        return f"{strategy_name}: {shape} -> {out}"
+
     emb_list = [np.load(p) for p in emb_list_paths]
     if strategy_name in _PCA_STRATEGIES:
         kwargs["train_items"] = np.asarray(train_items) if train_items is not None else None
@@ -125,7 +237,8 @@ def _ensure_pca_aligned_sources(
     """Materialise per-source PCA-aligned matrices, once per dataset/dim.
 
     Writes ``<ext><suffix>_pcaD<dim>.npy`` next to the native features.
-    Fit is train-item-only (see :func:`pca_align`).  Returns the aligned
+    Fit is train-item-only (see
+    :func:`src.fusions.streaming.stream_pca_align`).  Returns the aligned
     paths, or ``None`` when a native source is missing.
     """
     native_paths = [dataset_dir / f"{ext}{suffix}.npy" for ext in extractors]
@@ -136,11 +249,11 @@ def _ensure_pca_aligned_sources(
     if all(p.exists() for p in aligned_paths):
         return aligned_paths
 
-    natives = [np.load(p) for p in native_paths]
-    aligned = pca_align(natives, dim, train_items=np.asarray(train_items))
-    for arr, path in zip(aligned, aligned_paths, strict=True):
-        atomic_np_save(arr.astype(np.float32), path)
-        logger.info("  pca-aligned source written: %s %s", path.name, arr.shape)
+    # Streamed one source at a time: loading every native matrix at once
+    # put several GB in the *parent* process before any worker started.
+    for native, path in zip(native_paths, aligned_paths, strict=True):
+        shape = stream_pca_align(native, path, dim, np.asarray(train_items))
+        logger.info("  pca-aligned source written: %s %s", path.name, shape)
     return aligned_paths
 
 
@@ -378,9 +491,9 @@ def run(condition: str = "frozen") -> None:
         logger.info("All fusions already exist.")
         return
 
-    logger.info("Running %d fusions in parallel...", len(pending))
+    n_workers = _plan_fusion_workers(pending)
+    logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
 
-    n_workers = min(len(pending), os.cpu_count() or 4)
     completed = 0
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_fuse_single, **task): task for task in pending}

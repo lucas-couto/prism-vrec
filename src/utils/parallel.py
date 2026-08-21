@@ -21,8 +21,23 @@ import torch.multiprocessing as mp
 
 from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
+from src.utils.memory import plan_pool_workers
 
 logger = get_logger(__name__)
+
+#: Share of a worker's GPU allowance the validation ranking may hold.
+#: The remainder covers the model, its embedding tables, the optimiser
+#: state and the autograd graph.
+_RANKING_VRAM_SHARE = 0.5
+
+#: Factor the ranking budget is multiplied by per OOM retry.  Halving
+#: halves the user-batch, which is what actually overflowed: the ranking
+#: buffers scale with ``batch x n_items``, not with the model.
+_OOM_SHRINK_PER_RETRY = 0.5
+
+#: Retries before a job is declared unrecoverable.  At the third attempt
+#: the budget is a quarter of the original.
+MAX_OOM_RETRIES = 2
 
 
 try:
@@ -73,15 +88,28 @@ class TrainingJob:
         return f"{self.dataset_name}_{self.embedding_name}_{self.model_name}_{digest[:6]}"
 
 
-def detect_max_workers(device: str = "cuda") -> int:
-    """Estimate how many training workers fit in GPU VRAM.
+def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
+    """Estimate how many training workers fit in GPU VRAM *and* host RAM.
 
     Uses a simple heuristic based on total VRAM rather than dummy-model
     profiling, because real datasets (100K+ items) use far more memory
     than any small dummy can predict.
+
+    VRAM is only half the constraint: every spawned worker keeps its own
+    copy of the interaction dicts and the visual embedding matrix in
+    host RAM (``spawn`` shares nothing), so a pool sized purely from
+    VRAM can exhaust system memory instead.  When *per_worker_bytes* is
+    given, the host-memory budget lowers the count accordingly; the
+    default of ``0`` means "unknown", which preserves the VRAM-only
+    behaviour for callers that cannot estimate the footprint.
     """
     if device == "cpu" or not torch.cuda.is_available():
-        return max(1, (os.cpu_count() or 4) - 1)
+        cpu_cap = max(1, (os.cpu_count() or 4) - 1)
+        return plan_pool_workers(
+            per_worker_bytes=per_worker_bytes,
+            hard_cap=cpu_cap,
+            label="training pool",
+        )
 
     try:
         total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
@@ -103,7 +131,11 @@ def detect_max_workers(device: str = "cuda") -> int:
         margin_mb,
         n_workers,
     )
-    return n_workers
+    return plan_pool_workers(
+        per_worker_bytes=per_worker_bytes,
+        hard_cap=n_workers,
+        label="training pool",
+    )
 
 
 def _locked_append_grid_progress(path: Path, entry: dict) -> None:
@@ -152,9 +184,21 @@ def _worker_fn(
 
     wlog = _get_logger(f"worker_{worker_id}", log_dir=log_dir)
 
-    if torch.cuda.is_available() and n_workers > 1:
-        fraction = min(0.95, 1.0 / n_workers + 0.05)
-        torch.cuda.set_per_process_memory_fraction(fraction)
+    # The per-process cap and the ranking budget derived from it are the
+    # same decision seen from two sides: torch enforces the cap, and the
+    # evaluator has to size its (batch x n_items) buffers to fit inside
+    # it.  ``set_per_process_memory_fraction`` is invisible to
+    # ``get_device_properties``, so the number has to travel by hand.
+    worker_vram = 0
+    if torch.cuda.is_available():
+        fraction = min(0.95, 1.0 / n_workers + 0.05) if n_workers > 1 else 1.0
+        if n_workers > 1:
+            torch.cuda.set_per_process_memory_fraction(fraction)
+        try:
+            total = torch.cuda.get_device_properties(0).total_memory
+            worker_vram = int(total * fraction)
+        except Exception as exc:  # noqa: BLE001 — probing must not kill the worker
+            wlog.warning("VRAM probe failed (%s); evaluator will size itself.", exc)
 
     checkpoint_mgr = CheckpointManager()
     config = load_config()
@@ -230,6 +274,22 @@ def _worker_fn(
                     _emb_cache[job.embeddings_path] = load_embedding(job.embeddings_path)
                 visual_emb = _emb_cache[job.embeddings_path]
 
+            # Each OOM retry halves the ranking budget, which halves the
+            # user-batch the evaluator can afford.  Without this the job
+            # came back byte-for-byte identical and OOM'd again.
+            ranking_budget = (
+                int(worker_vram * _RANKING_VRAM_SHARE * _OOM_SHRINK_PER_RETRY**job.retry_count)
+                if worker_vram
+                else None
+            )
+            if job.retry_count:
+                wlog.info(
+                    "  Retry %d for %s: ranking budget %.2f GB",
+                    job.retry_count,
+                    job.job_id,
+                    (ranking_budget or 0) / 1024**3,
+                )
+
             best_val = train_single_run(
                 model_cls=model_cls,
                 model_name=job.model_name,
@@ -245,6 +305,7 @@ def _worker_fn(
                 embedding_name=job.embedding_name,
                 device=job.device,
                 item_categories=item_cats,
+                ranking_budget_bytes=ranking_budget,
             )
 
             experiment_key = f"{job.dataset_name}_{job.embedding_name}_{job.model_name}"
@@ -289,10 +350,21 @@ class TrainingOrchestrator:
         n_workers: int = 0,
         device: str = "cuda",
         log_dir: str = "logs",
+        per_worker_bytes: int = 0,
     ) -> None:
+        """Size the pool.
+
+        *per_worker_bytes* is the caller's estimate of the host RAM one
+        worker holds (interaction dicts + visual embeddings + the CUDA
+        context).  It only applies to the auto-detected count: an
+        explicit *n_workers* is honoured verbatim, because pinning the
+        pool is how a researcher overrides the heuristic.
+        """
         self.device = device
         self.log_dir = log_dir
-        self.n_workers = detect_max_workers(device) if n_workers <= 0 else n_workers
+        self.n_workers = (
+            detect_max_workers(device, per_worker_bytes) if n_workers <= 0 else n_workers
+        )
         logger.info("Training orchestrator: %d workers", self.n_workers)
 
     def run(self, jobs: list[TrainingJob]) -> list[dict]:
@@ -387,7 +459,7 @@ class TrainingOrchestrator:
 
             if result["status"] == "oom":
                 retry_count = result.get("retry_count", 0) + 1
-                if retry_count <= 2:
+                if retry_count <= MAX_OOM_RETRIES:
                     for job in jobs:
                         if job.job_id == result["job_id"]:
                             job.retry_count = retry_count

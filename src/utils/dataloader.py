@@ -36,17 +36,15 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 
 from src.utils.logging import get_logger
 
+# The budget itself is shared with the process-pool sizing in
+# :mod:`src.utils.memory`; re-exported under the private name this
+# module has always used so callers (and tests) keep one entry point.
+from src.utils.memory import memory_budget_bytes as _memory_budget_bytes
+
 logger = get_logger(__name__)
-
-# cgroup v1 with no limit set returns a sentinel close to ``2 ** 63``;
-# any value above this threshold is treated as "no limit".
-_CGROUP_NO_LIMIT_THRESHOLD = 1 << 60
-
-_FALLBACK_MEMORY_GB = 4.0  # used when neither cgroup nor sysconf works
 
 
 @dataclass(frozen=True)
@@ -191,41 +189,3 @@ def resolve_dataloader_settings(config: dict | None = None) -> DataLoaderSetting
         prefetch_factor=_pick("prefetch_factor", auto.prefetch_factor),
         batch_size=_pick("batch_size", auto.batch_size),
     )
-
-
-def _memory_budget_bytes() -> int:
-    """Return the strictest memory budget that applies to this process.
-
-    Resolution order: cgroup v2 -> cgroup v1 -> host total memory ->
-    a 4 GB fallback so the function never returns 0.
-    """
-    cgroup_v2 = _read_int_file(Path("/sys/fs/cgroup/memory.max"))
-    if cgroup_v2 is not None and cgroup_v2 < _CGROUP_NO_LIMIT_THRESHOLD:
-        return cgroup_v2
-
-    cgroup_v1 = _read_int_file(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
-    if cgroup_v1 is not None and cgroup_v1 < _CGROUP_NO_LIMIT_THRESHOLD:
-        return cgroup_v1
-
-    try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError):
-        pass
-
-    return int(_FALLBACK_MEMORY_GB * 1024**3)
-
-
-def _read_int_file(path: Path) -> int | None:
-    """Read *path* and parse it as an integer (cgroup interface convention).
-
-    Returns ``None`` when the file does not exist, is unreadable, or
-    contains a non-numeric value (e.g. cgroup v2 ``"max"``).
-    """
-    try:
-        text = path.read_text().strip()
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None

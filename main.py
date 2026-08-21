@@ -156,7 +156,7 @@ def _slice_steps(start: str | None, stop: str | None) -> list[str]:
 def _run_step(name: str, condition: str | None) -> None:
     """Invoke a step, passing ``condition`` only when the step accepts it."""
     from src.utils import telemetry
-    from src.utils.timing import now_iso, record_step
+    from src.utils.timing import cell_counts, now_iso, record_step
 
     fn = STEP_FUNCTIONS[name]
     label = name if name not in CONDITION_STEPS else f"{name} ({condition})"
@@ -164,6 +164,7 @@ def _run_step(name: str, condition: str | None) -> None:
     started_iso = now_iso()
     started = time.time()
     marker = telemetry.mark()
+    cells_before = cell_counts()
     try:
         if name in CONDITION_STEPS:
             fn(condition=condition)
@@ -177,9 +178,29 @@ def _run_step(name: str, condition: str | None) -> None:
         # the run a reader needs telemetry for.
         duration = time.time() - started
         metrics = telemetry.summarise_since(marker)
-        record_step(label, started_iso, duration, metrics)
+        no_new_work = _did_no_new_work(cells_before, cell_counts())
+        if no_new_work:
+            # Every cell found its output already on disk.  Timing and
+            # costing that window would credit this run with an hour of
+            # extraction it never performed.
+            metrics = None
+        record_step(label, started_iso, duration, metrics, skipped=no_new_work)
     logger.info("===== %s done in %.1fs =====", label, duration)
     _log_step_telemetry(label, metrics)
+
+
+def _did_no_new_work(before: tuple[int, int], after: tuple[int, int]) -> bool:
+    """True when a step ran only cells that were already done.
+
+    *before* / *after* are ``(recorded, skipped)`` snapshots from
+    :func:`src.utils.timing.cell_counts`.  Requiring at least one
+    skipped cell is what keeps steps that emit no cells at all
+    (``download``, ``preprocess``, ``report``) out of the skipped
+    bucket: they are timed as usual.
+    """
+    recorded = after[0] - before[0]
+    skipped = after[1] - before[1]
+    return recorded == 0 and skipped > 0
 
 
 def _log_step_telemetry(label: str, metrics: dict[str, Any] | None) -> None:

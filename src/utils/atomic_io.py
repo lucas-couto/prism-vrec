@@ -23,6 +23,7 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -111,5 +112,51 @@ def atomic_np_save(array: np.ndarray, path: str | Path) -> None:
     def _write(tmp: str) -> None:
         with open(tmp, "wb") as handle:
             np.save(handle, array)
+
+    atomic_write(_write, path)
+
+
+def atomic_np_memmap_save(
+    path: str | Path,
+    *,
+    dtype: Any,
+    shape: tuple[int, ...],
+    fill: Callable[[np.memmap], None],
+) -> None:
+    """Build a ``.npy`` on disk through a writable memmap, atomically.
+
+    The streaming counterpart of :func:`atomic_np_save`: instead of
+    taking a fully materialised array, it allocates the destination on
+    disk and hands *fill* a writable view to populate in pieces.  Peak
+    memory is therefore whatever *fill* holds at once, not the size of
+    the result — the difference between a few hundred MB and tens of GB
+    for a catalogue-sized fusion.
+
+    The result is an ordinary ``.npy`` that :func:`numpy.load` reads
+    back as the equivalent array, and the same crash-safety guarantees
+    apply: the destination is either the previous file or the complete
+    new one.
+
+    Args:
+        path: Destination file; its parent directory is created if absent.
+        dtype: dtype of the array to create.
+        shape: Shape of the array to create.
+        fill: Callback receiving the writable memmap.  It must populate
+            every element; unwritten regions are zeros.
+
+    Raises:
+        Exception: Re-raises whatever *fill* raises, after removing the
+            temp file, so *path* is never left partial.
+    """
+
+    def _write(tmp: str) -> None:
+        handle = np.lib.format.open_memmap(tmp, mode="w+", dtype=dtype, shape=shape)
+        try:
+            fill(handle)
+            handle.flush()
+        finally:
+            # Drop the mapping before the rename: on some platforms a
+            # live mapping keeps the temp inode pinned.
+            del handle
 
     atomic_write(_write, path)

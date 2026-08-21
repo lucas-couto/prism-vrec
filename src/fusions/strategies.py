@@ -419,7 +419,6 @@ def _fit_pca_train_only(
     Logs the cumulative explained variance for the chosen ``k``.
     """
     n_components = min(n_components, *matrix.shape)
-    pca = PCA(n_components=n_components, random_state=random_state)
     if train_items is None:
         if not allow_transductive:
             raise ValueError(
@@ -437,10 +436,52 @@ def _fit_pca_train_only(
             label,
         )
         fit_rows = matrix
+        # ``copy=True``: ``fit_rows`` IS ``matrix`` here, and centring it
+        # in place would make the ``transform`` below subtract the mean
+        # from already-centred data.
+        pca = fit_pca_on_rows(fit_rows, n_components, random_state, label, copy=True)
     else:
         fit_rows = matrix[np.asarray(train_items)]
         n_components = min(n_components, *fit_rows.shape)
-        pca = PCA(n_components=n_components, random_state=random_state)
+        pca = fit_pca_on_rows(fit_rows, n_components, random_state, label, copy=True)
+    return pca.transform(matrix)
+
+
+def fit_pca_on_rows(
+    fit_rows: np.ndarray,
+    n_components: int,
+    random_state: int | None,
+    label: str,
+    *,
+    copy: bool = True,
+) -> PCA:
+    """Fit a :class:`~sklearn.decomposition.PCA` on *fit_rows* and log it.
+
+    Factored out of :func:`_fit_pca_train_only` so the streaming
+    executor (:mod:`src.fusions.streaming`) fits the *same* estimator on
+    the *same* rows — identical components, identical outputs — without
+    having to materialise the full matrix it will later transform.
+
+    ``copy=False`` lets scikit-learn centre *fit_rows* in place, halving
+    the peak of the fit.  Pass it only when the caller owns *fit_rows*
+    and will not read it again afterwards.
+
+    :param fit_rows:
+        The rows the components are fit on, shape ``(n_fit, D)``.
+    :param n_components:
+        Component count, already clamped to ``min(k, n_fit, D)`` by the
+        caller.
+    :param random_state:
+        Seed forwarded to scikit-learn, so the randomized solver is
+        reproducible.
+    :param label:
+        Prefix for the log line identifying the strategy and source.
+    :param copy:
+        Forwarded to :class:`~sklearn.decomposition.PCA`.
+    :returns:
+        The fitted estimator.
+    """
+    pca = PCA(n_components=n_components, random_state=random_state, copy=copy)
     pca.fit(fit_rows)
     explained = float(np.sum(pca.explained_variance_ratio_))
     logger.info(
@@ -450,7 +491,7 @@ def _fit_pca_train_only(
         fit_rows.shape[0],
         explained,
     )
-    return pca.transform(matrix)
+    return pca
 
 
 def pca_align(
@@ -613,11 +654,21 @@ def _expand_pca(cfg: dict) -> list[tuple[str, dict]]:
 
 
 def _expand_pca_per_model(cfg: dict) -> list[tuple[str, dict]]:
-    """Expand the ``n_components_per_model`` grid for per-source PCA."""
+    """Expand the ``n_components_per_model`` grid for per-source PCA.
+
+    The YAML key is ``n_components_per_model`` (it reads better next to
+    ``pca``'s joint ``n_components``), but the kwarg handed to
+    :func:`fuse_pca_per_model` must be the one that function actually
+    consumes — ``n_components``.  Emitting the YAML spelling instead
+    left it in ``**kwargs``, where ``_warn_ignored_kwargs`` discarded it
+    and every task silently fell back to the default 64: a configured
+    sweep of ``[32, 64, 128]`` wrote three identical 64-dim matrices
+    under three different ``_nc`` filenames.
+    """
     values = cfg.get("n_components_per_model", [64])
     if not isinstance(values, list):
         values = [values]
-    return [(f"_nc{n}", {"n_components_per_model": n}) for n in values]
+    return [(f"_nc{n}", {"n_components": n}) for n in values]
 
 
 register_fusion_strategy("mean", fuse_mean, equal_dim_required=True)

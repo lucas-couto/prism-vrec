@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from src.fusions.registry import get_fusion_spec
 from src.fusions.strategies import (
     fuse_concat,
     fuse_max_pool,
@@ -121,3 +122,49 @@ def test_empty_embeddings_list_raises() -> None:
     for fn in (fuse_mean, fuse_sum, fuse_prod, fuse_max_pool, fuse_concat):
         with pytest.raises(ValueError):
             fn([], normalize=False)
+
+
+# ---------------------------------------------------------------------
+# Grid expansion: the kwargs a spec emits must be the ones its function
+# consumes, or the sweep silently collapses to the default.
+# ---------------------------------------------------------------------
+
+
+def test_pca_per_model_grid_emits_the_kwarg_the_function_consumes() -> None:
+    """``fuse_pca_per_model`` takes ``n_components``, not the YAML spelling.
+
+    Emitting ``n_components_per_model`` left it in ``**kwargs``, where
+    ``_warn_ignored_kwargs`` discarded it: a configured sweep of
+    ``[32, 64, 128]`` wrote three identical 64-dim matrices under three
+    different ``_nc`` filenames.
+    """
+    spec = get_fusion_spec("pca_per_model")
+
+    grid = spec.expand_grid({"n_components_per_model": [32, 64, 128]})
+
+    assert grid == [
+        ("_nc32", {"n_components": 32}),
+        ("_nc64", {"n_components": 64}),
+        ("_nc128", {"n_components": 128}),
+    ]
+
+
+def test_pca_per_model_grid_kwarg_actually_changes_the_width() -> None:
+    spec = get_fusion_spec("pca_per_model")
+    [(_, kwargs)] = spec.expand_grid({"n_components_per_model": 3})
+    sources = [
+        np.random.default_rng(0).normal(size=(20, 8)).astype(np.float32),
+        np.random.default_rng(1).normal(size=(20, 6)).astype(np.float32),
+    ]
+
+    fused = spec.fn(sources, normalize=True, train_items=np.arange(15), **kwargs)
+
+    assert fused.shape == (20, 6)  # 2 sources x 3 components, not 2 x 64
+
+
+def test_pca_grid_emits_the_kwarg_the_function_consumes() -> None:
+    spec = get_fusion_spec("pca")
+
+    grid = spec.expand_grid({"n_components": [16, 32]})
+
+    assert grid == [("_nc16", {"n_components": 16}), ("_nc32", {"n_components": 32})]

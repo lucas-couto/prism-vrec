@@ -88,6 +88,87 @@ the YAML pinned. There are no environment variable overrides, the YAML
 is the single source of truth so reruns reproduce from `git checkout`
 alone.
 
+## Process-pool sizing
+
+The DataLoader autotune covers loader *threads*. Two steps additionally
+fan work out across worker *processes*, and there the constraint is not
+throughput but survival: a spawned process shares nothing, so each one
+holds its own full copy of whatever it loads.
+
+* **`fuse`** — `concat`, `pca` and `pca_per_model` are executed
+  row-wise by `src/fusions/streaming.py`: sources are memory-mapped,
+  8192 rows are processed at a time and the result is written straight
+  into a memory-mapped `.npy`. A worker holds ~200 MB regardless of
+  catalogue size. The exception is the PCA *fit* matrix — an exact fit
+  needs every training row at once — and any strategy without a
+  row-wise decomposition, which still runs in memory over the whole
+  catalogue.
+* **`train`** (Cartesian grid) — a worker caches the visual embedding
+  matrix and the train/val interaction dicts for every dataset it
+  touches, on top of its CUDA context.
+
+GPU memory has its own bound inside each training worker. Full-ranking
+validation scores `B` users against every item, allocating `B x N`
+elements several times over, so a fixed user batch that fits a
+166K-item catalogue overflows a 348K-item one. `plan_ranking_batch`
+derives the batch from the catalogue size and the process's GPU
+allowance; the caller's `batch_size` is only an upper bound. Because
+every row is ranked and scored independently, this changes throughput
+and peak memory but never the metrics.
+
+The allowance itself has to be passed by hand:
+`torch.cuda.set_per_process_memory_fraction`, which the orchestrator
+applies so N workers share one card, is invisible to
+`torch.cuda.get_device_properties`. The worker therefore computes its
+own share and forwards it through `train_single_run` to the
+`Evaluator`. Each OOM retry halves that budget, which halves the batch
+that overflowed — before this, a retried job came back byte-for-byte
+identical and failed again.
+
+Sizing either pool from `os.cpu_count()` alone asks for tens of GB at
+once. `src/utils/memory.py` clamps the count to what fits:
+
+```
+workers = clamp(1, cpu_or_task_cap, (memory_budget - 4 GB reserve) // per_worker_bytes)
+```
+
+The budget is resolved exactly as for the DataLoader autotune (cgroup
+v2 -> cgroup v1 -> host RAM -> 4 GB fallback). The 4 GB reserve covers
+the parent process, the page cache and — when no cgroup limit confines
+the run — the host's own session. Each caller supplies the footprint
+estimate. For `fuse` it depends on the regime: a sidecar task costs
+nothing, a streamed task costs one chunk (plus the fit matrix for the
+PCA strategies), and an in-memory strategy is charged for the whole
+catalogue several times over. Shapes and dtypes come from the `.npy`
+headers, so nothing is read to produce the estimate. `train` takes the
+largest embedding matrix plus the largest interaction file across the
+pending jobs. A pinned `--workers` is always honoured verbatim.
+
+Lower `src.fusions.streaming.CHUNK_ROWS` to trade fusion throughput for
+an even smaller peak; the output is unaffected by the chunk size.
+
+When the memory budget lowers the count, the run log says so:
+
+```
+fusion pool: memory-capped to 2 workers (budget=20.0 GB after 4.0 GB
+reserve, ~9.7 GB/worker, cpu/task cap was 12)
+```
+
+**Set a container memory limit.** Without one the container's cgroup is
+unlimited, so an overshoot is not contained: the kernel declares a
+*global* OOM and kills processes outside the container — on a
+workstation, the desktop session. The compose services ship with
+`mem_limit: ${PRISM_MEM_LIMIT:-24g}` (and a matching `memswap_limit`,
+so hitting the cap kills a worker instead of thrashing swap). Override
+it per host:
+
+```bash
+PRISM_MEM_LIMIT=112g docker compose up -d      # 128 GB lab server
+```
+
+The limit is also what makes the in-container heuristics read a real
+budget instead of the host's total RAM.
+
 ## Per-step wall-time
 
 `manifest.json` carries a `steps` list with one entry per
@@ -300,6 +381,22 @@ Each entry also carries the same `telemetry` block documented under
 to that cell — so "which backbone drew the most power per image" is a
 group-by, not a separate experiment. It is omitted from the examples
 below for brevity.
+
+**Only new work appears here.** A cell that finds its output already on
+disk did nothing, so timing and costing it would credit this run with a
+fraction of a second and zero energy for an extraction that cost an
+hour on an earlier one. Such cells leave no entry at all. When *every*
+cell of a step was skipped, the step's manifest entry records
+`"skipped": true` and carries no `telemetry` block:
+
+```json
+{"name": "extract", "started_at": "2026-05-14T12:01:35Z",
+ "duration_seconds": 0.4, "skipped": true}
+```
+
+Steps that emit no cells at all (`download`, `preprocess`, `report`)
+are timed and costed exactly as before — absence of cells is not
+evidence of absence of work.
 
 ```json
 [
