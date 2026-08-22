@@ -255,6 +255,27 @@ checkpoint_every: 500 # save partial extraction every N batches
 
 Extraction is **native-dim** (v2 protocol): each extractor saves the backbone's own pooled feature. `raw_dim` is a declaration validated against a probe forward through the real model — a mismatch fails extraction loudly. The learned projection `E` inside each recommender maps the native feature to the shared latent dim (`common.visual_dim` in `recommenders.yaml`).
 
+Optionally, a **fixed linear projection** brings every extractor into one shared width — for a reviewer who asks that all backbones emit, say, 128-d, or to feed the element-wise fusion family equal-dim sources with nothing learned online:
+
+```yaml
+projection:
+  method: pca # none (default) | random | pca
+  dim: 128
+  seed: 42 # method: random only
+```
+
+This writes `<extractor>_p128.npy` **alongside** the native artifact, never in place of it, so native and projected can be trained and compared in the same battery. Two flags then decide what *consumes* them:
+
+```yaml
+# configs/recommenders.yaml — which variants the recommenders train on
+embedding_variants: both # native | projected | both
+
+# configs/fusion.yaml — which variants feed the fusion
+extractor_variants: native # native | projected | both
+```
+
+`extractor_variants: projected` is the shortcut this feature exists for: the sources already share a width, so the whole `alignment:` block is bypassed — nothing learned online, no PCA fit inside the fuse step. Outputs stay apart by the same token (`hybrid_mean` vs `hybrid_mean_p128`), and a hybrid built from projected sources is classified with them by `embedding_variants`. `random` is a seeded semi-orthogonal matrix (data-independent, so it cannot leak val/test items); `pca` is fit on train items only, like the fusion alignment. Any extractor overrides the block under `extractors.<name>.projection`. Already-extracted embeddings are projected in a linear pass — the backbone is not loaded again. Read [`docs/protocol.md` §1b](docs/protocol.md) before reporting a comparison run on projected artifacts: a fixed projection is a variable, not a free normalisation.
+
 To ablate an extractor, just remove its name from `extractors_enabled`, its block under `extractors:` stays as catalogue but the pipeline skips it (and the fine-tuning step skips it too).
 
 ### `configs/fusion.yaml`
@@ -894,7 +915,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.6.4},
+  version = {2.7.0},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }

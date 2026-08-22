@@ -43,6 +43,7 @@ from src.utils.artifact_names import (
     FUSION_PREFIX,
     is_component_artifact,
     is_finetuned_artifact,
+    is_projected_artifact,
 )
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
@@ -52,6 +53,38 @@ from src.utils.parallel import TrainingJob, TrainingOrchestrator
 from src.utils.seed import set_seed
 
 logger = get_logger(__name__)
+
+
+EMBEDDING_VARIANTS = ("native", "projected", "both")
+
+
+def _resolve_embedding_variants(config: dict) -> str:
+    """Read ``embedding_variants`` from the recommender config.
+
+    Selects which of the two artifact families the recommenders are
+    trained on when a fixed projection is configured in
+    ``configs/extractors.yaml``: the backbones' native features, their
+    fixed-dim projections, or both side by side.
+    """
+    value = str(config.get("embedding_variants", "both"))
+    if value not in EMBEDDING_VARIANTS:
+        raise ValueError(
+            f"embedding_variants must be one of {list(EMBEDDING_VARIANTS)}, got {value!r}"
+        )
+    return value
+
+
+def filter_by_variant(names: list[str], variant: str) -> list[str]:
+    """Keep the embedding names belonging to *variant*.
+
+    ``"none"`` — the pseudo-embedding of the non-visual baselines — is
+    never filtered out: it belongs to no artifact family, and dropping
+    it would silently remove plain BPR from a projected-only battery.
+    """
+    if variant == "both":
+        return names
+    want_projected = variant == "projected"
+    return [n for n in names if n == "none" or is_projected_artifact(n) == want_projected]
 
 
 def get_embedding_files(
@@ -133,9 +166,11 @@ def _iter_cells(
     consume this so their notions of "which cells exist" can never drift.
     """
     dim_filter = config.get("embedding_dims", [])
+    variant = _resolve_embedding_variants(config)
 
     for dataset_name in config.get("datasets", []):
         all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
+        all_embs = filter_by_variant(all_embs, variant)
         if condition == "frozen":
             embedding_names = [e for e in all_embs if not is_finetuned_artifact(e)]
         else:

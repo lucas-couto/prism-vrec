@@ -22,6 +22,7 @@ from src.fusions.registry import (
     register_fusion_strategy,
     registered_fusion_strategies,
 )
+from src.fusions.strategies import fit_pca_on_rows
 
 scan_user_fusion_strategies()
 
@@ -29,6 +30,7 @@ scan_user_fusion_strategies()
 __all__ = [
     "AdaptiveGatedFusion",
     "FusionSpec",
+    "fit_pca_on_rows",
     "get_fusion_spec",
     "get_fusion_strategy",
     "is_online_strategy",

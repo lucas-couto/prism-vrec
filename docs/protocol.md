@@ -40,6 +40,51 @@ extraction loudly. Every artifact ships a `.meta.json` sidecar
 (backbone, native dim, extraction point, exact weights id, transform
 recipe); the loader cross-checks features against it.
 
+### 1b. Optional fixed projection to a common dimension (opt-in, off by default)
+
+`projection:` in `configs/extractors.yaml` writes an *additional*
+artifact per extractor, `<extractor>_p<dim>.npy`, carrying a fixed
+linear map of the native feature to one shared width. It exists so the
+element-wise fusion family can consume equal-dim sources without an
+alignment learned online, and so a reviewer who asks for "every
+backbone at 128-d" gets exactly that. The native artifact is untouched
+and both are trainable side by side.
+
+**This re-enables, as an explicit variable, the very thing §1 rejected
+as a default.** `method: random` is the seeded random projection the v1
+protocol was criticised for: a comparison run *only* on
+`<extractor>_p128` artifacts compares "backbone × fixed compression",
+not backbones, and the narrower `dim` is, the more of the difference
+between backbones the compression can absorb. That is a legitimate
+experiment — it is not the headline benchmark. The defensible uses are:
+
+- **As a controlled ablation**, reported next to the native-dim result
+  from the same run, so the cost of the compression is visible rather
+  than assumed away.
+- **As a fusion input**, where the alternative (`alignment: learned`)
+  is itself a projection — a fixed one merely moves it earlier and
+  removes it from the recommender's gradient.
+
+`method: pca` (fit on train items only, mirroring `alignment.method:
+pca`) preserves more variance than `random` and is the better default
+of the two when the projection feeds a comparison; it is
+dataset-dependent, so its basis does not transfer across datasets.
+
+What is *written* (`projection:` in extractors.yaml) and what is
+*consumed* are separate decisions: `embedding_variants` in
+recommenders.yaml (`native` / `projected` / `both`) selects the training
+cells, and `extractor_variants` in fusion.yaml selects the fusion
+sources. `both` is what produces the paired report this section asks
+for. With `extractor_variants: projected` the `alignment:` block is
+bypassed — the sources already share a width — which removes the
+learned alignment from the recommender's gradient and makes the
+projection the only compression in the pipeline.
+
+Provenance is on disk: the projector is saved as
+`<extractor>_p<dim>.proj.npz` with a `.proj.json` describing method,
+dim, seed and fit set, and the artifact's own `.meta.json` records
+`source_native_dim` alongside the projected `native_dim`.
+
 ## 2. Canonical per-backbone preprocessing
 
 The preprocessing recipe is part of the model. Three **distinct

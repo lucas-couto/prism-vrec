@@ -36,6 +36,21 @@ alignment:
   method: learned
   dim: 128
 
+# Which artifact family the fusion sources come from. `fusion_extractors`
+# (extractors.yaml) keeps the logical names; this decides the variant.
+#   native    - the backbones' own widths; the `alignment:` block above
+#               brings them to a common dim (the v2 default)
+#   projected - the <extractor>_p<dim> artifacts written by `projection:`
+#               in extractors.yaml. They ALREADY share a width, so the
+#               `alignment:` block is bypassed entirely: nothing is
+#               learned online and no PCA is fit inside the fuse step
+#   both      - one pass each; outputs are distinguished by the same
+#               _p<dim> token (hybrid_mean vs hybrid_mean_p128)
+# `projected` requires every name in fusion_extractors to have a
+# projection configured, all to the SAME dim — otherwise the sources
+# would not share a space and the run fails loudly.
+extractor_variants: native
+
 strategies:
   # Strategies that require equal dims
   mean: {}

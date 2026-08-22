@@ -11,6 +11,16 @@ recommenders_enabled:
   - deepstyle
   - avbpr
 
+# Which embedding variants the recommenders are trained on, when a fixed
+# projection is configured under `projection:` in extractors.yaml.
+#   native    - the backbones' own widths only (the v2 default)
+#   projected - the fixed-dim <extractor>_p<dim> artifacts only
+#   both      - one cell per variant, so the cost of the projection is
+#               visible instead of assumed
+# Applies to fusion outputs too: a hybrid built from projected sources
+# carries the same token and is classified with them.
+embedding_variants: both
+
 common:
   latent_dim: [64, 128]
   learning_rate: [0.001, 0.01]
