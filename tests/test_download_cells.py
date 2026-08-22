@@ -52,9 +52,7 @@ def _fake_datasets(tmp_path, monkeypatch):
 
     _register("light_ds", 1_000_000)
     _register("heavy_ds", 3_000_000)
-    monkeypatch.setattr(
-        download, "load_config", lambda: {"datasets": ["light_ds", "heavy_ds"]}
-    )
+    monkeypatch.setattr(download, "load_config", lambda: {"datasets": ["light_ds", "heavy_ds"]})
 
 
 def test_each_dataset_gets_its_own_cell(_fake_datasets):

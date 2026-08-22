@@ -33,6 +33,11 @@ Dates are UTC.
 
 ### Fixed
 
+- **The "saved" log line at the end of `_finetune_and_extract` is
+  reachable again.** 2.6.3 inserted the `return True` above it, leaving
+  it as dead code, so a successful re-extraction never logged its
+  output shape (`ruff` RET503). The log now precedes the return.
+
 - **Per-step timings survive an interrupted run.** The step-level list
   — the only place `download`, `preprocess` and `export_best` are timed
   at all, since they open no cells — was written to `manifest.json`
