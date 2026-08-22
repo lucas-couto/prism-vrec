@@ -7,9 +7,15 @@ Captures wall-clock durations at two granularities:
   run manifest under the ``steps`` key.  Always recorded by
   ``main.py``.  The ``telemetry`` block carries throughput and cost
   aggregates for the step's window; see :mod:`src.utils.telemetry`.
+  The manifest only receives this list when the run closes, so the
+  same entries are also flushed after every step into the sidecar
+  ``results/runs/<run_id>/steps.json``.  That is what a researcher
+  reads while the pipeline is still running, and what survives a run
+  that is killed before ``finish_run`` — steps with no cells at all
+  (``preprocess``, ``report``) have no other trace.
 * **Per cell**, opt-in finer-grained log written to
   ``results/runs/<run_id>/step_timings.json``.  Hot loops in the
-  expensive steps (extract, finetune, train, ...) wrap each cell
+  expensive steps (download, extract, finetune, ...) wrap each cell
   with the :func:`time_cell` context manager so a researcher can
   audit how long every ``(dataset, extractor)`` or
   ``(dataset, embedding, recommender)`` combination took.
@@ -57,17 +63,21 @@ def _now_iso() -> str:
 
 
 class Cell:
-    """Handle yielded by :func:`time_cell` so a cell can disown itself.
+    """Handle yielded by :func:`time_cell` so a cell can describe itself.
 
     A step that discovers its output already exists calls :meth:`skip`;
-    the surrounding context manager then records nothing at all.
+    the surrounding context manager then records nothing at all.  A step
+    that only learns part of a cell's identity *while doing the work*
+    (a download that weighs its dataset once the bytes have landed)
+    calls :meth:`label` to add it before the entry is written.
     """
 
-    __slots__ = ("skipped", "reason")
+    __slots__ = ("skipped", "reason", "extra_labels")
 
     def __init__(self) -> None:
         self.skipped = False
         self.reason: str | None = None
+        self.extra_labels: dict[str, Any] = {}
 
     def skip(self, reason: str | None = None) -> None:
         """Mark this cell as "no work done" so it is never recorded.
@@ -79,6 +89,18 @@ class Cell:
         """
         self.skipped = True
         self.reason = reason
+
+    def label(self, **labels: Any) -> None:
+        """Add labels that are only known once the work has run.
+
+        Merged over the labels passed to :func:`time_cell`, so a late
+        value wins over a placeholder of the same name.  Ignored when
+        the cell is skipped, since a skipped cell records nothing.
+
+        :param labels: Arbitrary key/value pairs for the entry's
+            ``labels`` dict (e.g. ``size_mb=812.4``).
+        """
+        self.extra_labels.update(labels)
 
 
 class _TimingRecorder:
@@ -94,6 +116,11 @@ class _TimingRecorder:
     def bind(self, run_dir: Path | str) -> None:
         with self._lock:
             self._run_dir = Path(run_dir)
+            # Anything recorded before the bind (nothing today, but the
+            # order in ``main`` is not this module's to guarantee) is
+            # persisted now rather than waiting for the next entry.
+            self._flush_steps_unsafe()
+            self._flush_cells_unsafe()
 
     def record_step(
         self,
@@ -116,6 +143,7 @@ class _TimingRecorder:
             entry["telemetry"] = metrics
         with self._lock:
             self._steps.append(entry)
+            self._flush_steps_unsafe()
 
     def steps(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -154,7 +182,7 @@ class _TimingRecorder:
             if cell.skipped:
                 # Nothing ran: counted, not recorded.  The count is what
                 # lets ``_run_step`` tell "step did no new work" from
-                # "step has no cells at all" (download, preprocess).
+                # "step has no cells at all" (preprocess, report).
                 with self._lock:
                     self._skipped_cells += 1
             else:
@@ -163,7 +191,7 @@ class _TimingRecorder:
                     "step": step,
                     "started_at": started_at,
                     "duration_seconds": duration,
-                    "labels": labels,
+                    "labels": {**labels, **cell.extra_labels},
                 }
                 # The cell slices the same run-wide sample series the
                 # enclosing step will slice, so nesting costs nothing extra.
@@ -172,14 +200,27 @@ class _TimingRecorder:
                     entry["telemetry"] = metrics
                 with self._lock:
                     self._cells.append(entry)
-                    self._flush_unsafe()
+                    self._flush_cells_unsafe()
 
-    def _flush_unsafe(self) -> None:
+    def _flush_cells_unsafe(self) -> None:
         """Persist the cell list to disk; caller already holds the lock."""
-        if self._run_dir is None:
+        self._write_unsafe("step_timings.json", self._cells)
+
+    def _flush_steps_unsafe(self) -> None:
+        """Persist the step list to disk; caller already holds the lock."""
+        self._write_unsafe("steps.json", self._steps)
+
+    def _write_unsafe(self, filename: str, entries: list[dict[str, Any]]) -> None:
+        """Atomically dump *entries* into ``<run_dir>/<filename>``.
+
+        An empty list writes nothing: a run that recorded no cells
+        should leave no sidecar behind rather than an empty array
+        that reads as "measured, found nothing".
+        """
+        if self._run_dir is None or not entries:
             return
-        path = self._run_dir / "step_timings.json"
-        payload = json.dumps(self._cells, indent=2)
+        path = self._run_dir / filename
+        payload = json.dumps(entries, indent=2)
         try:
             atomic_write(lambda tmp: Path(tmp).write_text(payload), path)
         except OSError as exc:
@@ -193,9 +234,9 @@ def bind_run_dir(run_dir: Path | str) -> None:
     """Bind the global recorder to a run directory.
 
     Called once by :func:`main.main` right after :func:`start_run`.
-    The path is where :func:`time_cell` writes ``step_timings.json``.
-    Until bound, per-cell timings are still accumulated in memory but
-    not persisted.
+    The path is where :func:`time_cell` writes ``step_timings.json``
+    and :func:`record_step` writes ``steps.json``.  Until bound, both
+    levels are still accumulated in memory but not persisted.
     """
     _RECORDER.bind(run_dir)
 
@@ -217,6 +258,9 @@ def record_step(
     ``skipped`` marks a step that found all of its work already done.
     Its entry carries ``skipped: true`` and no telemetry, because the
     measured window covers existence checks rather than computation.
+
+    The updated list is flushed to ``<run_dir>/steps.json`` on every
+    call, so an interrupted run still documents the steps it did run.
     """
     _RECORDER.record_step(name, started_at, duration_seconds, metrics, skipped)
 
@@ -236,6 +280,13 @@ def time_cell(step: str, **labels: Any):
         with time_cell("extract", dataset=name, extractor=ext) as cell:
             if not _extract_for_config(...):
                 cell.skip("embeddings exist")
+
+    A label whose value only exists once the work has run is added on
+    the handle instead, and lands in the same ``labels`` dict::
+
+        with time_cell("download", dataset=name) as cell:
+            provider.download()
+            cell.label(size_mb=weigh(provider.raw_dir))
 
     *labels* are arbitrary keyword arguments that end up under
     ``labels`` in the JSON entry.  They make every line in

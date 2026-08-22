@@ -195,8 +195,9 @@ def _did_no_new_work(before: tuple[int, int], after: tuple[int, int]) -> bool:
     *before* / *after* are ``(recorded, skipped)`` snapshots from
     :func:`src.utils.timing.cell_counts`.  Requiring at least one
     skipped cell is what keeps steps that emit no cells at all
-    (``download``, ``preprocess``, ``report``) out of the skipped
-    bucket: they are timed as usual.
+    (``preprocess``, ``report``) out of the skipped bucket: they are
+    timed as usual.  ``download`` does emit cells, but never skips
+    them, so it is never marked skipped either.
     """
     recorded = after[0] - before[0]
     skipped = after[1] - before[1]

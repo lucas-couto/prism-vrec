@@ -4,8 +4,8 @@ Re-running a finished pipeline used to append a full telemetry window
 per step, attributing seconds of existence checks — and zero energy — to
 an extraction that actually ran for an hour on a previous run.  A step
 whose cells were all skipped is now recorded as ``skipped`` with no
-telemetry, while steps that emit no cells at all (``download``,
-``preprocess``, ``report``) keep being timed as usual.
+telemetry, while steps that emit no cells at all (``preprocess``,
+``report``) keep being timed as usual.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ class TestDidNoNewWork:
         assert main._did_no_new_work((0, 0), (1, 5)) is False
 
     def test_step_without_cells_is_never_marked_skipped(self):
-        """``download`` and ``preprocess`` emit no cells; they must be timed."""
+        """``preprocess`` and ``report`` emit no cells; they must be timed."""
         assert main._did_no_new_work((7, 2), (7, 2)) is False
 
     def test_counts_are_relative_to_the_step_window(self):

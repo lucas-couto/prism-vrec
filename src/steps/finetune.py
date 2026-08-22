@@ -255,9 +255,9 @@ def _finetune_and_extract(
     meta_path = output_path.with_suffix("").with_suffix(".meta.json")
     payload = json.dumps(meta, indent=2)
     atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
+    logger.info("  %s finetuned: saved (%s)", extractor_name, embeddings.shape)
 
     return True
-    logger.info("  %s finetuned: saved (%s)", extractor_name, embeddings.shape)
 
 
 def run() -> None:
