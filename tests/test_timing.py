@@ -113,6 +113,54 @@ def test_time_cell_writes_sidecar_json_after_bind(tmp_path):
     assert payload[0]["labels"] == {"dataset": "ds", "extractor": "vit"}
 
 
+def test_record_step_writes_steps_sidecar_after_bind(tmp_path):
+    """Steps with no cells at all (download) only exist in this file
+    until ``finish_run`` copies the list into the manifest.
+    """
+    timing.bind_run_dir(tmp_path)
+
+    timing.record_step("download", "2026-05-14T10:00:00Z", 12.5)
+
+    sidecar = tmp_path / "steps.json"
+    assert sidecar.exists()
+
+    payload = json.loads(sidecar.read_text())
+    assert payload == [
+        {
+            "name": "download",
+            "started_at": "2026-05-14T10:00:00Z",
+            "duration_seconds": 12.5,
+        }
+    ]
+
+
+def test_steps_sidecar_accumulates_every_step_in_order(tmp_path):
+    """An interrupted run must still document the steps it did run."""
+    timing.bind_run_dir(tmp_path)
+
+    timing.record_step("download", "2026-05-14T10:00:00Z", 1.0)
+    timing.record_step("preprocess", "2026-05-14T10:01:00Z", 2.0)
+
+    payload = json.loads((tmp_path / "steps.json").read_text())
+    assert [entry["name"] for entry in payload] == ["download", "preprocess"]
+
+
+def test_record_step_skips_disk_when_not_bound(tmp_path):
+    timing.record_step("download", "2026-05-14T10:00:00Z", 1.0)
+
+    assert not (tmp_path / "steps.json").exists()
+    assert len(timing.step_timings()) == 1
+
+
+def test_bind_flushes_steps_recorded_before_the_bind(tmp_path):
+    timing.record_step("download", "2026-05-14T10:00:00Z", 1.0)
+
+    timing.bind_run_dir(tmp_path)
+
+    payload = json.loads((tmp_path / "steps.json").read_text())
+    assert [entry["name"] for entry in payload] == ["download"]
+
+
 def test_time_cell_skips_disk_when_not_bound(tmp_path):
     """Without bind_run_dir, the cell is still recorded in memory but
     no sidecar is written, useful for unit tests and smoke runs that
@@ -189,6 +237,35 @@ def test_unskipped_cell_is_recorded_as_before():
 
     assert len(timing.cell_timings()) == 1
     assert timing.cell_counts() == (1, 0)
+
+
+def test_cell_label_merges_into_the_entry_labels():
+    """A weight known only after the work runs still lands on the entry."""
+    with timing.time_cell("download", dataset="tradesy") as cell:
+        cell.label(size_mb=812.4, downloaded_mb=0.0)
+
+    [entry] = timing.cell_timings()
+    assert entry["labels"] == {
+        "dataset": "tradesy",
+        "size_mb": 812.4,
+        "downloaded_mb": 0.0,
+    }
+
+
+def test_cell_label_overrides_a_placeholder_of_the_same_name():
+    with timing.time_cell("download", dataset="tradesy", size_mb=None) as cell:
+        cell.label(size_mb=812.4)
+
+    [entry] = timing.cell_timings()
+    assert entry["labels"]["size_mb"] == 812.4
+
+
+def test_cell_label_on_a_skipped_cell_records_nothing():
+    with timing.time_cell("download", dataset="tradesy") as cell:
+        cell.label(size_mb=812.4)
+        cell.skip("already on disk")
+
+    assert timing.cell_timings() == []
 
 
 def test_skipped_cell_is_not_written_to_the_sidecar(tmp_path):

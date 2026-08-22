@@ -1,15 +1,16 @@
 # Observability
 
 Every `main.py` invocation produces a self-describing snapshot of the run
-under `results/runs/<run_id>/`. Two files live there:
+under `results/runs/<run_id>/`. These files live there:
 
 | File | Purpose |
 |---|---|
-| `manifest.json` | Reproducibility: git SHA, seed, hardware, package versions, config snapshot, per-step wall-time, DataLoader tier. One file per run. |
+| `manifest.json` | Reproducibility: git SHA, seed, hardware, package versions, config snapshot, per-step wall-time, DataLoader tier. Written at start, completed when the run closes. One file per run. |
+| `steps.json` | Live per-step wall-time **and telemetry**, flushed after every step. Same content the finished `manifest.json` carries under `steps`. One file per run. |
 | `step_timings.json` | Profiling: per-cell wall-time **and telemetry** for the expensive steps (extract, finetune, evaluate_finetuning, evaluate). One file per run. |
 | `telemetry_samples.jsonl` | Raw per-sample utilisation series, for plotting. Only written when `telemetry.save_samples: true`. |
 
-Both are gitignored. Archive them alongside published results (for
+All of them are gitignored. Archive them alongside published results (for
 example on Zenodo with a DOI) so a future reader can reconstruct the
 run.
 
@@ -194,6 +195,14 @@ budget instead of the host's total RAM.
 
 The condition suffix is part of `name`, so `fuse (frozen)` and
 `fuse (finetuned)` are separate entries with their own durations.
+
+`manifest.json` only receives this list when the run closes, so the same
+array is flushed to the sidecar `steps.json` after every step. That is
+the file to read while a pipeline is still running, and the one that
+survives a run killed before it could close its manifest. Steps that
+open no cells — `preprocess`, `export_best` — have no trace in
+`step_timings.json` at all, so `steps.json` is the only place their
+duration appears mid-run.
 
 ## Per-step throughput and cost
 
@@ -394,12 +403,25 @@ cell of a step was skipped, the step's manifest entry records
  "duration_seconds": 0.4, "skipped": true}
 ```
 
-Steps that emit no cells at all (`download`, `preprocess`, `report`)
-are timed and costed exactly as before — absence of cells is not
-evidence of absence of work.
+`download` is the deliberate exception: its cells are recorded even
+when every byte was already on disk. Re-validating a multi-gigabyte
+archive (size / checksum) is real wall-time, and it is exactly the
+window a reader is looking for when a "no-op" re-run takes twenty
+minutes. The `downloaded_mb` label separates the two cases — it is
+`0.0` when nothing new came over the network.
+
+Steps that emit no cells at all (`preprocess`, `report`) are timed and
+costed exactly as before — absence of cells is not evidence of absence
+of work.
 
 ```json
 [
+  {
+    "step": "download",
+    "started_at": "2026-05-14T12:00:00Z",
+    "duration_seconds": 812.5,
+    "labels": {"dataset": "amazon_fashion", "size_mb": 3120.4, "downloaded_mb": 3120.4}
+  },
   {
     "step": "extract",
     "started_at": "2026-05-14T12:01:35Z",
@@ -428,6 +450,7 @@ interrupted run keeps its history up to the failure point.
 
 | Step | Cell granularity |
 |---|---|
+| `download` | `(dataset, size_mb, downloaded_mb)` |
 | `extract` | `(dataset, extractor, dim)` |
 | `finetune` | `(dataset, extractor)` |
 | `evaluate_finetuning` | `(dataset, extractor)` |
@@ -450,7 +473,8 @@ For these two steps:
 
 The framework records every timing structurally during the run — there
 is no need to parse `run.log` files after the fact. The per-step list
-is at `manifest['steps']`, the per-cell sidecar at
+is at `manifest['steps']` (mirrored live in
+`results/runs/<run_id>/steps.json`), the per-cell sidecar at
 `results/runs/<run_id>/step_timings.json` (see [Timing model](#timing-model)
 above). Load both with `pandas.read_json` and plot with whatever charting
 library fits your workflow:
@@ -461,6 +485,8 @@ import pandas as pd
 
 manifest = json.loads(open("results/runs/<run_id>/manifest.json").read())
 steps = pd.DataFrame(manifest["steps"])
+# ...or, for a run still in flight / interrupted:
+# steps = pd.read_json("results/runs/<run_id>/steps.json")
 cells = pd.read_json("results/runs/<run_id>/step_timings.json")
 
 # Bar chart per step

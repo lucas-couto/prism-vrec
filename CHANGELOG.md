@@ -8,6 +8,46 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-08-22
+
+### Added
+
+- **Per-dataset download timings, with each dataset's weight on disk.**
+  `download` was one opaque window covering every configured dataset,
+  so "which dataset cost the download hour" was unanswerable. Its loop
+  now opens one cell per dataset, labelled `size_mb` (total weight of
+  the dataset's raw dir) and `downloaded_mb` (how much of that arrived
+  over the network this run — `0.0` when the archive was already
+  there). Each cell is flushed as it closes, so a run interrupted
+  halfway through the downloads still documents the datasets it did
+  fetch.
+
+  Unlike every other step, a `download` cell is recorded even when
+  nothing new was fetched: re-validating a multi-gigabyte archive by
+  size / checksum is real wall-time, and it is exactly the window a
+  reader wants when a "no-op" re-run takes twenty minutes.
+
+  `Cell.label(**labels)` is new, for the values that only exist once
+  the work has run (you cannot weigh a dataset before downloading it).
+  Existing `time_cell` call sites are untouched.
+
+### Fixed
+
+- **Per-step timings survive an interrupted run.** The step-level list
+  — the only place `download`, `preprocess` and `export_best` are timed
+  at all, since they open no cells — was written to `manifest.json`
+  exclusively by `finish_run`, i.e. once, at the very end. A run killed
+  or crashed before that point left the manifest's `steps` key absent
+  and `step_timings.json` holding only the per-cell entries, so the
+  download duration was nowhere on disk.
+
+  `record_step` now flushes the accumulated list to a sidecar
+  `results/runs/<run_id>/steps.json` after every step, the same way
+  `time_cell` already flushed the per-cell list. `finish_run` still
+  writes `manifest['steps']` unchanged, and the per-cell
+  `step_timings.json` keeps its flat-array format — no consumer of
+  either file has to change.
+
 ## [2.6.3] - 2026-08-21
 
 ### Fixed
