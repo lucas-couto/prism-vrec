@@ -108,20 +108,22 @@ Pruners available via `hp_search.optuna.pruner`:
 
 ### Persistence and resume
 
-By default Optuna keeps studies in memory — they are lost on process
-exit.  For long-running pods set `storage` to a SQLAlchemy URL so
-trials are persisted:
+The shipped `configs/recommenders.yaml` sets
+`storage: "sqlite:///results/optuna/battery.db"`, so studies persist
+across process restarts and resume by default.  Removing the key falls
+back to Optuna's in-memory storage (studies lost on process exit) —
+only sensible for throwaway experiments:
 
 ```yaml
 hp_search:
   optuna:
-    storage: "sqlite:///optuna.db"
+    storage: "sqlite:///results/optuna/battery.db"
 ```
 
 Re-running with the same `study_name` (auto-derived from
 `(dataset, model, embedding)`) **resumes** the search from the
 already-completed trials.  Bonus: install `optuna-dashboard` and run
-`optuna-dashboard sqlite:///optuna.db` to inspect convergence and HP
+`optuna-dashboard sqlite:///results/optuna/battery.db` to inspect convergence and HP
 importance interactively — useful figures for theses.
 
 ### Parallelism
@@ -137,7 +139,7 @@ Keeping trials sequential inside a cell is intentional: Bayesian
 sampling needs the previous trial's result to choose the next sample,
 and parallel trials inside the same study weaken the surrogate signal.
 
-Set `storage: "sqlite:///optuna.db"` for parallel runs: with in-memory
+Keep the persistent `storage` set (the shipped default) for parallel runs: with in-memory
 storage the completed-cell skip cannot survive a restart (the runner
 logs a warning). Cells whose studies already hold `n_trials` legitimate
 outcomes (COMPLETE + PRUNED) are skipped, so a killed run resumes where
@@ -159,11 +161,11 @@ it stopped.
 
 ## Inspecting a study
 
-After a run with `storage: "sqlite:///optuna.db"`:
+After a run with the persistent `storage` (the shipped default):
 
 ```bash
 pip install optuna-dashboard
-optuna-dashboard sqlite:///optuna.db
+optuna-dashboard sqlite:///results/optuna/battery.db
 # opens http://127.0.0.1:8080
 ```
 

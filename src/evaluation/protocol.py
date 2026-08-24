@@ -5,8 +5,9 @@ argument:
 
 * ``"full_ranking"`` (default and primary protocol — recommended for
   thesis-grade comparisons).  Scores every item in the catalogue for
-  every test user, masks items seen in train + val, computes top-K
-  metrics on the resulting full ranking.
+  every test user, masks the interactions passed as the seen/train set
+  (train+val at final evaluation), computes top-K metrics on the
+  resulting full ranking.
 * ``"sampled"``.  For each test user, draws ``n_negatives`` items the
   user has not seen and ranks the held-out positives against that
   smaller pool.  Much cheaper but **statistically inconsistent** with
@@ -33,6 +34,32 @@ logger = get_logger(__name__)
 
 
 ProtocolName = Literal["full_ranking", "sampled"]
+
+
+class NonFiniteScoresError(RuntimeError):
+    """A model emitted NaN/inf scores during evaluation.
+
+    Masking is the Evaluator's job (train items are ``-inf``-filled
+    AFTER this check), so any non-finite value in a model's raw output
+    is a numerical bug — typically an fp16/AMP overflow.  It must fail
+    loud: the ranking paths would otherwise disagree silently (the
+    batched sort ranks NaN at the TOP, the numpy lexsort at the bottom)
+    and a NaN held-out score turns into a spurious ``_rank`` of 1.
+    """
+
+
+def _assert_finite_scores(finite_mask: np.ndarray | torch.Tensor, where: str) -> None:
+    """Raise :class:`NonFiniteScoresError` unless *finite_mask* is all-True."""
+    if bool(finite_mask.all()):
+        return
+    n_bad = int((~finite_mask).sum())
+    raise NonFiniteScoresError(
+        f"model emitted {n_bad} non-finite score(s) ({where}). "
+        "Raw scores must be finite — the Evaluator applies the "
+        "train-item mask itself. Check the model for fp16/AMP "
+        "overflow or uninitialised parameters."
+    )
+
 
 #: Number of top items persisted per user for downstream inspection
 #: (the ``_top_items`` column).  Together with ``max_k`` it bounds how
@@ -107,7 +134,11 @@ class Evaluator:
         history.  Used to filter out already-seen items from candidates.
     test_interactions:
         Mapping ``{user_id: set_of_item_ids}`` representing the held-out
-        items.  In leave-one-out there is exactly one item per user.
+        items.  In leave-one-out there is exactly one item per user;
+        multi-item test sets are supported for plain metric evaluation,
+        but the per-user sufficient-statistic records
+        (:meth:`per_user_records` / :meth:`evaluate_with_records`)
+        require leave-one-out and raise otherwise.
     n_items:
         Total number of items in the catalogue (items are assumed to be
         integer-indexed from ``0`` to ``n_items - 1``).
@@ -154,6 +185,15 @@ class Evaluator:
         #: ``set_per_process_memory_fraction`` passes its real allowance,
         #: which the device cannot report.
         self.ranking_budget_bytes = ranking_budget_bytes
+
+        #: True when every test user holds out exactly ONE item.  The
+        #: per-user sufficient-statistic records (``_rank``,
+        #: ``_tie_block_size``, ...) pick the held-out via
+        #: ``next(iter(...))`` — meaningless for a multi-item test set —
+        #: so the records-producing entry points refuse to run unless
+        #: this holds.  Plain metric evaluation supports any test-set
+        #: cardinality.
+        self._is_leave_one_out = all(len(items) == 1 for items in test_interactions.values())
 
         # Random tie-break key: exact-score ties are broken by ascending
         # ``_tiebreak_key[item]`` instead of ascending item_idx.  item_idx
@@ -305,6 +345,26 @@ class Evaluator:
         rename = {c: c[1:] for c in frame.columns if c.startswith("_")}
         return frame[["user_id", *rename]].rename(columns=rename)
 
+    def _require_leave_one_out(self, caller: str) -> None:
+        """Refuse the records path when the test split is not leave-one-out.
+
+        The ``_rank`` / ``_tie_block_size`` records are sufficient
+        statistics ONLY when each user holds out exactly one item; for a
+        multi-item test set they would silently describe an arbitrary
+        held-out.  Plain metric evaluation (:meth:`evaluate_per_user`)
+        keeps working for any test-set cardinality.
+        """
+        if self._is_leave_one_out:
+            return
+        n_multi = sum(1 for items in self.test_interactions.values() if len(items) != 1)
+        raise ValueError(
+            f"{caller} requires a leave-one-out test split (exactly one "
+            f"held-out item per user); {n_multi} of "
+            f"{len(self.test_interactions)} test users violate this. "
+            "Use evaluate_per_user() for plain metrics on multi-item "
+            "test sets."
+        )
+
     def evaluate_with_records(
         self,
         model: Any,
@@ -314,8 +374,11 @@ class Evaluator:
         """Single pass → ``(metrics_df, records_df)`` (Task F).
 
         Used by the final evaluate step so the per-user artifact is written
-        WITHOUT a second scoring pass.
+        WITHOUT a second scoring pass.  Requires a leave-one-out test
+        split (see :meth:`_require_leave_one_out`); raises ``ValueError``
+        otherwise.
         """
+        self._require_leave_one_out("evaluate_with_records")
         frame = self._per_user_frame(model, device, batch_size)
         self._log_tie_stats(frame)
         return self._metrics_view(frame), self._records_view(frame)
@@ -357,10 +420,12 @@ class Evaluator:
         post-tiebreak — the seeded permutation resolves ties); effective
         ``n_candidates`` (post-mask, varies per user); ``tie_block_size``
         (exact-score block of the held-out); ``top_items`` (first 20
-        item_idx of the masked ranking).  Full-ranking only.
+        item_idx of the masked ranking).  Full-ranking only, and requires
+        a leave-one-out test split (raises ``ValueError`` otherwise).
         """
         if self.protocol != "full_ranking":
             raise ValueError("per_user_records requires protocol='full_ranking'.")
+        self._require_leave_one_out("per_user_records")
         return self._records_view(self._per_user_frame(model, device, batch_size))
 
     def _evaluate_single(
@@ -420,6 +485,13 @@ class Evaluator:
             user_ids_tensor = torch.tensor(batch_user_ids, dtype=torch.long, device=device)
 
             batch_scores = model.predict_batch(user_ids_tensor, all_items)
+            # R3 guard: raw scores must be finite BEFORE the train-item
+            # mask goes in — the stable sort below ranks NaN at the top,
+            # so a NaN would silently inflate the metrics.
+            _assert_finite_scores(
+                torch.isfinite(batch_scores),
+                f"batched path, users {batch_user_ids[0]}..{batch_user_ids[-1]}",
+            )
             # Inference throughput is measured in users ranked per second;
             # see src.utils.flops on why scoring dispatches no counted FLOPs
             # for factorisation models.
@@ -565,6 +637,9 @@ class Evaluator:
                 scores_np = scores.cpu().numpy()
             else:
                 scores_np = np.asarray(scores)
+            # R3 guard: the sampled pool has no mask at all, so every
+            # score must be finite.
+            _assert_finite_scores(np.isfinite(scores_np), f"sampled path, user {user_id}")
 
             # Unified tie-break: exact-score ties broken by the random
             # ``_tiebreak_key`` (seeded permutation), NOT by pool position
@@ -623,6 +698,10 @@ class Evaluator:
         Used by the single-user fallback path; the batched path performs
         the same operations on GPU.
         """
+        # R3 guard: check the raw output before masking (numpy's lexsort
+        # would push NaN to the BOTTOM — the opposite of the batched
+        # path — so the two paths would silently disagree).
+        _assert_finite_scores(np.isfinite(user_scores), f"single path, user {user_id}")
         train_items = self.train_interactions.get(user_id, set())
         if train_items:
             train_idx = np.array(list(train_items), dtype=np.int64)

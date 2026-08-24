@@ -20,7 +20,12 @@ artefacts:
   product of every config.  Every row carries ``family``, ``group``
   and ``n_comparisons_in_family`` so the correction is auditable.
   Effect size: Cliff's delta (primary); the paired-difference
-  bootstrap CI accompanies each pair.
+  bootstrap CI accompanies each pair.  Each row also carries
+  ``omnibus_significant`` — the family's Friedman verdict joined onto
+  its pairwise rows (NaN where Friedman is undefined, i.e. fewer than
+  3 configs, or disabled).  Pairwise rows are ANNOTATED, never
+  suppressed: a pairwise effect must not be claimed at the family
+  level when its omnibus is not significant.
 
 **Primary metrics.** Under the leave-one-out protocol there are only
 two independent signals per user: *hit or not* (recall@k ≡ HitRate@k)
@@ -155,27 +160,24 @@ def run(condition: str = "frozen") -> None:
                     summary.to_csv(out, index=False)
                     logger.info("    bootstrap CI saved: %s", out)
 
+                fried_rows: list[dict] = []
                 if friedman_enabled and instances:
-                    fried_rows = []
-                    for inst in instances:
-                        fried = friedman_test(
-                            eval_df,
-                            metric=metric,
-                            alpha=alpha,
-                            configs=inst.configs,
+                    fried_rows = _family_friedman_rows(eval_df, instances, metric, alpha)
+                    if fried_rows:
+                        out = results_dir / f"{dataset_name}_friedman_{_safe(metric)}.csv"
+                        pd.DataFrame(fried_rows).to_csv(out, index=False)
+                        n_sig = sum(1 for r in fried_rows if r["significant"])
+                        logger.info(
+                            "    friedman: %d/%d family instances significant -> %s",
+                            n_sig,
+                            len(fried_rows),
+                            out,
                         )
-                        fried_rows.append(
-                            {"family": inst.family, "group": inst.group, **fried},
+                    else:
+                        logger.info(
+                            "    friedman skipped: no family with a defined "
+                            "omnibus among the enabled families."
                         )
-                    out = results_dir / f"{dataset_name}_friedman_{_safe(metric)}.csv"
-                    pd.DataFrame(fried_rows).to_csv(out, index=False)
-                    n_sig = sum(1 for r in fried_rows if r["significant"])
-                    logger.info(
-                        "    friedman: %d/%d family instances significant -> %s",
-                        n_sig,
-                        len(fried_rows),
-                        out,
-                    )
 
                 if instances:
                     pair_frames = [
@@ -195,6 +197,7 @@ def run(condition: str = "frozen") -> None:
                         for inst in instances
                     ]
                     pairs_df = pd.concat(pair_frames, ignore_index=True)
+                    pairs_df["omnibus_significant"] = _omnibus_column(pairs_df, fried_rows)
                     out = results_dir / f"{dataset_name}_pairwise_{_safe(metric)}.csv"
                     pairs_df.to_csv(out, index=False)
                     logger.info(
@@ -233,6 +236,51 @@ def run(condition: str = "frozen") -> None:
             logger.info("Long-format %s: %s", label, path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Long-format consolidation skipped: %s", exc)
+
+
+def _family_friedman_rows(
+    eval_df: pd.DataFrame,
+    instances: list,
+    metric: str,
+    alpha: float,
+) -> list[dict]:
+    """One Friedman row per family instance with a defined omnibus.
+
+    Pair-collection families (``vs_baseline``, ``frozen_vs_finetuned``)
+    declare ``omnibus_defined=False``: a K-way Friedman over their
+    configs would test "all dataset configs are equivalent" — trivially
+    rejected, a gate that never gates (R1).  Those instances emit NO
+    row (the Friedman CSV only carries the one-dimension families);
+    :func:`_omnibus_column` then reports
+    ``omnibus_significant = NaN`` on their pairwise rows because no
+    verdict exists for their (family, group) key.
+    """
+    rows: list[dict] = []
+    for inst in instances:
+        if not inst.omnibus_defined:
+            continue
+        fried = friedman_test(eval_df, metric=metric, alpha=alpha, configs=inst.configs)
+        rows.append({"family": inst.family, "group": inst.group, **fried})
+    return rows
+
+
+def _omnibus_column(pairs_df: pd.DataFrame, fried_rows: list[dict]) -> pd.Series:
+    """Family omnibus verdict joined onto each pairwise row (E4 gate).
+
+    Returns True/False where the family's Friedman test ran, and NaN
+    where it is undefined (fewer than 3 configs) or was not computed
+    (``friedman.enabled: false``).  The gate ANNOTATES, it does not
+    suppress — see the module docstring.
+    """
+    flags: dict[tuple[str, str], object] = {}
+    for row in fried_rows:
+        undefined = pd.isna(row["p_value"])
+        flags[(row["family"], row["group"])] = (
+            float("nan") if undefined else bool(row["significant"])
+        )
+    keys = zip(pairs_df["family"], pairs_df["group"], strict=True)
+    values = [flags.get(key, float("nan")) for key in keys]
+    return pd.Series(values, index=pairs_df.index, dtype=object)
 
 
 def _load_evaluation(

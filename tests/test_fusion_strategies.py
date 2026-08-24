@@ -8,8 +8,11 @@ get in the way of checking the raw operation.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+import yaml
 
 from src.fusions.registry import get_fusion_spec
 from src.fusions.strategies import (
@@ -168,3 +171,58 @@ def test_pca_grid_emits_the_kwarg_the_function_consumes() -> None:
     grid = spec.expand_grid({"n_components": [16, 32]})
 
     assert grid == [("_nc16", {"n_components": 16}), ("_nc32", {"n_components": 32})]
+
+
+def test_logit_strategies_grid_emits_the_kwarg_the_functions_consume() -> None:
+    """``attention_weighted`` and ``gated`` expose their fixed logits
+    through ``expand_grid`` so configured values reach the fusion fn
+    (and the learned-alignment sidecar) instead of the uniform default."""
+    for name in ("attention_weighted", "gated"):
+        spec = get_fusion_spec(name)
+
+        grid = spec.expand_grid({"logits": [[1.0, 0.0]]})
+
+        assert grid == [("_l1_0", {"logits": [1.0, 0.0]})]
+
+
+def test_logit_strategies_grid_defaults_to_uniform() -> None:
+    for name in ("attention_weighted", "gated"):
+        spec = get_fusion_spec(name)
+
+        grid = spec.expand_grid({})
+
+        assert grid == [("_l0_0", {"logits": [0.0, 0.0]})]
+
+
+# ---------------------------------------------------------------------
+# Canonical-config distinctness: the weighted-combination family only
+# constitutes three distinct experimental conditions if the canonical
+# values in configs/fusion.yaml keep the strategies apart.  The previous
+# 0.5 / zero-logit canon collapsed all three into plain mean (decision
+# 2026-08-22).
+# ---------------------------------------------------------------------
+
+
+def test_canonical_config_keeps_weighted_family_distinct() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "fusion.yaml"
+    strategies_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))["strategies"]
+
+    rng = np.random.default_rng(0)
+    sources = [
+        rng.normal(size=(12, 6)).astype(np.float32),
+        rng.normal(size=(12, 6)).astype(np.float32),
+    ]
+
+    fused = {"mean": fuse_mean(sources, normalize=True)}
+    for name in ("weighted_mean", "attention_weighted", "gated"):
+        spec = get_fusion_spec(name)
+        [(_suffix, kwargs)] = spec.expand_grid(strategies_cfg.get(name, {}))
+        fused[name] = spec.fn(sources, normalize=True, **kwargs)
+
+    names = list(fused)
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            assert not np.allclose(fused[a], fused[b], atol=1e-6), (
+                f"canonical configs collapse {a!r} and {b!r} into the same "
+                f"fused matrix — they are not distinct experimental conditions"
+            )

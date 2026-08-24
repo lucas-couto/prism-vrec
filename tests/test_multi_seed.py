@@ -11,6 +11,7 @@ import pytest
 from src.reporting.aggregate_seeds import (
     aggregate_bootstrap_ci,
     aggregate_evaluation,
+    aggregate_statistical_tests,
     write_cross_seed_aggregates,
 )
 from src.utils.config import derive_seed_config
@@ -192,6 +193,130 @@ class TestAggregateBootstrapCi:
         assert out.iloc[0]["mean_across_seeds"] == pytest.approx(0.55)
 
 
+def _wilcoxon_row(
+    *,
+    p: float,
+    p_holm: float,
+    significant: bool,
+    diff: float,
+    config_a: str = "vbpr_resnet50",
+) -> dict:
+    """One long-format ``statistical_tests.csv`` Wilcoxon row (fixed pair)."""
+    return {
+        "dataset": "amazon_fashion",
+        "metric": "ndcg",
+        "k": 10,
+        "test_type": "wilcoxon",
+        "family": "vs_baseline",
+        "group": "all",
+        "config_a": config_a,
+        "config_b": "bpr_none",
+        "recommender_a": "vbpr",
+        "extractor_a": "resnet50",
+        "fusion_a": "none",
+        "condition_a": "frozen",
+        "recommender_b": "bpr",
+        "extractor_b": "none",
+        "fusion_b": "none",
+        "condition_b": "both",
+        "p_value": p,
+        "corrected_p": p_holm,
+        "significant": significant,
+        "diff_mean": diff,
+    }
+
+
+class TestAggregateStatisticalTests:
+    def test_golden_case_reconciles_verdicts_across_seeds(self, tmp_path: Path) -> None:
+        per_seed = [
+            (42, _wilcoxon_row(p=0.001, p_holm=0.004, significant=True, diff=0.02)),
+            (99, _wilcoxon_row(p=0.002, p_holm=0.008, significant=True, diff=0.03)),
+            (7, _wilcoxon_row(p=0.2, p_holm=0.6, significant=False, diff=-0.01)),
+        ]
+        seed_dirs = []
+        for seed, row in per_seed:
+            d = tmp_path / f"results_seed{seed}"
+            seed_dirs.append(d)
+            _write_seed_csv(d, "statistical_tests.csv", [row])
+
+        out = aggregate_statistical_tests(seed_dirs, seeds=[42, 99, 7])
+
+        assert len(out) == 1
+        row = out.iloc[0]
+        assert row["n_seeds"] == 3
+        assert row["n_seeds_significant"] == 2
+        assert row["median_diff_mean"] == pytest.approx(0.02)
+        # Two of three seeds share the median's sign.
+        assert row["sign_agreement"] == pytest.approx(2 / 3)
+        assert row["p_holm_min"] == pytest.approx(0.004)
+        assert row["p_holm_median"] == pytest.approx(0.008)
+        assert row["p_holm_max"] == pytest.approx(0.6)
+
+    def test_configs_differing_only_in_dim_do_not_collapse(self, tmp_path: Path) -> None:
+        # R2: the parsed components (recommender/extractor/fusion/
+        # condition) are identical for vbpr_resnet50_D64 and _D128 —
+        # only config_a tells them apart.  Without it in the key the
+        # two pairs merge and n_seeds counts seeds × dims.
+        seed_dirs = []
+        for seed in (42, 99):
+            d = tmp_path / f"results_seed{seed}"
+            seed_dirs.append(d)
+            _write_seed_csv(
+                d,
+                "statistical_tests.csv",
+                [
+                    _wilcoxon_row(
+                        p=0.001,
+                        p_holm=0.004,
+                        significant=True,
+                        diff=0.02,
+                        config_a="vbpr_resnet50_D64",
+                    ),
+                    _wilcoxon_row(
+                        p=0.2,
+                        p_holm=0.6,
+                        significant=False,
+                        diff=-0.01,
+                        config_a="vbpr_resnet50_D128",
+                    ),
+                ],
+            )
+
+        out = aggregate_statistical_tests(seed_dirs, seeds=[42, 99])
+
+        assert len(out) == 2  # one group per dim, not one merged group
+        assert set(out["config_a"]) == {"vbpr_resnet50_D64", "vbpr_resnet50_D128"}
+        assert (out["n_seeds"] == 2).all()  # seeds, not seeds x dims
+        d64 = out[out["config_a"] == "vbpr_resnet50_D64"].iloc[0]
+        assert d64["n_seeds_significant"] == 2
+        d128 = out[out["config_a"] == "vbpr_resnet50_D128"].iloc[0]
+        assert d128["n_seeds_significant"] == 0
+
+    def test_friedman_rows_are_excluded(self, tmp_path: Path) -> None:
+        d = tmp_path / "results_seed42"
+        friedman_row = {
+            "dataset": "amazon_fashion",
+            "metric": "ndcg",
+            "k": 10,
+            "test_type": "friedman",
+            "family": "vs_baseline",
+            "group": "all",
+            "p_value": 0.01,
+            "significant": True,
+        }
+        wilcoxon = _wilcoxon_row(p=0.001, p_holm=0.004, significant=True, diff=0.02)
+        _write_seed_csv(d, "statistical_tests.csv", [friedman_row, wilcoxon])
+
+        out = aggregate_statistical_tests([d], seeds=[42])
+
+        assert len(out) == 1
+        assert out.iloc[0]["n_seeds"] == 1
+
+    def test_returns_empty_when_no_files(self, tmp_path: Path) -> None:
+        out = aggregate_statistical_tests([tmp_path / "does_not_exist"], seeds=[42])
+        assert out.empty
+
+
 class TestWriteCrossSeedAggregates:
     def test_end_to_end(self, tmp_path: Path) -> None:
         seed_dirs = []
@@ -233,12 +358,21 @@ class TestWriteCrossSeedAggregates:
                     }
                 ],
             )
+            _write_seed_csv(
+                d,
+                "statistical_tests.csv",
+                [_wilcoxon_row(p=0.01, p_holm=0.02, significant=True, diff=value - 0.4)],
+            )
 
         out_dir = tmp_path / "aggregated"
         written = write_cross_seed_aggregates(seed_dirs, out_dir, seeds=[42, 99])
 
         assert written["evaluation_multi_seed"].exists()
         assert written["bootstrap_ci_multi_seed"].exists()
+        assert written["statistical_tests_across_seeds"].exists()
+        tests_df = pd.read_csv(written["statistical_tests_across_seeds"])
+        assert len(tests_df) == 1
+        assert tests_df.iloc[0]["n_seeds_significant"] == 2
         eval_df = pd.read_csv(written["evaluation_multi_seed"])
         assert len(eval_df) == 1
         assert eval_df.iloc[0]["n_seeds"] == 2

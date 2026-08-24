@@ -43,6 +43,7 @@ from src.utils.artifact_names import (
     FUSION_PREFIX,
     is_component_artifact,
     is_finetuned_artifact,
+    is_projected_artifact,
 )
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
@@ -52,6 +53,38 @@ from src.utils.parallel import TrainingJob, TrainingOrchestrator
 from src.utils.seed import set_seed
 
 logger = get_logger(__name__)
+
+
+EMBEDDING_VARIANTS = ("native", "projected", "both")
+
+
+def _resolve_embedding_variants(config: dict) -> str:
+    """Read ``embedding_variants`` from the recommender config.
+
+    Selects which of the two artifact families the recommenders are
+    trained on when a fixed projection is configured in
+    ``configs/extractors.yaml``: the backbones' native features, their
+    fixed-dim projections, or both side by side.
+    """
+    value = str(config.get("embedding_variants", "both"))
+    if value not in EMBEDDING_VARIANTS:
+        raise ValueError(
+            f"embedding_variants must be one of {list(EMBEDDING_VARIANTS)}, got {value!r}"
+        )
+    return value
+
+
+def filter_by_variant(names: list[str], variant: str) -> list[str]:
+    """Keep the embedding names belonging to *variant*.
+
+    ``"none"`` — the pseudo-embedding of the non-visual baselines — is
+    never filtered out: it belongs to no artifact family, and dropping
+    it would silently remove plain BPR from a projected-only battery.
+    """
+    if variant == "both":
+        return names
+    want_projected = variant == "projected"
+    return [n for n in names if n == "none" or is_projected_artifact(n) == want_projected]
 
 
 def get_embedding_files(
@@ -133,9 +166,11 @@ def _iter_cells(
     consume this so their notions of "which cells exist" can never drift.
     """
     dim_filter = config.get("embedding_dims", [])
+    variant = _resolve_embedding_variants(config)
 
     for dataset_name in config.get("datasets", []):
         all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
+        all_embs = filter_by_variant(all_embs, variant)
         if condition == "frozen":
             embedding_names = [e for e in all_embs if not is_finetuned_artifact(e)]
         else:
@@ -175,6 +210,75 @@ def _iter_cells(
                     n_users=n_users,
                     n_items=n_items,
                 )
+
+
+class EnabledRecommenderHasNoCellsError(RuntimeError):
+    """An enabled recommender enumerated zero training cells (audit D5).
+
+    Silently dropping a model out of the comparison (e.g. ACF enabled but
+    no ``*_comp.npy`` artifact exists) would bias the battery without any
+    signal; enumeration therefore fails loud instead.
+    """
+
+
+def assert_enabled_recommenders_have_cells(
+    cell_counts: dict[str, int],
+    condition: str,
+) -> None:
+    """Fail loud when an enabled recommender silently drops out (D5).
+
+    Args:
+        cell_counts: Per enabled (and registered) recommender, the number
+            of ``(dataset, model, embedding)`` cells enumerated for it.
+        condition: ``"frozen"`` or ``"finetuned"`` — non-visual models
+            are legitimately absent from the finetuned condition.
+
+    Raises:
+        EnabledRecommenderHasNoCellsError: When a recommender has zero
+            cells while other recommenders enumerated at least one and
+            the emptiness is not condition-expected.
+    """
+    if not any(cell_counts.values()):
+        # Nothing at all to train for this condition (e.g. no finetuned
+        # artifacts yet): the existing "no pending jobs" paths report it.
+        return
+    for model_name, count in cell_counts.items():
+        if count > 0:
+            continue
+        spec = get_recommender_spec(model_name)
+        if not spec.requires_visual and condition != "frozen":
+            # Feature-blind baselines (plain BPR) only run frozen.
+            continue
+        if spec.requires_components:
+            reason = (
+                "it requires component embeddings and no *_comp.npy artifact "
+                "matched the enabled datasets/filters — run an extractor that "
+                "emits component embeddings, or disable the recommender"
+            )
+        else:
+            reason = (
+                "no embedding artifact matched the enabled datasets/filters "
+                f"(condition={condition!r}, embedding_variants, embedding_dims)"
+            )
+        raise EnabledRecommenderHasNoCellsError(
+            f"recommender {model_name!r} is enabled but enumerated 0 training "
+            f"cells for condition {condition!r}: {reason}. It would silently "
+            "drop out of the comparison."
+        )
+
+
+def _cell_counts(
+    condition: str,
+    config: dict,
+    processed_dir: str,
+    embeddings_dir: str,
+) -> dict[str, int]:
+    """Cells per enabled model, BEFORE completed-job filtering (D5 guard)."""
+    model_names = _resolve_model_names(config)
+    counts = {name: 0 for name in model_names}
+    for cell in _iter_cells(condition, config, processed_dir, embeddings_dir, model_names):
+        counts[cell.model_name] += 1
+    return counts
 
 
 def get_hyperparam_grid(model_name: str, config: dict) -> list[dict]:
@@ -336,9 +440,27 @@ def _run_grid(
     sequential: bool,
 ) -> None:
     """Original Cartesian grid behaviour, dispatched via the orchestrator."""
+    from src.recommenders.hp_budget import grid_budget_message
+
     device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
+
+    # D1: the grid backend spends one selection shot per config, so
+    # unequal per-model spaces are unequal budgets. Cannot be fixed
+    # silently (spaces are legitimate per-model choices) — warn loud.
+    grid_sizes = {
+        name: len(get_hyperparam_grid(name, config)) for name in _resolve_model_names(config)
+    }
+    budget_warning = grid_budget_message(grid_sizes)
+    if budget_warning:
+        logger.warning(budget_warning)
+
+    # D5: an enabled recommender with zero cells must fail, not vanish.
+    assert_enabled_recommenders_have_cells(
+        _cell_counts(condition, config, processed_dir, embeddings_dir),
+        condition,
+    )
 
     jobs = build_job_list(condition, config, processed_dir, embeddings_dir, device)
 
@@ -599,6 +721,13 @@ def _run_optuna(
 
     cells = _list_cells(condition, config, processed_dir, embeddings_dir)
     logger.info("Optuna cells to process: %d (n_trials=%d)", len(cells), n_trials)
+
+    # D5: an enabled recommender with zero cells must fail, not vanish.
+    counts = {name: 0 for name in _resolve_model_names(config)}
+    for cell_key, _n_users, _n_items, _emb_path in cells:
+        counts[cell_key.model_name] += 1
+    assert_enabled_recommenders_have_cells(counts, condition)
+
     if not cells:
         return
 

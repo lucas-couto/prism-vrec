@@ -65,12 +65,15 @@ def test_module_rejects_wrong_dim() -> None:
 def test_module_parameters_receive_gradient() -> None:
     """Backprop reaches every gate parameter once training is under way.
 
-    The gate is zero-initialised at ``gate[0]`` so the network starts at
-    the uniform fusion (sigmoid(0) = 0.5). On the very first backward,
-    ``∂L/∂gate[2].weight = 0`` because ``a₁ = Tanh(0) = 0``. A single
-    SGD step on the freely-updating parameters breaks the zero at
-    ``gate[0]``; from the second backward onward every parameter
-    receives a non-zero gradient. This test verifies that full path.
+    The FINAL layer ``gate[-1]`` is zero-initialised (qualification
+    spec) so the network starts at the uniform fusion (sigmoid(0) =
+    0.5). On the very first backward, ``∂L/∂gate[0].weight = 0``
+    because the chain rule routes through ``gate[-1].weight = 0``,
+    while ``gate[-1]`` itself receives a non-zero gradient from the
+    first layer's non-zero ReLU activations. A single SGD step moves
+    ``gate[-1].weight`` off zero; from the second backward onward
+    every parameter receives a non-zero gradient. This test verifies
+    that full path.
     """
     torch.manual_seed(0)
 
@@ -94,6 +97,23 @@ def test_module_parameters_receive_gradient() -> None:
         assert param.grad.abs().sum().item() > 0, (
             f"{name}: zero grad — gate is decoupled from output"
         )
+
+
+def test_gate_mlp_matches_qualification_spec() -> None:
+    """Spec: ``Linear(2D→D) → ReLU → Linear(D→D)``, FINAL layer
+    zero-initialised (weight and bias); first layer standard init."""
+    fusion = AdaptiveGatedFusion(dim=8)
+
+    assert isinstance(fusion.gate[0], torch.nn.Linear)
+    assert fusion.gate[0].in_features == 16
+    assert fusion.gate[0].out_features == 8
+    assert isinstance(fusion.gate[1], torch.nn.ReLU)
+    assert isinstance(fusion.gate[-1], torch.nn.Linear)
+    assert torch.all(fusion.gate[-1].weight == 0)
+    assert torch.all(fusion.gate[-1].bias == 0)
+    # First layer must NOT be zeroed — its ReLU activations carry the
+    # gradient into the final layer on the very first backward.
+    assert fusion.gate[0].weight.abs().sum().item() > 0
 
 
 def test_gate_values_in_unit_interval() -> None:
@@ -126,6 +146,43 @@ def test_factory_returns_module_for_known_strategy() -> None:
 def test_factory_rejects_unknown_strategy() -> None:
     with pytest.raises(ValueError, match="Unknown online fusion strategy"):
         online_module_for("does_not_exist", dim=16)
+
+
+def test_learned_alignment_logit_ops_use_fixed_buffers() -> None:
+    """Thesis spec: attention_weighted / gated logits are FIXED config
+    values, never trainable — only adaptive_gated is a learned fusion."""
+    from src.fusions.online import LearnedAlignmentFusion
+
+    for strategy in ("attention_weighted", "gated"):
+        module = LearnedAlignmentFusion([6, 4], dim=8, strategy=strategy, logits=[1.0, 0.0])
+
+        torch.testing.assert_close(module.fixed_logits, torch.tensor([1.0, 0.0]))
+        assert "fixed_logits" not in dict(module.named_parameters())
+        assert "fixed_logits" in dict(module.named_buffers())
+
+
+def test_learned_alignment_logit_ops_reject_wrong_length() -> None:
+    from src.fusions.online import LearnedAlignmentFusion
+
+    with pytest.raises(ValueError, match="logits"):
+        LearnedAlignmentFusion([6, 4], dim=8, strategy="gated", logits=[1.0, 0.0, -1.0])
+
+
+def test_adaptive_gated_is_the_only_learned_fusion_op() -> None:
+    """No parameters beyond the alignment projections for any offline-
+    mirroring op; adaptive_gated alone adds trainable gate parameters."""
+    from src.fusions.online import LearnedAlignmentFusion
+
+    for strategy in ("mean", "weighted_mean", "attention_weighted", "gated"):
+        kwargs = {"weights": [0.7, 0.3]} if strategy == "weighted_mean" else {}
+        module = LearnedAlignmentFusion([6, 4], dim=8, strategy=strategy, **kwargs)
+        non_projection = [
+            n for n, _ in module.named_parameters() if not n.startswith("projections")
+        ]
+        assert non_projection == [], f"{strategy}: unexpected trainable params {non_projection}"
+
+    gated_module = LearnedAlignmentFusion([6, 4], dim=8, strategy="adaptive_gated")
+    assert any(n.startswith("gate") for n, _ in gated_module.named_parameters())
 
 
 def test_load_embedding_npy_passes_through(tmp_path: Path) -> None:

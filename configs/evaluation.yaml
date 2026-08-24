@@ -51,8 +51,13 @@ statistical:
   #   backbone_within_model — which backbone? (fixes the recommender)
   #   model_within_backbone — which recommender? (fixes the backbone)
   #   fusion_within_model   — which fusion? (fixes the recommender)
-  #   frozen_vs_finetuned   — does fine-tuning help? (one pair per config;
-  #                           requires condition "all")
+  #   frozen_vs_finetuned   — does fine-tuning help? (ONE instance per
+  #                           dataset holding ALL frozen/finetuned pairs,
+  #                           Holm with m = n_pairs; requires condition
+  #                           "all")
+  #   vs_baseline           — does visual signal beat pure BPR? (every
+  #                           config vs bpr/none in one instance, Holm
+  #                           with m = n_configs - 1)
   # "all_pairs" may be added for exploration but is never the default
   # for reported numbers. Every output row carries family, group and
   # n_comparisons_in_family so the correction is auditable.
@@ -61,6 +66,7 @@ statistical:
     - model_within_backbone
     - fusion_within_model
     - frozen_vs_finetuned
+    - vs_baseline
 
   # Metric families analysed by step 07. Under leave-one-out there are
   # only two independent signals per user — hit-or-not (recall@k, i.e.
@@ -83,7 +89,11 @@ statistical:
 
   # Friedman omnibus test, run WITHIN each comparison family (3+
   # configs). If a family's omnibus is not significant, none of its
-  # pairwise effects can be claimed at the family level.
+  # pairwise effects can be claimed at the family level. Only the
+  # one-dimension families have a meaningful K-way omnibus; for the
+  # pair-collection families (vs_baseline, frozen_vs_finetuned) it is
+  # undefined by construction and reported as NaN — their evidence is
+  # the Holm-corrected pairwise tests alone.
   friedman:
     enabled: true
 

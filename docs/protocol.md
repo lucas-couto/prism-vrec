@@ -40,6 +40,55 @@ extraction loudly. Every artifact ships a `.meta.json` sidecar
 (backbone, native dim, extraction point, exact weights id, transform
 recipe); the loader cross-checks features against it.
 
+### 1b. Optional fixed projection to a common dimension (opt-in, off by default)
+
+`projection:` in `configs/extractors.yaml` writes an *additional*
+artifact per extractor, `<extractor>_p<dim>.npy`, carrying a fixed
+linear map of the native feature to one shared width. It exists so the
+element-wise fusion family can consume equal-dim sources without an
+alignment learned online, and so a reviewer who asks for "every
+backbone at 128-d" gets exactly that. The native artifact is untouched
+and both are trainable side by side.
+
+**This re-enables, as an explicit variable, the very thing §1 rejected
+as a default.** `method: random` is the seeded random projection the v1
+protocol was criticised for: a comparison run *only* on
+`<extractor>_p128` artifacts compares "backbone × fixed compression",
+not backbones, and the narrower `dim` is, the more of the difference
+between backbones the compression can absorb. That is a legitimate
+experiment — it is not the headline benchmark. The defensible uses are:
+
+- **As a controlled ablation**, reported next to the native-dim result
+  from the same run, so the cost of the compression is visible rather
+  than assumed away.
+- **As a fusion input**, where the alternative (`alignment: learned`)
+  is itself a projection — a fixed one merely moves it earlier and
+  removes it from the recommender's gradient.
+
+`method: pca` (fit on train items only, mirroring `alignment.method:
+pca`) preserves more variance than `random` and is the better default
+of the two when the projection feeds a comparison; it is
+dataset-dependent, so its basis does not transfer across datasets.
+`method: pca_whitened` additionally equalises the per-component
+train-set variance (Jégou & Chum, ECCV 2012), so no single principal
+direction dominates the inner products the recommenders compute — same
+fit set and leakage guarantees as `pca`.
+
+What is *written* (`projection:` in extractors.yaml) and what is
+*consumed* are separate decisions: `embedding_variants` in
+recommenders.yaml (`native` / `projected` / `both`) selects the training
+cells, and `extractor_variants` in fusion.yaml selects the fusion
+sources. `both` is what produces the paired report this section asks
+for. With `extractor_variants: projected` the `alignment:` block is
+bypassed — the sources already share a width — which removes the
+learned alignment from the recommender's gradient and makes the
+projection the only compression in the pipeline.
+
+Provenance is on disk: the projector is saved as
+`<extractor>_p<dim>.proj.npz` with a `.proj.json` describing method,
+dim, seed and fit set, and the artifact's own `.meta.json` records
+`source_native_dim` alongside the projected `native_dim`.
+
 ## 2. Canonical per-backbone preprocessing
 
 The preprocessing recipe is part of the model. Three **distinct
@@ -100,6 +149,25 @@ gaps). The validation metric is still full-ranking over all items for
 those users. The final evaluate step constructs its `Evaluator` without
 `sample_size` and ranks the entire test set.
 
+**Item-side transduction in fine-tuning (declared).** The CNN/ViT
+fine-tuning trains a category classifier on the **full catalogue**
+(`src/steps/finetune.py` builds `CategoryDataset` splits from every
+item's image and category label; `src/finetuning/dataset.py`), so the
+images and category labels of items that later appear as test held-outs
+are seen by the backbone. No interaction data is used at this stage and
+no test **interactions** leak — the backbone never observes which user
+held out which item. This is a deliberate protocol decision, standard
+in visual recommendation (item content is catalogue metadata, available
+before any interaction), and it slightly favours the finetuned
+condition relative to a strictly inductive protocol in which held-out
+items' images would be excluded from fine-tuning.
+
+**Held-out items as BPR training negatives.** During BPR training a
+user's own val/test positives are eligible to be drawn as negatives
+(`src/utils/training.py` excludes only the user's train items) — the
+standard protocol, with negligible metric deflation given catalogue
+sizes.
+
 ## 4. Deterministic tie-breaking
 
 All three ranking paths (batched torch, sampled numpy, single-user
@@ -131,10 +199,30 @@ size, so the real exact-tie frequency is measured during the battery.
   runs with `m ≈ 2900` and rejects everything artificially). Each
   family varies exactly one dimension: `backbone_within_model`
   (`m = C(n_backbones, 2)` per recommender), `model_within_backbone`,
-  `fusion_within_model`, `frozen_vs_finetuned` (one `m = 1` pair per
-  config). Every result row carries `family`, `group` and
+  `fusion_within_model`, `frozen_vs_finetuned` (ONE instance per
+  dataset containing every frozen/finetuned pair, `m = n_pairs` — one
+  research question, one correction unit), and `vs_baseline` (ONE
+  instance per dataset pairing every config with the pure-BPR
+  baseline `bpr_none`, `m = n_configs − 1` since the baseline pairs
+  with everyone but itself — the central visual-signal hypothesis).
+  Every result row carries `family`, `group` and
   `n_comparisons_in_family` so the correction is auditable; `all_pairs`
   exists as an exploratory option only.
+- **Friedman gate (annotate, don't suppress)**: the family omnibus is
+  computed alongside the pairwise tests and its verdict is joined onto
+  every pairwise row as `omnibus_significant` (NaN where Friedman is
+  undefined, i.e. fewer than 3 configs, or disabled). Pairwise rows
+  are never suppressed, but a pairwise effect must not be claimed at
+  the family level when its omnibus is not significant. The gate only
+  applies to the one-dimension families (`backbone_within_model`,
+  `model_within_backbone`, `fusion_within_model`), whose configs form a
+  homogeneous K-way design. `vs_baseline` and `frozen_vs_finetuned`
+  are bundles of two-treatment questions (a star against one baseline;
+  per-config frozen/finetuned pairs): the only K-way omnibus available
+  there — "all dataset configs are equivalent" — is trivially rejected
+  and gates nothing, so those families report
+  `omnibus_significant = NaN` by construction and their evidence is
+  the Holm-corrected pairwise tests alone.
 - **Primary metrics under LOO**: with one relevant item per user only
   two independent signals exist — hit-or-not (recall@k ≡ HitRate@k) and
   hit rank (ndcg@k). precision@k = recall@k / k and map@k = 1/rank are
@@ -152,10 +240,24 @@ size, so the real exact-tie frequency is measured during the battery.
   and inflates on such vectors (the std shrinks); it is off by default
   and available for diagnostics only.
 - **Paired-difference bootstrap CI** on every pairwise row
-  (`diff_mean`, `diff_ci_lower/upper`, resampling USERS): the CI that
-  must agree with the Wilcoxon verdict. Per-config CIs are descriptive
-  — under paired inference, overlapping individual CIs do NOT imply
-  absence of a significant difference.
+  (`diff_mean`, `diff_ci_lower/upper`, resampling USERS): a RAW 95% CI
+  whose agreement is with the raw Wilcoxon p-value at alpha, NOT with
+  the Holm-corrected `significant` verdict — a CI excluding zero under
+  a Holm-non-significant verdict is the correction working, not a
+  contradiction. Per-config CIs are descriptive — under paired
+  inference, overlapping individual CIs do NOT imply absence of a
+  significant difference.
+- **Cross-seed scope of the p-values**: every p-value in a per-seed
+  `statistical_tests.csv` is a statement about ONE training
+  realisation (the models trained under that seed), not about the
+  methods in general. Multi-seed runs write
+  `statistical_tests_across_seeds.csv` — per pair: `n_seeds`,
+  `n_seeds_significant` (Holm-corrected verdict per seed), the median
+  paired difference and its sign agreement across seeds, and
+  min/median/max of the Holm-corrected p-value. This reconciliation is
+  deliberately descriptive (no Fisher-style p-value combination);
+  method-level claims require the verdict AND the sign of the effect
+  to agree across seeds.
 
 ## 6. Fusion pipeline (Pipeline B — separate from the 8-extractor Pipeline A)
 

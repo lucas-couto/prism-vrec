@@ -5,18 +5,21 @@ Each strategy receives a list of matrices ``[Z1, Z2, ..., ZM]`` where
 ``(N, Dh)``.  Optional L2 normalisation can be applied per-vector before
 fusion.
 
-Ten strategies are provided:
+Eleven strategies are provided (ten offline plus the learned
+``adaptive_gated``, which lives in :mod:`src.fusions.online`):
 
 *   **mean** -- element-wise mean (equal dims required)
 *   **sum** -- element-wise sum (equal dims required)
 *   **prod** -- Hadamard product (equal dims required)
 *   **max_pool** -- element-wise max (equal dims required)
-*   **weighted_mean** -- configurable per-source weights (equal dims)
-*   **attention_weighted** -- softmax over learnable logits (equal dims)
-*   **gated** -- normalised sigmoid over logits (equal dims)
+*   **weighted_mean** -- fixed configurable per-source weights (equal dims)
+*   **attention_weighted** -- softmax over fixed configurable logits (equal dims)
+*   **gated** -- normalised sigmoids over fixed configurable logits (equal dims)
 *   **concat** -- concatenation along the feature axis (any dims)
 *   **pca** -- PCA on the concatenation (any dims)
 *   **pca_per_model** -- separate PCA per source, then concatenate (any dims)
+*   **adaptive_gated** -- online per-item gate MLP co-trained with the
+    recommender (equal dims; no offline artifact)
 
 Use :func:`get_fusion_strategy` to obtain a strategy callable by name.
 """
@@ -267,7 +270,7 @@ def fuse_attention_weighted(
     logits: list[float] | None = None,
     **kwargs,
 ) -> np.ndarray:
-    """Attention-weighted fusion via softmax over learnable logits.
+    """Attention-weighted fusion via softmax over fixed configurable logits.
 
     Each source *m* receives a scalar attention weight
     ``alpha_m = softmax(logits)[m]``.  The fused representation is the
@@ -321,7 +324,7 @@ def fuse_gated(
     logits: list[float] | None = None,
     **kwargs,
 ) -> np.ndarray:
-    """Gated fusion via normalised sigmoid over logits.
+    """Gated fusion via normalised sigmoids over fixed configurable logits.
 
     Each source *m* receives a gate value ``g_m = sigmoid(logit_m)``.  The
     gates are then normalised to sum to 1 so that the fused representation
@@ -645,6 +648,23 @@ def _expand_weighted_mean(cfg: dict) -> list[tuple[str, dict]]:
     return [(f"_w{w}", {"weights": [w, 1.0 - w]}) for w in values]
 
 
+def _expand_fixed_logits(cfg: dict) -> list[tuple[str, dict]]:
+    """Expand the ``logits`` grid into ``[(suffix, {logits: [...]})]``.
+
+    Each grid entry is one full logit vector (one value per source),
+    e.g. ``logits: [[1.0, 0.0]]``.  A bare vector is promoted to a
+    single-entry grid.  Defaults to the uniform two-source vector
+    (all-zero logits), which reduces to plain ``mean``.
+    """
+    values = cfg.get("logits", [[0.0, 0.0]])
+    if values and not isinstance(values[0], list):
+        values = [values]
+    return [
+        ("_l" + "_".join(f"{float(v):g}" for v in vec), {"logits": [float(v) for v in vec]})
+        for vec in values
+    ]
+
+
 def _expand_pca(cfg: dict) -> list[tuple[str, dict]]:
     """Expand the ``n_components`` grid for the joint-PCA strategy."""
     values = cfg.get("n_components", [128])
@@ -685,8 +705,14 @@ register_fusion_strategy(
     "attention_weighted",
     fuse_attention_weighted,
     equal_dim_required=True,
+    expand_grid=_expand_fixed_logits,
 )
-register_fusion_strategy("gated", fuse_gated, equal_dim_required=True)
+register_fusion_strategy(
+    "gated",
+    fuse_gated,
+    equal_dim_required=True,
+    expand_grid=_expand_fixed_logits,
+)
 
 register_fusion_strategy("concat", fuse_concat, equal_dim_required=False)
 register_fusion_strategy(

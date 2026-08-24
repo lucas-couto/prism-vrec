@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import src.steps.evaluate as ev
 from src.steps.evaluate import (
@@ -12,7 +14,81 @@ from src.steps.evaluate import (
     _load_done,
     _record_done,
     _route_targets,
+    load_data,
 )
+
+
+def _write_dataset(
+    base: Path,
+    train: list[tuple[int, int]],
+    val: list[tuple[int, int]],
+    test: list[tuple[int, int]],
+) -> None:
+    """Write a minimal processed dataset (CSV splits + idx maps)."""
+    base.mkdir(parents=True)
+    for name, rows in (("train", train), ("val", val), ("test", test)):
+        pd.DataFrame(rows, columns=["user_idx", "item_idx"]).to_csv(
+            base / f"{name}.csv", index=False
+        )
+    users = sorted({u for rows in (train, val, test) for u, _ in rows})
+    items = sorted({i for rows in (train, val, test) for _, i in rows})
+    (base / "user2idx.json").write_text(json.dumps({str(u): u for u in users}))
+    (base / "item2idx.json").write_text(json.dumps({str(i): i for i in items}))
+
+
+class TestLoadDataDisjointness:
+    """A3 guard: a test item duplicated in train/val is masked -> unhittable."""
+
+    def test_disjoint_splits_load_fine(self, tmp_path: Path) -> None:
+        _write_dataset(
+            tmp_path / "amazon_x",
+            train=[(0, 1), (0, 2), (1, 3)],
+            val=[(0, 4), (1, 5)],
+            test=[(0, 6), (1, 7)],
+        )
+
+        n_users, n_items, seen, test, train_only = load_data(str(tmp_path), "amazon_x")
+
+        assert test == {0: {6}, 1: {7}}
+        assert seen[0] == {1, 2, 4}
+
+    def test_test_item_in_train_raises(self, tmp_path: Path) -> None:
+        # user 0's test item 2 is also in their train history; user 1's
+        # test item 5 is also in their val history — both unhittable.
+        _write_dataset(
+            tmp_path / "amazon_x",
+            train=[(0, 1), (0, 2), (1, 3)],
+            val=[(0, 4), (1, 5)],
+            test=[(0, 2), (1, 5)],
+        )
+
+        with pytest.raises(ValueError, match=r"2 \(user, item\) pair"):
+            load_data(str(tmp_path), "amazon_x")
+
+    def test_error_reports_examples(self, tmp_path: Path) -> None:
+        _write_dataset(
+            tmp_path / "amazon_x",
+            train=[(0, 1), (0, 2)],
+            val=[(0, 4)],
+            test=[(0, 2)],
+        )
+
+        with pytest.raises(ValueError, match=r"\(user=0, item=2\)"):
+            load_data(str(tmp_path), "amazon_x")
+
+    def test_same_item_for_different_users_is_allowed(self, tmp_path: Path) -> None:
+        # item 2 is user 0's train item but user 1's test item —
+        # per-user disjointness holds, no error.
+        _write_dataset(
+            tmp_path / "amazon_x",
+            train=[(0, 2), (1, 3)],
+            val=[(0, 4), (1, 5)],
+            test=[(0, 6), (1, 2)],
+        )
+
+        _, _, _, test, _ = load_data(str(tmp_path), "amazon_x")
+
+        assert test == {0: {6}, 1: {2}}
 
 
 class TestRouteTargets:

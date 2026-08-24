@@ -8,6 +8,95 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-08-22
+
+### Added
+
+- **Optional fixed linear projection of every extractor to one common
+  dimension**, configured under `projection:` in
+  `configs/extractors.yaml`:
+
+  ```yaml
+  projection:
+    method: pca # none (default) | random | pca
+    dim: 128
+    seed: 42 # method: random only
+  ```
+
+  Writes `<extractor>_p<dim>.npy` **alongside** the native artifact —
+  the v2 native-dim contract is untouched and both can be trained and
+  compared in the same battery. `random` is a seeded semi-orthogonal
+  matrix (QR of a Gaussian; data-independent, so it cannot leak
+  validation or test items and reproduces on any machine); `pca` is fit
+  on train items only, mirroring `alignment.method: pca`. Any extractor
+  overrides the block under `extractors.<name>.projection`, including
+  `method: none` to stay native-only.
+
+  This gives the element-wise fusion family (`mean`, `sum`, `prod`,
+  `max_pool`, ...) equal-dim sources with nothing learned online: point
+  `fusion_extractors` at the projected names and the fuse step consumes
+  them directly. The `_p<dim>` token sits before the condition suffix
+  (`resnet50_p128.npy`, `resnet50_p128_finetuned.npy`), so one
+  `fusion_extractors` entry resolves in both conditions, and `train` /
+  `evaluate` discover the projected stems by the same glob that finds
+  every other embedding — no registration.
+
+  Projecting an already-extracted catalogue never reloads a backbone:
+  the hook reads the source's own `.meta.json` for provenance and
+  streams the matrix in 8192-row chunks, so peak memory is a function of
+  the chunk, not of the catalogue. The projector itself is persisted as
+  `<extractor>_p<dim>.proj.npz` plus a `.proj.json` (method, dim, seed,
+  fit set), and the artifact's sidecar records `source_native_dim`
+  alongside the projected `native_dim` — which is also what keeps the
+  loader's metadata cross-check satisfied.
+
+  **`docs/protocol.md` §1b states the methodological caveat**: a fixed
+  projection is an experimental variable, not a free normalisation.
+  `method: random` is exactly the seeded random projection §1 rejects as
+  a *default*, so a comparison run only on projected artifacts compares
+  "backbone × compression". Report it next to the native-dim result from
+  the same run.
+
+- **Two flags selecting which variant is consumed**, separate from the
+  decision to write it:
+
+  ```yaml
+  # configs/recommenders.yaml
+  embedding_variants: both # native | projected | both
+
+  # configs/fusion.yaml
+  extractor_variants: native # native | projected | both
+  ```
+
+  `embedding_variants` filters the training cells at their single source
+  of truth (`train._iter_cells`), so `evaluate` — which enumerates from
+  the checkpoints `train` produced — follows automatically. The
+  non-visual `"none"` pseudo-embedding is never filtered out, so a
+  projected-only battery keeps plain BPR. Fusion outputs are classified
+  with the sources they were built from, since they carry the same
+  token.
+
+  `extractor_variants` expands `fusion_extractors` into the chosen
+  family, keeping the logical names in the config. With `projected` the
+  sources already share a width, so the entire `alignment:` block is
+  bypassed: the equal-dim strategies fuse them directly, with no
+  `Linear(D_i -> D)` co-trained by BPR and no PCA fit inside the fuse
+  step — the point of projecting at extraction time. Outputs carry the
+  variant token (`hybrid_mean` vs `hybrid_mean_p128`) so both families
+  coexist in one dataset directory, and `both` runs one pass each. A
+  projected variant whose extractors have no projection, or are
+  projected to *different* widths, fails loudly rather than fusing
+  matrices that do not share a space.
+
+### Changed
+
+- `train_item_indices` — the train-only fit set that anything learned
+  from item features must be fit on — moved to `src/utils/splits.py`,
+  shared by the fusion PCA alignment and the new projection instead of
+  being private to `src/steps/fuse.py`. `fit_pca_on_rows` is now
+  exported from the `src.fusions` package rather than reached through
+  `src.fusions.strategies`.
+
 ## [2.6.4] - 2026-08-22
 
 ### Added

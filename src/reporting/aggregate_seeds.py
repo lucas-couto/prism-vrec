@@ -8,6 +8,22 @@ long-format CSVs and writes a consolidated table with ``mean``,
 fusion, condition, metric, k) cell — the headline number researchers
 actually report.
 
+Cross-seed reconciliation of the statistical tests
+--------------------------------------------------
+
+Every p-value in a per-seed ``statistical_tests.csv`` is a statement
+about ONE training realisation: it tests whether config A beats config
+B *for the models trained under that seed*, not whether method A beats
+method B in general.  ``aggregate_statistical_tests`` therefore builds
+``statistical_tests_across_seeds.csv`` — per (dataset, family, group,
+pair, metric, k): ``n_seeds``, ``n_seeds_significant`` (Holm-corrected
+verdicts), the median paired difference and its sign agreement across
+seeds, and min/max/median of the Holm-corrected p-value.  This is a
+DESCRIPTIVE reconciliation, deliberately not a p-value combination
+method (no Fisher's method): a method-level claim requires the
+Holm-corrected verdict AND the sign of the difference to agree across
+seeds, and must be phrased as such.
+
 Pure pandas (no torch / no ML deps); safe to run on a laptop.
 """
 
@@ -16,6 +32,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -41,6 +58,30 @@ _GROUP_KEYS_CI = [
     "fusion",
     "condition",
     "embedding_dim",
+    "metric",
+    "k",
+]
+
+# Pair identity in the long-format statistical_tests.csv.  ``config_a``
+# / ``config_b`` are THE identity — the full config strings, including
+# the ``_D<dim>`` token.  The parsed components that follow are kept as
+# descriptive columns but do NOT suffice as a key: configs differing
+# only in embedding_dim parse to the same components and would collapse
+# into one group, making ``n_seeds`` count seeds × dims (R2).
+_GROUP_KEYS_TESTS = [
+    "dataset",
+    "family",
+    "group",
+    "config_a",
+    "config_b",
+    "recommender_a",
+    "extractor_a",
+    "fusion_a",
+    "condition_a",
+    "recommender_b",
+    "extractor_b",
+    "fusion_b",
+    "condition_b",
     "metric",
     "k",
 ]
@@ -122,6 +163,62 @@ def aggregate_bootstrap_ci(seed_dirs: list[Path], seeds: list[int] | None) -> pd
     return _aggregate(df, _GROUP_KEYS_CI, "mean")
 
 
+def _sign_agreement(diffs: pd.Series) -> float:
+    """Fraction of seeds whose difference sign matches the median's sign.
+
+    ``1.0`` means every seed agrees on the direction of the effect;
+    ``NaN`` when no seed reported a difference.
+    """
+    values = diffs.dropna()
+    if values.empty:
+        return float("nan")
+    return float((np.sign(values) == np.sign(values.median())).mean())
+
+
+def aggregate_statistical_tests(seed_dirs: list[Path], seeds: list[int] | None) -> pd.DataFrame:
+    """Reconcile per-seed pairwise verdicts (see the module docstring).
+
+    Reads each seed's ``statistical_tests.csv``, keeps the Wilcoxon
+    rows, and returns one row per (dataset, family, group, pair,
+    metric, k) with ``n_seeds``, ``n_seeds_significant``
+    (Holm-corrected verdicts), ``median_diff_mean``,
+    ``sign_agreement``, and ``p_holm_min/median/max``.  Descriptive
+    only — no p-value combination is performed.
+    """
+    df = _read_per_seed(seed_dirs, "statistical_tests.csv", seeds)
+    if df.empty:
+        return df
+    if "test_type" in df.columns:
+        df = df[df["test_type"] == "wilcoxon"].copy()
+    if df.empty:
+        return pd.DataFrame()
+    if "diff_mean" not in df.columns:
+        df["diff_mean"] = np.nan
+    if "config_a" not in df.columns or "config_b" not in df.columns:
+        # Legacy per-seed CSVs (pre config_a/config_b columns): grouping
+        # falls back to the parsed components, which collapse configs
+        # differing only in embedding_dim (R2).  Warn loudly instead of
+        # misgrouping silently.
+        logger.warning(
+            "statistical_tests.csv lacks config_a/config_b; falling back "
+            "to parsed-component grouping. Configs differing only in "
+            "embedding_dim WILL collapse into one group — regenerate the "
+            "per-seed long-format tables to fix the pair identity."
+        )
+
+    keys = [k for k in _GROUP_KEYS_TESTS if k in df.columns]
+    grouped = df.groupby(keys, dropna=False)
+    return grouped.agg(
+        n_seeds=("significant", "size"),
+        n_seeds_significant=("significant", "sum"),
+        median_diff_mean=("diff_mean", "median"),
+        sign_agreement=("diff_mean", _sign_agreement),
+        p_holm_min=("corrected_p", "min"),
+        p_holm_median=("corrected_p", "median"),
+        p_holm_max=("corrected_p", "max"),
+    ).reset_index()
+
+
 def write_cross_seed_aggregates(
     seed_dirs: list[Path],
     output_dir: Path,
@@ -151,6 +248,16 @@ def write_cross_seed_aggregates(
         "Wrote cross-seed bootstrap CI (%d rows) to %s",
         len(ci_df),
         ci_path,
+    )
+
+    tests_df = aggregate_statistical_tests(seed_dirs, seeds)
+    tests_path = output_dir / "statistical_tests_across_seeds.csv"
+    tests_df.to_csv(tests_path, index=False)
+    written["statistical_tests_across_seeds"] = tests_path
+    logger.info(
+        "Wrote cross-seed statistical reconciliation (%d rows) to %s",
+        len(tests_df),
+        tests_path,
     )
 
     return written

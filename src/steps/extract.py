@@ -19,6 +19,12 @@ from src.extractors import (
     is_registered,
     registered_extractor_names,
 )
+from src.extractors.projection import (
+    ProjectionConfig,
+    ensure_projected,
+    projected_path,
+    resolve_projection_config,
+)
 from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
@@ -26,6 +32,7 @@ from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
+from src.utils.splits import train_item_indices
 from src.utils.timing import time_cell
 
 logger = get_logger(__name__)
@@ -100,6 +107,56 @@ def _write_meta(extractor, extractor_name: str, npy_path: Path, extra: dict | No
     atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
 
 
+def _project_pooled(
+    pooled_path: Path,
+    projection: ProjectionConfig | None,
+    train_items,
+) -> bool:
+    """Write the fixed-dim projection of a pooled artifact, if configured.
+
+    Deliberately independent of a live extractor instance: the source's
+    own ``.meta.json`` carries the backbone provenance, so projecting a
+    catalogue that was extracted on an earlier run never pays for
+    loading the backbone weights again.
+
+    The sidecar declares the *projected* width under ``native_dim``,
+    because that is what a loader must expect from this file; the
+    backbone's own width is preserved under ``source_native_dim`` so the
+    artifact still says where it came from.
+
+    :returns: ``True`` when a projected artifact was written.
+    """
+    if projection is None:
+        return False
+
+    written = ensure_projected(pooled_path, projection, train_items)
+    if written is None:
+        return False
+
+    source_meta_path = pooled_path.with_suffix("").with_suffix(".meta.json")
+    meta: dict = {}
+    if source_meta_path.exists():
+        meta = json.loads(source_meta_path.read_text(encoding="utf-8"))
+
+    meta.update(
+        {
+            "name": written.stem,
+            "kind": "pooled",
+            "source_native_dim": meta.get("native_dim"),
+            "native_dim": projection.dim,
+            "projection": {
+                "method": projection.method,
+                "dim": projection.dim,
+                "source": pooled_path.name,
+            },
+        }
+    )
+    payload = json.dumps(meta, indent=2)
+    meta_path = written.with_suffix("").with_suffix(".meta.json")
+    atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
+    return True
+
+
 def _validate_native_dim(extractor, extractor_name: str, config: dict) -> None:
     """Fail loudly when the probed native dim contradicts the config.
 
@@ -129,6 +186,8 @@ def _extract_for_config(
     device: str,
     config: dict,
     extract_components: bool = False,
+    projection: ProjectionConfig | None = None,
+    train_items: list[int] | None = None,
 ) -> bool:
     """Extract native-dim embeddings for a single ``(extractor, dataset)`` cell.
 
@@ -138,6 +197,12 @@ def _extract_for_config(
     ``supports_components``, additionally writes the 3-D
     ``<extractor>_comp.npy`` (native per-item components) consumed by
     ACF.  Both outputs are skipped independently when already present.
+
+    When ``projection`` is set, a fixed-dim ``<extractor>_p<dim>.npy`` is
+    written alongside the native pooled artifact.  It is skipped
+    independently too, and a cell that needs *only* the projection never
+    instantiates the backbone: projecting an already-extracted catalogue
+    costs a linear pass over the matrix, not a re-extraction.
 
     :returns:
         ``True`` when something was actually extracted, ``False`` when
@@ -152,10 +217,19 @@ def _extract_for_config(
     want_components = extract_components and getattr(extractor_cls, "supports_components", False)
     need_pooled = not pooled_path.exists()
     need_components = want_components and not comp_path.exists()
+    need_projection = (
+        projection is not None and not projected_path(pooled_path, projection.dim).exists()
+    )
 
-    if not need_pooled and not need_components:
+    if not need_pooled and not need_components and not need_projection:
         logger.info("  %s: already exists, skipping.", extractor_name)
         return False
+
+    if not need_pooled and not need_components:
+        # Only the projection is missing.  The native features are already
+        # on disk and the projection is a linear map over them, so the
+        # backbone is never loaded.
+        return _project_pooled(pooled_path, projection, train_items)
 
     logger.info("  Extracting %s (native dim)...", extractor_name)
     extractor = extractor_cls(device=device)
@@ -216,7 +290,42 @@ def _extract_for_config(
             components.shape,
         )
 
+    _project_pooled(pooled_path, projection, train_items)
+
     return True
+
+
+def _components_needed(config: dict) -> bool:
+    """Return ``True`` when component artifacts must be extracted.
+
+    An explicit ``extract_components: true`` in the config always wins.
+    Otherwise component extraction is auto-enabled when any recommender
+    in ``recommenders_enabled`` declares ``requires_components`` (e.g.
+    ACF) — so enabling such a model can never strand the train step on
+    ``EnabledRecommenderHasNoCellsError`` just because the flag was off.
+    Unregistered names are skipped here; the train step already fails
+    loud on them.
+    """
+    if bool(config.get("extract_components", False)):
+        return True
+
+    # Local import: pulling in the recommender package registers every
+    # model spec, and doing it lazily keeps extract importable without it.
+    from src.recommenders import get_recommender_spec
+
+    for name in config.get("recommenders_enabled") or []:
+        try:
+            spec = get_recommender_spec(name)
+        except KeyError:
+            continue
+        if spec.requires_components:
+            logger.info(
+                "extract_components auto-enabled: recommender %r requires "
+                "component embeddings (*_comp.npy).",
+                name,
+            )
+            return True
+    return False
 
 
 def run() -> None:
@@ -230,7 +339,7 @@ def run() -> None:
     batch_size = config.get("batch_size", 64)
     checkpoint_every = config.get("checkpoint_every", 500)
     datasets = config.get("datasets", [])
-    extract_components = bool(config.get("extract_components", False))
+    extract_components = _components_needed(config)
 
     # Instantiating the manager guarantees the on-disk directories exist.
     CheckpointManager()
@@ -266,8 +375,15 @@ def run() -> None:
 
         item_ids = get_item_ids(processed_dir, dataset_name)
         image_dir = f"{config['paths']['data_raw']}/{dataset_name}/images"
+        # Read once per dataset, and only when some extractor actually
+        # asks for a train-only PCA projection.
+        train_items: list[int] | None = None
 
         for extractor_name, extractor_cls in extractors.items():
+            projection = resolve_projection_config(config, extractor_name)
+            if projection is not None and projection.method == "pca" and train_items is None:
+                train_items = train_item_indices(processed_dir, dataset_name)
+
             with time_cell(
                 "extract",
                 dataset=dataset_name,
@@ -285,6 +401,8 @@ def run() -> None:
                     device=device,
                     config=config,
                     extract_components=extract_components,
+                    projection=projection,
+                    train_items=train_items,
                 )
                 if not did_work:
                     cell.skip("embeddings already on disk")

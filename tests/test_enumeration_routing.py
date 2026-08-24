@@ -11,8 +11,15 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from src.steps.train import build_job_list, is_component_artifact
+from src.steps.train import (
+    EnabledRecommenderHasNoCellsError,
+    _cell_counts,
+    assert_enabled_recommenders_have_cells,
+    build_job_list,
+    is_component_artifact,
+)
 
 DATASET = "synthetic"
 N_ITEMS = 4
@@ -76,6 +83,42 @@ def test_vbpr_excludes_component_stems(tmp_path, monkeypatch) -> None:
 
     vbpr_embeddings = {j.embedding_name for j in jobs if j.model_name == "vbpr"}
     assert vbpr_embeddings == {"vit_b16_D128", "hybrid_mean_D128"}
+
+
+class TestSilentDropoutGuard:
+    """Audit D5: an enabled recommender with zero cells must fail loud."""
+
+    def test_acf_without_comp_artifacts_raises_actionable_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        processed, emb = _setup(tmp_path, with_comp=False)
+
+        counts = _cell_counts("frozen", _config(), processed, emb)
+
+        assert counts["acf"] == 0
+        assert counts["vbpr"] > 0
+        with pytest.raises(EnabledRecommenderHasNoCellsError, match=r"acf.*comp"):
+            assert_enabled_recommenders_have_cells(counts, "frozen")
+
+    def test_passes_when_comp_artifacts_exist(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        processed, emb = _setup(tmp_path, with_comp=True)
+
+        counts = _cell_counts("frozen", _config(), processed, emb)
+
+        assert_enabled_recommenders_have_cells(counts, "frozen")  # no raise
+
+    def test_globally_empty_enumeration_does_not_raise(self) -> None:
+        # No artifacts at all (e.g. finetuned condition before finetuning):
+        # handled by the existing "no pending jobs" paths, not per model.
+        assert_enabled_recommenders_have_cells({"vbpr": 0, "acf": 0}, "frozen")
+
+    def test_feature_blind_model_exempt_in_finetuned_condition(self) -> None:
+        # Plain BPR only runs frozen; its absence from finetuned is by design.
+        assert_enabled_recommenders_have_cells({"bpr": 0, "vbpr": 3}, "finetuned")
+
+    def test_visual_model_with_zero_cells_raises_in_finetuned(self) -> None:
+        with pytest.raises(EnabledRecommenderHasNoCellsError, match="vbpr"):
+            assert_enabled_recommenders_have_cells({"vbpr": 0, "deepstyle": 2}, "finetuned")
 
 
 def test_vbpr_pool_is_identical_with_and_without_comp_file(tmp_path, monkeypatch) -> None:

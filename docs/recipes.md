@@ -283,6 +283,59 @@ framework no longer needs to be in the loop.
 
 ---
 
+## 8b. "Every extractor must emit the same dimension (e.g. 128)"
+
+```yaml
+# configs/extractors.yaml
+projection:
+  method: pca # random | pca
+  dim: 128
+```
+
+```bash
+python main.py --from extract --to extract --condition frozen
+```
+
+Writes `<extractor>_p128.npy` next to each native artifact. The native
+files are untouched, so this costs a linear pass over matrices already
+on disk — the backbones are not loaded again — and the run that follows
+can compare native against projected.
+
+Two flags decide what consumes the artifacts:
+
+```yaml
+# configs/recommenders.yaml — which variants the recommenders train on
+embedding_variants: both # native | projected | both
+
+# configs/fusion.yaml — which variants feed the fusion
+extractor_variants: projected # native | projected | both
+```
+
+`fusion_extractors` keeps the logical names (`resnet50`, `vit_b16`);
+`extractor_variants` picks the family. With `projected`, the sources
+already share a width, so the `alignment:` block is bypassed entirely —
+no `Linear(D_i -> D)` co-trained by BPR, no PCA fit inside the fuse
+step. Outputs carry the token so both families coexist:
+`hybrid_mean.npy` next to `hybrid_mean_p128.npy`. `both` runs one pass
+each.
+
+The projected stems are picked up as ordinary embeddings by `train` and
+`evaluate`, no registration needed, and the same names resolve in the
+fine-tuned condition (`resnet50_p128_finetuned.npy`) because the
+`_p<dim>` token sits before the condition suffix.
+
+Two caveats worth stating in the dissertation before reporting numbers
+from these artifacts:
+
+- A fixed projection **is an experimental variable**. A comparison run
+  only on projected artifacts compares "backbone × compression", which
+  is what [`docs/protocol.md` §1](protocol.md) rejects as the headline
+  benchmark. Report it next to the native-dim result from the same run.
+- `dim` must not exceed the narrowest enabled backbone's `raw_dim`
+  (`cvt_13` = 384); projecting upward fails loudly rather than padding.
+
+---
+
 ## 9. "I have a custom recommender; everything else stays default"
 
 After adding the plugin under `plugins/recommenders/<name>.py`:
@@ -310,13 +363,14 @@ The earlier steps' outputs (extracts, fusions) are reused.
 ## 9b. "Run ACF (component-level + item-level attention)"
 
 ACF is the only recommender that consumes per-item *component*
-embeddings (`<extractor>_D<dim>_comp.npy`, shape `(n_items, M, D)`)
-instead of the pooled `(n_items, D)` ones. Two edits enable it: turn on
-component extraction, and add `acf` to the recommender list.
+embeddings (`<extractor>_comp.npy`, shape `(n_items, M, native_dim)`)
+instead of the pooled `(n_items, native_dim)` ones. One edit enables
+it: add `acf` to the recommender list — the extract step auto-enables
+component extraction whenever an enabled recommender requires it
+(`extract_components: true` in `configs/default.yaml` only forces the
+artifacts without such a recommender).
 
 ```yaml
-# configs/default.yaml
-extract_components: true        # extractors also emit the 3-D *_comp artifacts
 
 # configs/recommenders.yaml
 recommenders_enabled:
@@ -364,7 +418,7 @@ GPU.
 | --- | --- | --- |
 | `datasets:` | `configs/default.yaml` | Every step that loops datasets becomes a no-op. |
 | `extractors_enabled` | `configs/extractors.yaml` | `extract` and `finetune` skip. |
-| `extract_components` | `configs/default.yaml` | Off → no `*_comp` artifacts written (ACF cannot run); pooled output unchanged. |
+| `extract_components` | `configs/default.yaml` | Off → auto-enabled while a component recommender (e.g. `acf`) is enabled; `true` forces the `*_comp` artifacts without one. Pooled output unchanged. |
 | `finetuning.extractors` | `configs/finetuning.yaml` | `finetune` and `evaluate_finetuning` skip. |
 | `fusion_strategies_enabled` | `configs/fusion.yaml` | `fuse` step skips entirely. |
 | `recommenders_enabled` | `configs/recommenders.yaml` | `train` step skips entirely. |

@@ -12,6 +12,14 @@ seed: 42
 # silently crash.  The resolved device is recorded in the run manifest.
 device: "auto"
 
+# When true the extract step also writes the pre-pool component
+# embeddings (`<extractor>_comp.npy`, shape (n_items, M, native_dim))
+# for extractors that expose them.  Leave false: component extraction
+# is AUTO-ENABLED whenever a recommender in `recommenders_enabled`
+# declares `requires_components` (e.g. acf), so this flag only needs
+# to be true to force the artifacts with no such recommender enabled.
+extract_components: false
+
 paths:
   data_raw: "data/raw"
   data_processed: "data/processed"

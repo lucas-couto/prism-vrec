@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from src.data import dvbpr  # noqa: F401
 from src.data.base import get_dataset_provider
 from src.extractors import get_extractor_class, is_registered
+from src.extractors.projection import ensure_projected, resolve_projection_config
 from src.finetuning.checkpoint import (
     FineTuningMetadata,
     load_finetuned,
@@ -42,6 +43,7 @@ from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
+from src.utils.splits import train_item_indices
 from src.utils.timing import time_cell
 
 logger = get_logger(__name__)
@@ -257,7 +259,31 @@ def _finetune_and_extract(
     atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
     logger.info("  %s finetuned: saved (%s)", extractor_name, embeddings.shape)
 
+    # The fine-tuned features are a different space from the frozen ones,
+    # so they get their own projector rather than reusing the frozen one.
+    _project_finetuned(output_path, extractor_name, dataset_name)
+
     return True
+
+
+def _project_finetuned(output_path: Path, extractor_name: str, dataset_name: str) -> None:
+    """Project the fine-tuned artifact when ``projection:`` is configured.
+
+    Mirrors what ``extract`` does for the frozen condition, so both
+    conditions offer the same fixed-dim artifacts and a fusion configured
+    on ``<extractor>_p<dim>`` resolves in either one.
+    """
+    config = load_config()
+    projection = resolve_projection_config(config, extractor_name)
+    if projection is None:
+        return
+
+    train_items = (
+        train_item_indices(config["paths"]["data_processed"], dataset_name)
+        if projection.method == "pca"
+        else None
+    )
+    ensure_projected(output_path, projection, train_items)
 
 
 def run() -> None:

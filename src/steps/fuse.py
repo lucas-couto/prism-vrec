@@ -36,8 +36,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
+from src.extractors.projection import resolve_projection_config
 from src.fusions import (
     get_fusion_strategy,
     is_registered,
@@ -54,6 +54,7 @@ from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
 from src.utils.logging import get_logger
 from src.utils.memory import plan_pool_workers
+from src.utils.splits import train_item_indices
 
 logger = get_logger(__name__)
 
@@ -94,18 +95,6 @@ def _alignment_config(config: dict) -> tuple[str, int]:
     if method not in {"learned", "pca"}:
         raise ValueError(f"fusion alignment.method must be 'learned' or 'pca', got {method!r}")
     return method, int(block.get("dim", 128))
-
-
-def _train_item_indices(processed_dir: str, dataset_name: str) -> list[int]:
-    """Item indices with at least one *training* interaction.
-
-    The PCA fit set: fitting on all catalogue items would leak items
-    that only occur in validation/test interactions into the learned
-    components.
-    """
-    train_csv = Path(processed_dir) / dataset_name / "train.csv"
-    df = pd.read_csv(train_csv, usecols=["item_idx"])
-    return sorted(int(i) for i in df["item_idx"].unique())
 
 
 def _source_row_bytes(emb_list_paths: list[str]) -> tuple[int, int]:
@@ -268,12 +257,24 @@ def _collect_fusion_tasks(
     alignment_method: str,
     alignment_dim: int,
     suffix: str = "",
+    variant_token: str = "",
+    pre_aligned: bool = False,
 ) -> list[dict]:
     """Build the list of fusion tasks for a single dataset.
 
     Strategy-agnostic: every registered strategy declares its grid via
     :meth:`FusionSpec.expand_grid`.  This function only knows the I/O
     layout and the alignment routing — never strategy-specific math.
+
+    *variant_token* distinguishes the outputs of a projected-source run
+    (``hybrid_mean_p128``) from the native one (``hybrid_mean``), so both
+    variants can coexist in one dataset directory.
+
+    *pre_aligned* declares that the sources already share a width — the
+    case when they are fixed-dim projections.  The whole ``alignment:``
+    block is then bypassed: the equal-dim strategies fuse the sources
+    directly, with nothing learned online and no PCA fit inside this
+    step, which is the point of projecting at extraction time.
     """
     tasks: list[dict] = []
     dataset_dir = Path(embeddings_dir) / dataset_name
@@ -289,10 +290,12 @@ def _collect_fusion_tasks(
         return tasks
     native_path_strs = [str(p) for p in native_paths]
 
-    train_items = _train_item_indices(processed_dir, dataset_name)
+    train_items = train_item_indices(processed_dir, dataset_name)
     aligned_paths: list[Path] | None = None
-    if alignment_method == "pca" and any(
-        s.equal_dim_required for s in iter_specs() if s.name in enabled_strategies
+    if (
+        not pre_aligned
+        and alignment_method == "pca"
+        and any(s.equal_dim_required for s in iter_specs() if s.name in enabled_strategies)
     ):
         aligned_paths = _ensure_pca_aligned_sources(
             dataset_dir, extractors, suffix, alignment_dim, train_items
@@ -312,7 +315,7 @@ def _collect_fusion_tasks(
         if not spec.equal_dim_required:
             # Concatenation family: operates on native dims directly.
             for fsuffix, fn_kwargs in grid:
-                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{suffix}.npy"
+                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{variant_token}{suffix}.npy"
                 tasks.append(
                     {
                         "strategy_name": spec.name,
@@ -320,6 +323,39 @@ def _collect_fusion_tasks(
                         "emb_list_paths": native_path_strs,
                         "normalize": normalize,
                         "train_items": train_items if spec.name in _PCA_STRATEGIES else None,
+                        **fn_kwargs,
+                    }
+                )
+            continue
+
+        if pre_aligned:
+            # Sources already share a width, so there is nothing to align.
+            if spec.online:
+                out = dataset_dir / f"hybrid_{spec.name}{variant_token}{suffix}.json"
+                tasks.append(
+                    {
+                        "strategy_name": spec.name,
+                        "output_path": str(out),
+                        "emb_list_paths": native_path_strs,
+                        "normalize": normalize,
+                        "sidecar_payload": {
+                            "strategy": spec.name,
+                            "online": True,
+                            "alignment": "none",
+                            "components": [p.name for p in native_paths],
+                            "normalize": normalize,
+                        },
+                    }
+                )
+                continue
+            for fsuffix, fn_kwargs in grid:
+                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{variant_token}{suffix}.npy"
+                tasks.append(
+                    {
+                        "strategy_name": spec.name,
+                        "output_path": str(out),
+                        "emb_list_paths": native_path_strs,
+                        "normalize": normalize,
                         **fn_kwargs,
                     }
                 )
@@ -389,6 +425,59 @@ def _collect_fusion_tasks(
             )
 
     return tasks
+
+
+EXTRACTOR_VARIANTS = ("native", "projected", "both")
+
+
+def _resolve_extractor_variants(
+    config: dict, extractors: list[str]
+) -> list[tuple[list[str], str, bool]]:
+    """Expand ``fusion_extractors`` into the configured source variants.
+
+    ``extractor_variants`` in ``configs/fusion.yaml`` selects which
+    artifact family the fusion sources come from:
+
+    * ``native`` (default) — the backbones' own widths, aligned by the
+      ``alignment:`` block as before.
+    * ``projected`` — the fixed-dim artifacts written by
+      ``projection:`` in ``configs/extractors.yaml``.  They already share
+      a width, so no alignment happens at all.
+    * ``both`` — one pass each, with distinct outputs.
+
+    :returns: ``(source_names, output_token, pre_aligned)`` per variant.
+    :raises ValueError: On an unknown variant, on a projected variant
+        with no projection configured, or when the enabled extractors
+        are projected to *different* widths — which would not share a
+        space and so could not be fused element-wise.
+    """
+    value = str(config.get("extractor_variants", "native"))
+    if value not in EXTRACTOR_VARIANTS:
+        raise ValueError(
+            f"extractor_variants must be one of {list(EXTRACTOR_VARIANTS)}, got {value!r}"
+        )
+
+    variants: list[tuple[list[str], str, bool]] = []
+    if value in {"native", "both"}:
+        variants.append((list(extractors), "", False))
+    if value in {"projected", "both"}:
+        dims = {ext: resolve_projection_config(config, ext) for ext in extractors}
+        missing = sorted(ext for ext, cfg in dims.items() if cfg is None)
+        if missing:
+            raise ValueError(
+                f"extractor_variants={value!r} needs a projection for every fusion "
+                f"extractor, but {missing} have projection.method 'none' in "
+                f"configs/extractors.yaml."
+            )
+        widths = {cfg.dim for cfg in dims.values()}
+        if len(widths) > 1:
+            raise ValueError(
+                f"fusion extractors are projected to different widths ({sorted(widths)}); "
+                f"element-wise fusion needs one shared dim."
+            )
+        dim = widths.pop()
+        variants.append(([f"{ext}_p{dim}" for ext in extractors], f"_p{dim}", True))
+    return variants
 
 
 def run(condition: str = "frozen") -> None:
@@ -466,21 +555,30 @@ def run(condition: str = "frozen") -> None:
         alignment_dim,
     )
 
+    variants = _resolve_extractor_variants(config, extractors)
     all_tasks: list[dict] = []
-    for dataset_name in datasets:
-        tasks = _collect_fusion_tasks(
-            dataset_name,
-            embeddings_dir,
-            processed_dir,
-            extractors,
-            fusion_config,
-            normalize,
-            enabled_strategies,
-            alignment_method,
-            alignment_dim,
-            suffix=suffix,
-        )
-        all_tasks.extend(tasks)
+    for source_names, variant_token, pre_aligned in variants:
+        if pre_aligned:
+            logger.info(
+                "Sources %s already share a width — alignment bypassed.",
+                ", ".join(source_names),
+            )
+        for dataset_name in datasets:
+            tasks = _collect_fusion_tasks(
+                dataset_name,
+                embeddings_dir,
+                processed_dir,
+                source_names,
+                fusion_config,
+                normalize,
+                enabled_strategies,
+                alignment_method,
+                alignment_dim,
+                suffix=suffix,
+                variant_token=variant_token,
+                pre_aligned=pre_aligned,
+            )
+            all_tasks.extend(tasks)
 
     pending = [t for t in all_tasks if not Path(t["output_path"]).exists()]
     skipped = len(all_tasks) - len(pending)

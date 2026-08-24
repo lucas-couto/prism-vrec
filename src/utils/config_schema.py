@@ -294,6 +294,24 @@ class AlignmentConfig(BaseModel):
     dim: int = Field(128, ge=1)
 
 
+class ExtractionProjectionConfig(BaseModel):
+    """Fixed linear projection applied at extraction time (optional).
+
+    ``none`` keeps the v2 contract: artifacts stay at the backbone's
+    native width.  ``random`` applies a seeded semi-orthogonal matrix,
+    ``pca`` a basis fit on train items only, ``pca_whitened`` the same
+    basis with per-component variance equalisation.  Any of them writes
+    ``<extractor>_p<dim>.npy`` *alongside* the native artifact, never in
+    place of it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["none", "random", "pca", "pca_whitened"] = "none"
+    dim: int = Field(128, ge=1)
+    seed: int = Field(42, ge=0, description="RNG seed for method 'random'; ignored by 'pca'.")
+
+
 class CommonTrainingConfig(BaseModel):
     """Shared recommender-training block (``common:`` in recommenders.yaml).
 
@@ -358,6 +376,14 @@ class FrameworkConfig(BaseModel):
     dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
 
+    projection: ExtractionProjectionConfig = Field(
+        default_factory=lambda: ExtractionProjectionConfig(),
+        description=(
+            "Fixed linear projection to a common dimension, written "
+            "alongside the native artifacts.  Overridable per extractor "
+            "under extractors.<name>.projection."
+        ),
+    )
     extractors_enabled: list[str] = Field(default_factory=list)
     extractors: dict[str, dict[str, Any]] = Field(default_factory=dict)
     fusion_extractors: list[str] = Field(default_factory=list)
@@ -383,7 +409,23 @@ class FrameworkConfig(BaseModel):
     strategies: dict[str, Any] | None = None
     normalize_before_fusion: bool = True
     alignment: AlignmentConfig = Field(default_factory=lambda: AlignmentConfig())
+    extractor_variants: Literal["native", "projected", "both"] = Field(
+        "native",
+        description=(
+            "Which artifact family the fusion sources come from.  "
+            "'projected' sources already share a width, so the alignment "
+            "block is bypassed."
+        ),
+    )
 
+    embedding_variants: Literal["native", "projected", "both"] = Field(
+        "both",
+        description=(
+            "Which embedding artifacts the recommenders train on when a "
+            "fixed projection is configured: the native features, their "
+            "fixed-dim projections, or both."
+        ),
+    )
     recommenders_enabled: list[str] = Field(default_factory=list)
     common: CommonTrainingConfig = Field(default_factory=CommonTrainingConfig)
     hp_search: HpSearchConfig = Field(default_factory=HpSearchConfig)

@@ -38,7 +38,7 @@ Authored by **Lucas Silva Couto** ([ORCID 0009-0000-0641-8166](https://orcid.org
 
 ## 1. Overview
 
-The framework lets you compare visual feature extractors as drop-in front-ends for recommender systems under a single, reproducible protocol. It supports four families of extractors, ten late-fusion strategies, and five recommender models, all wired through a configurable, idempotent pipeline.
+The framework lets you compare visual feature extractors as drop-in front-ends for recommender systems under a single, reproducible protocol. It supports four families of extractors, eleven late-fusion strategies (ten offline plus one learned online), and six recommender models, all wired through a configurable, idempotent pipeline.
 
 **Extractor families covered out of the box:**
 
@@ -47,7 +47,7 @@ The framework lets you compare visual feature extractors as drop-in front-ends f
 | Pure architectures                                    | ResNet50 (CNN), ViT-B/16 (Transformer)                                    |
 | CNN+Transformer architectural hybrids                 | CvT-13, CoAtNet-0, LeViT-256                                              |
 | Foundation models (ViTs with specialised pretraining) | CLIP ViT-B/32 (contrastive multimodal), DINOv2 ViT-B/14 (self-supervised) |
-| Late-fusion strategies                                | 10 strategies over ResNet50 + ViT-B/16 embeddings                         |
+| Late-fusion strategies                                | 11 strategies (10 offline + 1 learned online) over ResNet50 + ViT-B/16 embeddings |
 
 **Research question the framework lets you answer:** _In visual recommendation, does CNN+ViT hybridisation, whether by late fusion or architectural design, compete with (a) pure architectures and (b) foundation models, as state-of-the-art baselines?_
 
@@ -162,7 +162,7 @@ The three long-format files at the top consolidate the ~160 granular per-(datase
 │                        PIPELINE OVERVIEW                                 │
 │                                                                          │
 │  01 Download ─→ 02 Preprocess ─→ 03 Extract ─→ 04 Fuse ─→ 05 Train     │
-│     (DVBPR)      (splits+imgs)    (7 models)   (10 strat)  (parallel)   │
+│     (DVBPR)      (splits+imgs)    (8 models)   (11 strat)  (parallel)   │
 │                                                                          │
 │                        ─→ 06 Evaluate ─→ 07 Stats ─→ 08 Best Hyperparams │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -175,7 +175,7 @@ The three long-format files at the top consolidate the ~160 granular per-(datase
 | 03   | `src/steps/extract.py`             | Extract frozen embeddings for every `(extractor, dataset, dim)`                  |
 | 03b  | `src/steps/finetune.py`            | Fine-tune 5 extractors via category classification, then re-extract              |
 | 03c  | `src/steps/evaluate_finetuning.py` | Post-hoc top-K / F1 / confusion matrix on the deterministic FT val split         |
-| 04   | `src/steps/fuse.py`                | Apply 10 fusion strategies (parallelised across CPU cores)                       |
+| 04   | `src/steps/fuse.py`                | Apply 11 fusion strategies (parallelised across CPU cores)                       |
 | 05   | `src/steps/train.py`               | Recommender grid search (one job per `(dataset, model, embedding, hyperparams)`) |
 | 06   | `src/steps/evaluate.py`            | Full-ranking evaluation on the test set                                          |
 | 07   | `src/steps/statistical.py`         | Bootstrap CIs, Friedman omnibus, pairwise Wilcoxon with effect sizes             |
@@ -255,6 +255,27 @@ checkpoint_every: 500 # save partial extraction every N batches
 
 Extraction is **native-dim** (v2 protocol): each extractor saves the backbone's own pooled feature. `raw_dim` is a declaration validated against a probe forward through the real model — a mismatch fails extraction loudly. The learned projection `E` inside each recommender maps the native feature to the shared latent dim (`common.visual_dim` in `recommenders.yaml`).
 
+Optionally, a **fixed linear projection** brings every extractor into one shared width — for a reviewer who asks that all backbones emit, say, 128-d, or to feed the element-wise fusion family equal-dim sources with nothing learned online:
+
+```yaml
+projection:
+  method: pca # none (default) | random | pca
+  dim: 128
+  seed: 42 # method: random only
+```
+
+This writes `<extractor>_p128.npy` **alongside** the native artifact, never in place of it, so native and projected can be trained and compared in the same battery. Two flags then decide what *consumes* them:
+
+```yaml
+# configs/recommenders.yaml — which variants the recommenders train on
+embedding_variants: both # native | projected | both
+
+# configs/fusion.yaml — which variants feed the fusion
+extractor_variants: native # native | projected | both
+```
+
+`extractor_variants: projected` is the shortcut this feature exists for: the sources already share a width, so the whole `alignment:` block is bypassed — nothing learned online, no PCA fit inside the fuse step. Outputs stay apart by the same token (`hybrid_mean` vs `hybrid_mean_p128`), and a hybrid built from projected sources is classified with them by `embedding_variants`. `random` is a seeded semi-orthogonal matrix (data-independent, so it cannot leak val/test items); `pca` is fit on train items only, like the fusion alignment; `pca_whitened` adds per-component variance equalisation on the same fit set. Any extractor overrides the block under `extractors.<name>.projection`. Already-extracted embeddings are projected in a linear pass — the backbone is not loaded again. Read [`docs/protocol.md` §1b](docs/protocol.md) before reporting a comparison run on projected artifacts: a fixed projection is a variable, not a free normalisation.
+
 To ablate an extractor, just remove its name from `extractors_enabled`, its block under `extractors:` stays as catalogue but the pipeline skips it (and the fine-tuning step skips it too).
 
 ### `configs/fusion.yaml`
@@ -272,6 +293,7 @@ fusion_strategies_enabled:
   - concat
   - pca
   - pca_per_model
+  - adaptive_gated
 
 normalize_before_fusion: true
 
@@ -291,22 +313,27 @@ strategies:
   sum: {}
   prod: {}
   max_pool: {}
+  # Weighted strategies are FIXED convex combinations (thesis spec);
+  # distinct canonical values keep them from collapsing into `mean`.
   weighted_mean:
-    w_cnn: [0.3, 0.5, 0.7]
-  attention_weighted: {}
-  gated: {}
+    w_cnn: [0.7]          # weights (0.700, 0.300)
+  attention_weighted:
+    logits: [[1.0, 0.0]]  # softmax -> (0.731, 0.269)
+  gated:
+    logits: [[1.0, 0.0]]  # normalised sigmoids -> (0.594, 0.406)
   concat: {}
   pca:
-    n_components: [64, 128, 256]
+    n_components: [128]
   pca_per_model:
-    n_components_per_model: [32, 64, 128]
+    n_components_per_model: [64]
+  adaptive_gated: {}      # the only LEARNED fusion (online, no .npy)
 ```
 
 ### `configs/recommenders.yaml`
 
 ```yaml
 # Which recommenders to actually run. Empty / missing = none run.
-recommenders_enabled: ["bpr", "vbpr", "vnpr", "deepstyle", "avbpr"]
+recommenders_enabled: ["bpr", "vbpr", "vnpr", "deepstyle", "acf"]
 
 common: # shared by every recommender
   latent_dim: [64, 128]
@@ -329,9 +356,10 @@ deepstyle:
 avbpr:
   att_hidden: [64, 128]
 
-# ACF needs per-item component embeddings (*_comp artifacts; enable
-# `extract_components: true` in configs/default.yaml) and the user
-# history. Add `acf` to recommenders_enabled only for ACF runs.
+# ACF needs per-item component embeddings (*_comp artifacts) and the
+# user history. With `acf` in recommenders_enabled the extract step
+# auto-enables component extraction (no flag needed); the train step
+# fails loud if the *_comp artifacts are still missing.
 acf:
   att_hidden: [64, 128]
   max_history: [50]
@@ -562,16 +590,19 @@ Applied to the primary pair declared in `fusion_extractors` (default: ResNet50 +
 | 2   | Sum                | Element-wise sum                              |
 | 3   | Product            | Hadamard product                              |
 | 4   | Max Pool           | Element-wise maximum                          |
-| 5   | Weighted Mean      | Learnable weights (`w_cnn ∈ {0.3, 0.5, 0.7}`) |
-| 6   | Attention Weighted | Softmax over learnable logits                 |
-| 7   | Gated              | Normalised sigmoid gates                      |
+| 5   | Weighted Mean      | Fixed configurable weights (canonical `w_cnn = 0.7`) |
+| 6   | Attention Weighted | Softmax over fixed configurable logits (canonical `[1.0, 0.0]`) |
+| 7   | Gated              | Normalised sigmoids over fixed configurable logits (canonical `[1.0, 0.0]`) |
 | 8   | Concat             | Feature concatenation                         |
 | 9   | PCA                | PCA on concatenated features                  |
 | 10  | PCA per Model      | Per-model PCA then concat                     |
+| 11  | Adaptive Gated     | Per-item gate MLP, learned online (co-trained via BPR) |
+
+Strategies 1–10 are offline convex/algebraic combinations with no trainable fusion parameters — 5–7 differ only in how their fixed configurable values map to convex weights. Strategy 11 (`adaptive_gated`) is the only learned fusion.
 
 Optional L2 normalisation before fusion (`normalize_before_fusion` in `configs/fusion.yaml`).
 
-Because sources keep their native dims in v2, the equal-dim family (1-7 plus `adaptive_gated`) first brings them to a common dimension via the configured `alignment`: `learned` (per-source `Linear(D_i → D)` co-trained with the recommender by BPR) or `pca` (offline per-source PCA, fit only on items with a training interaction). The concatenation family (8-10) operates directly on native dims.
+Because sources keep their native dims in v2, the equal-dim family (1-7 plus 11, `adaptive_gated`) first brings them to a common dimension via the configured `alignment`: `learned` (per-source `Linear(D_i → D)` co-trained with the recommender by BPR) or `pca` (offline per-source PCA, fit only on items with a training interaction). The concatenation family (8-10) operates directly on native dims.
 
 ---
 
@@ -588,7 +619,7 @@ Because sources keep their native dims in v2, the equal-dim family (1-7 plus `ad
 
 All trained with BPR loss, Adam optimiser, mixed-precision (FP16 via `torch.amp`), and early stopping on validation NDCG@10.
 
-**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, native_dim)` written as `<extractor>_comp.npy` when `extract_components: true` is set. All eight extractors expose components (`M`: ResNet-50 / ConvNeXt / CoAtNet / CLIP = 49, ViT-B/16 / CvT = 196, LeViT = 16, DINOv2 = 256). ACF's two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
+**ACF** (Attentive Collaborative Filtering) is the only recommender that consumes per-item *component* embeddings — the pre-pool spatial cells / patch tokens of shape `(n_items, M, native_dim)` written as `<extractor>_comp.npy` (auto-extracted whenever a component-consuming recommender such as ACF is enabled; `extract_components: true` forces them without one). All eight extractors expose components (`M`: ResNet-50 / ConvNeXt / CoAtNet / CLIP = 49, ViT-B/16 / CvT = 196, LeViT = 16, DINOv2 = 256). ACF's two attention levels weight (a) an item's `M` components and (b) the items in the user's training history (built train-only, so validation/test never leak into the profile). Faithful to the paper, the sampled BPR positive stays in the history at train time. See `src/recommenders/acf.py`.
 
 ---
 
@@ -683,7 +714,7 @@ With exactly one relevant item per user, only two independent signals exist: hit
 
 - **Cliff's delta (primary)**, non-parametric and tie-robust, in `[-1, 1]`; the qualitative label (`negligible` / `small` / `medium` / `large`) follows Romano et al. thresholds. Consistent with Wilcoxon+pratt on 0/1-heavy per-user LOO metrics.
 - **Cohen's d (diagnostic only, off by default)** — parametric; on zero-dominated paired differences the `std` shrinks and `d` inflates without a sensible interpretation. Enable with `include_cohens_d: true` if needed.
-- **Paired-difference bootstrap CI** (`diff_mean`, `diff_ci_lower/upper`) on every pairwise row, resampling users: this is the CI that must agree with the Wilcoxon verdict. Per-config CIs in the summary table are descriptive — because the inference is paired, overlapping individual CIs do **not** imply absence of a significant difference.
+- **Paired-difference bootstrap CI** (`diff_mean`, `diff_ci_lower/upper`) on every pairwise row, resampling users: this CI must agree with the RAW (uncorrected) Wilcoxon p-value — the `significant` column is Holm-corrected, so a corrected non-significant verdict can coexist with a CI excluding zero. Per-config CIs in the summary table are descriptive — because the inference is paired, overlapping individual CIs do **not** imply absence of a significant difference.
 
 Each method is toggled individually in `configs/evaluation.yaml` -> `statistical:`.
 
@@ -710,7 +741,7 @@ Each method is toggled individually in `configs/evaluation.yaml` -> `statistical
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | Single directory scan in `CategoryDataset` / `ImageDataset` | One `os.listdir()` instead of N `path.exists()` calls.                                                                         |
 | Persistent DataLoader workers                               | `persistent_workers=True` removes per-epoch fork/warm-up.                                                                      |
-| Tunable batch / workers / prefetch                          | All exposed via env vars.                                                                                                      |
+| Tunable batch / workers / prefetch                          | YAML-only: `configs/finetuning.yaml -> finetuning.batch_size`; workers/prefetch via `configs/default.yaml -> dataloader.*` or autotune. |
 | Per-job try/except                                          | Failures are isolated per `(extractor × dataset)` so the queue continues after an OOM, layer-name mismatch, or HF Hub timeout. |
 
 ---
@@ -788,9 +819,9 @@ prism-vrec/
 │
 ├── configs/
 │   ├── default.yaml              # Orchestration: seed, device, datasets, paths, pipeline:
-│   ├── extractors.yaml           # 7 extractors + projection dims + fusion pair
-│   ├── fusion.yaml               # 10 fusion strategies + normalisation
-│   ├── recommenders.yaml         # Grid-search hyperparameters (5 models)
+│   ├── extractors.yaml           # 8 extractors + projection dims + fusion pair
+│   ├── fusion.yaml               # 11 fusion strategies + normalisation
+│   ├── recommenders.yaml         # Grid-search hyperparameters (6 models)
 │   ├── evaluation.yaml           # Metrics, k-values, statistical tests
 │   ├── finetuning.yaml           # Fine-tuning hyperparameters
 │   └── smoke/                    # Minimal end-to-end config (see §12) — swap via --config-dir
@@ -807,10 +838,10 @@ prism-vrec/
 │   │
 │   ├── extractors/
 │   │   ├── base.py               # BaseExtractor ABC (FP16 inference, checkpointing)
-│   │   ├── resnet.py, vit.py, cvt.py, coatnet.py, levit.py, clip.py, dinov2.py
+│   │   ├── resnet.py, vit.py, cvt.py, coatnet.py, levit.py, clip.py, dinov2.py, convnext.py
 │   │
 │   ├── fusions/
-│   │   └── strategies.py         # 10 fusion functions + factory
+│   │   └── strategies.py         # 11 fusion strategies + factory
 │   │
 │   ├── recommenders/
 │   │   ├── base.py               # BaseRecommender (BPR loss, L2 reg)
@@ -894,7 +925,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.6.4},
+  version = {2.8.0},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }

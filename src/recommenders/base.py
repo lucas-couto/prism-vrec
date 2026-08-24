@@ -9,6 +9,18 @@ import torch
 import torch.nn as nn
 
 
+def _record_bpr_batch(module: BaseRecommender, args: tuple) -> None:
+    """Forward pre-hook: remember the (user, pos, neg) index batch.
+
+    :meth:`BaseRecommender.bpr_loss` keeps its fixed
+    ``(score_pos, score_neg)`` signature, so the batch indices needed by
+    the BPR-Opt regulariser are captured transparently whenever the
+    module is called with the standard triple of index tensors.
+    """
+    if len(args) == 3:
+        module._last_batch = args
+
+
 class BaseRecommender(nn.Module, abc.ABC):
     """Base class for all BPR-based recommendation models.
 
@@ -50,6 +62,19 @@ class BaseRecommender(nn.Module, abc.ABC):
     #: models, so models that do not accept the keyword are untouched.
     wants_history: bool = False
 
+    #: Embedding tables whose rows are gathered per batch for the
+    #: BPR-Opt L2 penalty (see :meth:`l2_reg`).  ``_L2_USER_TABLES`` are
+    #: indexed by the batch's user ids, ``_L2_ITEM_TABLES`` by both the
+    #: positive and the negative item ids.  Missing attributes are
+    #: skipped, so a model lacking e.g. ``item_bias`` needs no override.
+    #: ``_L2_EXTRA_GATHERED_TABLES`` names tables whose rows are gathered
+    #: by a model-specific :meth:`_l2_gathered_rows` override — listing
+    #: them here only excludes their full weight matrix from the
+    #: shared-parameter term.
+    _L2_USER_TABLES: tuple[str, ...] = ("user_embedding",)
+    _L2_ITEM_TABLES: tuple[str, ...] = ("item_embedding", "item_bias")
+    _L2_EXTRA_GATHERED_TABLES: tuple[str, ...] = ()
+
     def __init__(
         self,
         n_users: int,
@@ -64,6 +89,11 @@ class BaseRecommender(nn.Module, abc.ABC):
         self.n_items = n_items
         self.config = config
         self.train_interactions = train_interactions
+
+        # Batch recorded by the forward pre-hook; consumed by the
+        # BPR-Opt regulariser in bpr_loss / l2_reg.
+        self._last_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self.register_forward_pre_hook(_record_bpr_batch)
 
         # Register visual embeddings as a non-trainable buffer if provided.
         # Three layouts are accepted:
@@ -198,22 +228,109 @@ class BaseRecommender(nn.Module, abc.ABC):
         ...
 
     def bpr_loss(self, score_pos: torch.Tensor, score_neg: torch.Tensor) -> torch.Tensor:
-        """BPR pairwise loss with L2 regularisation.
+        """BPR pairwise loss with BPR-Opt L2 regularisation.
 
         .. math::
-            \\mathcal{L} = -\\frac{1}{N}\\sum \\log\\sigma(\\hat y_{pos}
-            - \\hat y_{neg}) + \\lambda \\|\\Theta\\|^2
+            \\mathcal{L} = -\\frac{1}{N}\\sum_{(u,i,j)}
+            \\log\\sigma(\\hat y_{ui} - \\hat y_{uj})
+            + \\lambda \\Big( \\frac{1}{N}\\sum_{(u,i,j)}
+            \\|\\theta_{(u,i,j)}\\|^2 + \\|\\Theta_{shared}\\|^2 \\Big)
+
+        Following the cited BPR-Opt (Rendle et al., 2009), the L2 term
+        penalises only the parameters *touched* by each sampled triple
+        ``(u, i, j)``:
+
+        * ``θ_(u,i,j)`` — the embedding rows gathered for the triple
+          (user row, positive/negative item rows, their biases, plus
+          model-specific per-row extras such as visual-user rows,
+          category rows, or ACF history rows).  Their squared norms are
+          summed *as gathered* and mean-reduced over the ``N`` triples,
+          matching the mean-reduced log-loss.  A row appearing in two
+          triples of the batch is therefore penalised once per
+          occurrence — the natural per-triple reading of BPR-Opt.
+        * ``Θ_shared`` — dense parameters that participate in *every*
+          triple's score function (visual projections, MLPs, attention
+          nets, online-fusion modules).  These are penalised in full
+          each step, which is faithful to BPR-Opt's "parameters of the
+          score function for this triple" because every triple touches
+          all of them.
+
+        The gathered term needs the ``(user, pos, neg)`` index batch of
+        the preceding forward call — recorded transparently by a forward
+        pre-hook, keeping this signature unchanged.  When the loss is
+        invoked without a prior forward, only the shared term applies.
         """
         bpr = -torch.log(torch.sigmoid(score_pos - score_neg) + 1e-10).mean()
         reg = self.config.get("l2_reg", 0.0) * self.l2_reg()
         return bpr + reg
 
     def l2_reg(self) -> torch.Tensor:
-        """Sum of squared L2 norms over all trainable parameters."""
+        """BPR-Opt regulariser: batch-gathered rows plus shared params.
+
+        Returns ``Σ‖gathered rows‖² / batch_size + Σ‖shared params‖²``
+        (see :meth:`bpr_loss` for the exact reading).  Without a
+        recorded batch only the shared term is returned.  The recorded
+        batch is CONSUMED: a second call without a new forward falls
+        back to the shared term instead of silently reusing a stale
+        batch (R11).
+        """
+        reg = self._l2_shared()
+        batch, self._last_batch = self._last_batch, None
+        if batch is None:
+            return reg
+        user_ids, pos_item_ids, neg_item_ids = batch
+        rows = self._l2_gathered_rows(user_ids, pos_item_ids, neg_item_ids)
+        if not rows:
+            return reg
+        gathered = torch.stack([row.pow(2).sum() for row in rows]).sum()
+        return reg + gathered / user_ids.shape[0]
+
+    def _l2_gathered_rows(
+        self,
+        user_ids: torch.Tensor,
+        pos_item_ids: torch.Tensor,
+        neg_item_ids: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Embedding rows touched by the batch, penalised as gathered.
+
+        Default: rows of :attr:`_L2_USER_TABLES` for the batch users and
+        rows of :attr:`_L2_ITEM_TABLES` for the positive and negative
+        items.  Models with additional per-triple rows (e.g. category or
+        history rows) extend the returned list.
+        """
+        rows: list[torch.Tensor] = []
+        for name in self._L2_USER_TABLES:
+            table = getattr(self, name, None)
+            if table is not None:
+                rows.append(table(user_ids))
+        for name in self._L2_ITEM_TABLES:
+            table = getattr(self, name, None)
+            if table is not None:
+                rows.append(table(pos_item_ids))
+                rows.append(table(neg_item_ids))
+        return rows
+
+    def _l2_shared(self) -> torch.Tensor:
+        """Sum of squared norms of dense params shared by every triple.
+
+        Every trainable parameter except the weight matrices of the
+        row-gathered embedding tables (those are penalised per batch row
+        in :meth:`_l2_gathered_rows`).
+        """
+        gathered_names = (
+            *self._L2_USER_TABLES,
+            *self._L2_ITEM_TABLES,
+            *self._L2_EXTRA_GATHERED_TABLES,
+        )
+        excluded: set[int] = set()
+        for name in gathered_names:
+            table = getattr(self, name, None)
+            if table is not None:
+                excluded.add(id(table.weight))
         reg = torch.tensor(0.0, device=self._device())
         for param in self.parameters():
-            if param.requires_grad:
-                reg = reg + param.norm(2).pow(2)
+            if param.requires_grad and id(param) not in excluded:
+                reg = reg + param.pow(2).sum()
         return reg
 
     def save_checkpoint(
