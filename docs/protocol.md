@@ -113,6 +113,18 @@ their canonical eval resolution — the resize path (resize size,
 interpolation, crop_pct) differs per recipe and is recorded in each
 artifact's metadata. No hidden resolution variable.
 
+### 2b. Interaction filtering is inherited, not applied
+
+No k-core filtering runs inside this framework. The DVBPR datasets
+arrive **pre-partitioned upstream** (their published splits already
+carry the original papers' filtering); re-filtering here would silently
+change the benchmark population. Plugin CSV datasets have their own
+knob (`CSVDatasetProvider(min_user_interactions=...)`, default 3,
+applied before the leave-one-out split). A `preprocessing.n_min` key
+used to exist in `configs/default.yaml` and was read by nothing — it
+has been removed so the config cannot claim a filtering step that
+never happens.
+
 ## 3. Evaluation protocol: full ranking default, sampled opt-in
 
 `full_ranking` is the default and the only protocol for reported

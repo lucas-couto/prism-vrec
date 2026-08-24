@@ -198,13 +198,28 @@ def gate_dataset_features(
     row count / NaN / zero-norm only (their dim depends on the strategy).
     Online-fusion ``.json`` sidecars carry no matrix and are skipped.
     """
+    from src.utils.artifact_names import is_component_artifact
+    from src.utils.variant_filters import embedding_matches_config
+
     enabled_extractors = set(config.get("extractors_enabled", []))
     for dataset in datasets:
         ds_dir = Path(embeddings_dir) / dataset
         if not ds_dir.is_dir():
             continue
+        n_skipped = 0
         for path in sorted(ds_dir.glob("*.npy")):
             stem = path.stem
+            # 3-D fp16 component artifacts (ACF) have their own consumer
+            # contract; the 2-D float32 checks below do not apply.
+            if is_component_artifact(stem):
+                continue
+            # Gate only what the CURRENT config trains: artifacts of
+            # disabled extractors/strategies must neither cost a scan
+            # nor fail the run (same disk-vs-config rule as the train
+            # cell filters and the evaluate checkpoint filter).
+            if not embedding_matches_config(stem, config):
+                n_skipped += 1
+                continue
             # Strip the finetuned suffix when matching the extractor name.
             base = stem[: -len("_finetuned")] if stem.endswith("_finetuned") else stem
             if base in enabled_extractors:
@@ -218,6 +233,12 @@ def gate_dataset_features(
                 )
             else:
                 validate_fused_feature(path, dataset, processed_dir=processed_dir)
+        if n_skipped:
+            logger.info(
+                "%s: %d artifact(s) on disk not gated (not part of the current config).",
+                dataset,
+                n_skipped,
+            )
 
 
 def run(dataset: str | None = None, backbone: str | None = None) -> int:

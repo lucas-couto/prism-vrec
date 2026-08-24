@@ -157,6 +157,25 @@ def _project_pooled(
     return True
 
 
+def _validate_weights_id(extractor, extractor_name: str, config: dict) -> None:
+    """Fail loudly when the declared weights tag is absent from the model's id.
+
+    ``configs/extractors.yaml`` declares each backbone's ``weights`` tag
+    (e.g. ``IMAGENET1K_V2``); the authoritative value is the extractor's
+    hardcoded ``weights_id``.  The key used to be decorative — editing
+    it changed nothing — which is a fidelity trap: like ``raw_dim``, a
+    declaration the code does not honour must at least be checked.
+    """
+    declared = config.get("extractors", {}).get(extractor_name, {}).get("weights")
+    if declared and str(declared) not in getattr(extractor, "weights_id", ""):
+        raise RuntimeError(
+            f"{extractor_name}: configs/extractors.yaml declares weights="
+            f"{declared!r} but the extractor is built with weights_id="
+            f"{extractor.weights_id!r}. The code is authoritative — fix the "
+            "config (the declared tag must appear in the real weights id)."
+        )
+
+
 def _validate_native_dim(extractor, extractor_name: str, config: dict) -> None:
     """Fail loudly when the probed native dim contradicts the config.
 
@@ -234,6 +253,7 @@ def _extract_for_config(
     logger.info("  Extracting %s (native dim)...", extractor_name)
     extractor = extractor_cls(device=device)
     _validate_native_dim(extractor, extractor_name, config)
+    _validate_weights_id(extractor, extractor_name, config)
 
     dataset = ImageDataset(image_dir, item_ids, transform=extractor.transform)
     if len(dataset) == 0:

@@ -15,13 +15,9 @@ paths:
   embeddings: "data/smoke_embeddings"
   checkpoints: "checkpoints/smoke"
   results: "results/smoke"
-  logs: "logs/smoke"
 
 datasets:
   - "synthetic"
-
-preprocessing:
-  n_min: 1   # k-core off — synthetic dataset is already minimal
 
 pipeline:
   run_all: true

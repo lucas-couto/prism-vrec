@@ -32,6 +32,7 @@ from src.utils.device import resolve_device
 from src.utils.logging import get_logger
 from src.utils.splits import assert_holdout_disjoint
 from src.utils.timing import note_skipped_cell, time_cell
+from src.utils.variant_filters import checkpoint_matches_config
 
 logger = get_logger(__name__)
 
@@ -365,6 +366,17 @@ def run(condition: str = "frozen") -> None:
         done_path = _done_path(results_dir, dataset_name)
         done = _load_done(done_path)
         best_models = find_best_models(dataset_name, results_dir=results_root)
+        # The models directory accumulates checkpoints across runs; only
+        # cells the CURRENT config would train are evaluated (same
+        # disk-vs-config rule as the train step's cell filters).
+        eligible = [m for m in best_models if checkpoint_matches_config(m, config)]
+        if len(eligible) != len(best_models):
+            logger.info(
+                "  %d checkpoint(s) on disk skipped (model/backbone/fusion "
+                "not enabled in the current config).",
+                len(best_models) - len(eligible),
+            )
+        best_models = eligible
         logger.info("  Found %d models to evaluate", len(best_models))
 
         for model_info in best_models:

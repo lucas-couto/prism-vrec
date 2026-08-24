@@ -53,15 +53,6 @@ class PathsConfig(BaseModel):
     embeddings: str = "data/embeddings"
     checkpoints: str = "checkpoints"
     results: str = "results"
-    logs: str = "logs"
-
-
-class PreprocessingConfig(BaseModel):
-    """k-core filtering parameters applied during preprocessing."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    n_min: int = Field(5, ge=1, description="Minimum interactions per user / item.")
 
 
 class DatasetContract(BaseModel):
@@ -377,7 +368,6 @@ class FrameworkConfig(BaseModel):
             "without an entry skip the check (backwards compatible)."
         ),
     )
-    preprocessing: PreprocessingConfig = Field(default_factory=PreprocessingConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
@@ -481,6 +471,5 @@ __all__ = [
     "PIPELINE_STEPS",
     "PathsConfig",
     "PipelineConfig",
-    "PreprocessingConfig",
     "validate_config",
 ]
