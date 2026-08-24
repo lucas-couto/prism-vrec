@@ -191,6 +191,48 @@ def filter_by_enabled_fusions(names: list[str], config: dict) -> list[str]:
     return kept
 
 
+def filter_by_enabled_extractors(names: list[str], config: dict) -> list[str]:
+    """Drop single-extractor stems whose backbone is not currently enabled.
+
+    Mirror of :func:`filter_by_enabled_fusions` for the other artifact
+    family: the embeddings directory accumulates every backbone ever
+    extracted, so shrinking ``extractors_enabled`` stopped the EXTRACT
+    step but the train step still picked the on-disk artifacts up as
+    cells.  Matching is longest-first against the registered extractor
+    names, so a stem like ``cvt_13_p128`` (projection token) or
+    ``resnet50_finetuned`` (condition marker) resolves to its backbone.
+    ``none`` and ``hybrid_*`` stems pass through untouched — the
+    baseline belongs to no backbone and fusions are governed by
+    :func:`filter_by_enabled_fusions`.
+    """
+    from src.extractors import registered_extractor_names
+
+    enabled = set(config.get("extractors_enabled") or [])
+    known = sorted(registered_extractor_names(), key=len, reverse=True)
+    kept: list[str] = []
+    for name in names:
+        if name == "none" or name.startswith(FUSION_PREFIX):
+            kept.append(name)
+            continue
+        base = next((k for k in known if name == k or name.startswith(f"{k}_")), None)
+        if base is None:
+            logger.warning(
+                "embedding %r matches no registered extractor; excluded from training.",
+                name,
+            )
+            continue
+        if base in enabled:
+            kept.append(name)
+    n_dropped = len(names) - len(kept)
+    if n_dropped:
+        logger.info(
+            "extractor filter: %d artifact(s) on disk excluded "
+            "(backbone not in extractors_enabled).",
+            n_dropped,
+        )
+    return kept
+
+
 def _iter_cells(
     condition: str,
     config: dict,
@@ -213,6 +255,7 @@ def _iter_cells(
         all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
         all_embs = filter_by_variant(all_embs, variant)
         all_embs = filter_by_enabled_fusions(all_embs, config)
+        all_embs = filter_by_enabled_extractors(all_embs, config)
         if condition == "frozen":
             embedding_names = [e for e in all_embs if not is_finetuned_artifact(e)]
         else:
@@ -468,10 +511,13 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     strategy = get_strategy(config)
     logger.info("Hyperparameter-search strategy: %s", strategy)
 
+    # hp_search.workers in the config is the default; an explicit CLI
+    # value still wins.  workers=1 disables the process pool entirely.
+    effective_workers = workers or int(config.get("hp_search", {}).get("workers", 0))
     if strategy == "optuna":
-        _run_optuna(condition, config, workers=workers, sequential=sequential)
+        _run_optuna(condition, config, workers=effective_workers, sequential=sequential)
     else:
-        _run_grid(condition, config, workers=workers, sequential=sequential)
+        _run_grid(condition, config, workers=effective_workers, sequential=sequential)
 
 
 def _run_grid(

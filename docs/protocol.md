@@ -234,11 +234,15 @@ size, so the real exact-tie frequency is measured during the battery.
   per-user metric distributions), Holm–Bonferroni for multiple
   comparisons (uniformly more powerful than Bonferroni at the same
   FWER), percentile bootstrap CIs.
-- **Effect size: Cliff's delta is primary** (non-parametric,
-  tie-robust; thresholds 0.147/0.33/0.474) — consistent with
-  Wilcoxon+pratt on zero-dominated differences. Cohen's d is parametric
-  and inflates on such vectors (the std shrinks); it is off by default
-  and available for diagnostics only.
+- **Effect size: PAIRED Cliff's delta is primary** — ``(wins −
+  losses) / n`` over per-user differences, the same pairing the
+  Wilcoxon uses (thresholds 0.147/0.33/0.474; ties count in the
+  denominator, consistent with ``pratt``). The between-groups form
+  collapses to ``p_a − p_b`` on the 0/1-heavy LOO metrics and reads
+  "negligible" even when one method wins every discordant pair, so it
+  is not reported. Cohen's d is parametric and inflates on such
+  vectors (the std shrinks); it is off by default and available for
+  diagnostics only.
 - **Paired-difference bootstrap CI** on every pairwise row
   (`diff_mean`, `diff_ci_lower/upper`, resampling USERS): a RAW 95% CI
   whose agreement is with the raw Wilcoxon p-value at alpha, NOT with

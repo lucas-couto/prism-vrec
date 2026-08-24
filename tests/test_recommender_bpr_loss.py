@@ -49,14 +49,13 @@ class _BareBonesRecommender(BaseRecommender):
 
 
 def _hand_bpr(score_pos: list[float], score_neg: list[float]) -> float:
-    """Reference implementation kept deliberately simple."""
-    eps = 1e-10
+    """Reference implementation kept deliberately simple (-ln sigmoid, no eps)."""
     n = len(score_pos)
     total = 0.0
     for p, q in zip(score_pos, score_neg, strict=False):
         diff = p - q
         sigmoid = 1.0 / (1.0 + math.exp(-diff))
-        total += -math.log(sigmoid + eps)
+        total += -math.log(sigmoid)
     return total / n
 
 

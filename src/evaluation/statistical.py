@@ -201,6 +201,27 @@ def cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
     return float(delta)
 
 
+def paired_cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
+    """Within-pair Cliff's delta: ``(wins - losses) / n`` over paired diffs.
+
+    The between-groups :func:`cliffs_delta` compares the CROSS PRODUCT
+    of the two samples; under leave-one-out, where per-user metrics are
+    dominated by 0/1 values, it collapses to ``p_a - p_b`` and reads
+    "negligible" even when one method wins every discordant pair (S2:
+    A~Bern(0.10) vs B~Bern(0.05) gives δ≈0.05 despite a 2x hit rate).
+    The paired form scores each user against THEMSELVES — the same
+    pairing the Wilcoxon test uses — so it answers "in what fraction of
+    users does A beat B, net of losses".  Ties count in the denominator
+    (consistent with Wilcoxon ``pratt``).
+    """
+    a = np.asarray(scores_a, dtype=float)
+    b = np.asarray(scores_b, dtype=float)
+    if len(a) == 0 or len(a) != len(b):
+        return 0.0
+    diffs = a - b
+    return float((np.sum(diffs > 0) - np.sum(diffs < 0)) / len(diffs))
+
+
 def cliffs_delta_magnitude(delta: float) -> str:
     """Map ``cliffs_delta`` to a textual magnitude (negligible/small/medium/large)."""
     abs_d = abs(delta)
@@ -526,7 +547,11 @@ def pairwise_significance(
             row["diff_ci_lower"] = diff_lo
             row["diff_ci_upper"] = diff_hi
         if include_effect_size:
-            delta = cliffs_delta(scores_a, scores_b)
+            # Paired form: matches the Wilcoxon's pairing (S2) — the
+            # between-groups form is uninformative on 0/1-heavy LOO
+            # metrics.  Column names unchanged; the definition is
+            # declared in docs/protocol.md.
+            delta = paired_cliffs_delta(scores_a, scores_b)
             row["cliffs_delta"] = delta
             row["cliffs_magnitude"] = cliffs_delta_magnitude(delta)
             if include_cohens_d:

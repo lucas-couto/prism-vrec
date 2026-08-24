@@ -260,7 +260,10 @@ class BaseRecommender(nn.Module, abc.ABC):
         pre-hook, keeping this signature unchanged.  When the loss is
         invoked without a prior forward, only the shared term applies.
         """
-        bpr = -torch.log(torch.sigmoid(score_pos - score_neg) + 1e-10).mean()
+        # F.logsigmoid is the numerically stable form of the documented
+        # -ln σ(x̂_uij): the old log(sigmoid(x)+1e-10) saturated at ≈23
+        # for strongly-wrong pairs and ZEROED their gradient (F9).
+        bpr = -torch.nn.functional.logsigmoid(score_pos - score_neg).mean()
         reg = self.config.get("l2_reg", 0.0) * self.l2_reg()
         return bpr + reg
 

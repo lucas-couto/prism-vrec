@@ -241,6 +241,12 @@ class HpSearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy: Literal["grid", "optuna"] = "grid"
+    #: Training worker processes. 0 = auto-detect from VRAM (capped at
+    #: 3); 1 = fully sequential in the parent process — no spawn, no
+    #: per-process VRAM caps, the whole GPU and host RAM budget for one
+    #: cell at a time.  The safe choice on hosts where N training
+    #: processes exhaust the memory cgroup.
+    workers: int = Field(0, ge=0, le=8)
     optuna: OptunaConfig = Field(default_factory=OptunaConfig)
 
 
