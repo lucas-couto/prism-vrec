@@ -49,9 +49,10 @@ def _config() -> dict:
         "datasets": [DATASET],
         "recommenders_enabled": ["vbpr", "acf"],
         "embedding_dims": ["D128"],
-        # The fusion filter honours the config: hybrid_* stems on disk
-        # only become cells when their strategy is enabled here.
+        # The fusion/extractor filters honour the config: stems on disk
+        # only become cells when their strategy/backbone is enabled here.
         "fusion_strategies_enabled": ["mean"],
+        "extractors_enabled": ["vit_b16"],
         "common": {
             "latent_dim": [64],
             "learning_rate": [0.001],
@@ -210,3 +211,54 @@ class TestFusionFilterHonoursConfig:
 
         assert not any(j.embedding_name.startswith("hybrid_") for j in jobs)
         assert any(j.embedding_name == "vit_b16_D128" for j in jobs)
+
+
+class TestExtractorFilterHonoursConfig:
+    """Disabled extractors must not become cells from stale disk artifacts."""
+
+    def test_disabled_backbones_are_dropped(self) -> None:
+        from src.steps.train import filter_by_enabled_extractors
+
+        names = [
+            "none",
+            "resnet50_p128",
+            "cvt_13_p128",
+            "levit_256_p128",
+            "resnet50_finetuned",
+            "hybrid_mean_p128",
+        ]
+
+        kept = filter_by_enabled_extractors(names, {"extractors_enabled": ["resnet50"]})
+
+        # baseline and hybrids pass through; only resnet50 stems survive.
+        assert kept == ["none", "resnet50_p128", "resnet50_finetuned", "hybrid_mean_p128"]
+
+    def test_empty_list_keeps_only_baseline_and_hybrids(self) -> None:
+        from src.steps.train import filter_by_enabled_extractors
+
+        kept = filter_by_enabled_extractors(
+            ["none", "vit_b16", "hybrid_mean_p128"], {"extractors_enabled": []}
+        )
+
+        assert kept == ["none", "hybrid_mean_p128"]
+
+    def test_unknown_stem_is_excluded(self) -> None:
+        from src.steps.train import filter_by_enabled_extractors
+
+        kept = filter_by_enabled_extractors(
+            ["mystery_backbone_p128"], {"extractors_enabled": ["resnet50"]}
+        )
+
+        assert kept == []
+
+    def test_jobs_respect_extractors_enabled(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        processed_dir, embeddings_dir = _setup(tmp_path, with_comp=True)
+        config = _config()
+        config["extractors_enabled"] = []  # vit_b16 artifacts on disk, disabled
+
+        jobs = build_job_list("frozen", config, processed_dir, embeddings_dir, "cpu")
+
+        assert not any(j.embedding_name.startswith("vit_b16") for j in jobs)
+        # hybrid (enabled strategy) and the bpr baseline survive.
+        assert any(j.embedding_name == "hybrid_mean_D128" for j in jobs)

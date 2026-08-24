@@ -408,7 +408,11 @@ def train_single_run(
     run_id = checkpoint_mgr.get_run_id(dataset_name, embedding_name, model_name, hyperparams)
     epochs = config.get("common", {}).get("epochs", 100)
     batch_size = config.get("common", {}).get("batch_size", 4096)
-    patience = config.get("common", {}).get("early_stopping_patience", 10)
+    # Patience is measured in EPOCHS (the counter advances by
+    # eval_every_epochs per evaluation): patience=20 with eval_every=10
+    # stops after 2 consecutive non-improving evaluations.  Default
+    # matches the shipped configs/recommenders.yaml (F10).
+    patience = config.get("common", {}).get("early_stopping_patience", 20)
     es_metric = config.get("common", {}).get("early_stopping_metric", "ndcg@10")
     eval_every_epochs = config.get("common", {}).get("eval_every_epochs", 10)
     eval_sample_size = config.get("common", {}).get("eval_sample_size")

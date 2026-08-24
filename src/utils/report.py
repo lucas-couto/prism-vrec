@@ -56,7 +56,28 @@ def _load_all(tables_dir: Path) -> pd.DataFrame:
         frames.append(df)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    df = pd.concat(frames, ignore_index=True)
+    return _aggregate_per_user_rows(df)
+
+
+def _aggregate_per_user_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse per-user evaluation rows to one MEAN row per config.
+
+    Step 06 with ``evaluate_per_user`` writes one row per (user,
+    config); ranking those rows directly reports the best USERS, not
+    the best configs (Top-N showed ndcg = 1.0 and the frozen/finetuned
+    delta collapsed — audit finding A1).  Aggregated CSVs (no
+    ``user_id`` column) pass through unchanged.
+    """
+    if "user_id" not in df.columns:
+        return df
+    keys = ["dataset", "condition", "model_name", "embedding_name"]
+    metric_cols = [
+        c
+        for c in df.columns
+        if c not in keys and c != "user_id" and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    return df.groupby(keys, as_index=False)[metric_cols].mean()
 
 
 def _md_table(df: pd.DataFrame, columns: Iterable[str]) -> str:
@@ -95,25 +116,37 @@ def _section_frozen_vs_finetuned(df: pd.DataFrame, metric: str) -> str:
     if df["condition"].nunique() < 2:
         return "_Only one condition present; frozen vs finetuned diff omitted._\n"
 
-    # Pivot on (dataset, model_name) only — embedding_name differs between
-    # frozen and finetuned conditions (e.g. "resnet50_D128" vs
-    # "resnet50_finetuned_D128"), so including it as a pivot key would
-    # prevent any row from having both a frozen and a finetuned value.
-    # aggfunc="max" picks the best embedding per (dataset, model, condition).
-    pivot_keys = ["dataset", "model_name"]
+    # Pair each config with ITSELF in the other condition: the
+    # embedding name differs only by the ``_finetuned`` marker
+    # ("resnet50_D128" vs "resnet50_finetuned_D128"), so stripping it
+    # yields the pair key.  The former max-over-embeddings pivot was an
+    # asymmetric best-of-N (audit finding S8): each condition could win
+    # with a DIFFERENT embedding, inflating the delta narrative.
+    from src.utils.artifact_names import FINETUNED_MARKER
+
+    df = df.copy()
+    df["base_embedding"] = df["embedding_name"].str.replace(FINETUNED_MARKER, "", regex=False)
+    pivot_keys = ["dataset", "model_name", "base_embedding"]
     pivot = df.pivot_table(
         index=pivot_keys,
         columns="condition",
         values=metric,
-        aggfunc="max",
+        aggfunc="mean",
     ).reset_index()
     if "frozen" not in pivot.columns or "finetuned" not in pivot.columns:
         return "_Frozen/finetuned columns missing; diff omitted._\n"
+    pivot = pivot.dropna(subset=["frozen", "finetuned"])
+    if pivot.empty:
+        return "_No (model, embedding) pair present in both conditions._\n"
     pivot["delta"] = pivot["finetuned"] - pivot["frozen"]
     pivot = pivot.sort_values("delta", ascending=False)
 
     columns = pivot_keys + ["frozen", "finetuned", "delta"]
-    return _md_table(pivot, columns)
+    note = (
+        "_Paired per (model, base embedding); significance lives in the "
+        "`frozen_vs_finetuned` rows of the pairwise Wilcoxon CSVs._\n\n"
+    )
+    return note + _md_table(pivot, columns)
 
 
 def _section_artefact_links(tables_dir: Path) -> str:

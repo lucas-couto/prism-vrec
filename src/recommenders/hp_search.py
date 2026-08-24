@@ -209,6 +209,11 @@ def create_study(
 
     Uses ``storage`` from the YAML when set so studies survive pod
     restarts; otherwise an in-memory study is created.
+    ``hp_search.optuna.warm_start`` (default true) controls resume:
+    with it off, an already-existing study in the storage is an ERROR
+    instead of being silently continued — protection against resuming
+    trials measured under a changed protocol (F11: the key used to be
+    accepted and read by nothing).
     """
     import optuna
 
@@ -231,7 +236,7 @@ def create_study(
         sampler=build_sampler(optuna_cfg, base_seed),
         pruner=build_pruner(optuna_cfg),
         storage=storage,
-        load_if_exists=True,
+        load_if_exists=bool(optuna_cfg.get("warm_start", True)),
     )
 
 

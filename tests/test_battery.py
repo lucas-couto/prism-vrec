@@ -24,6 +24,9 @@ from src.evaluation.protocol import Evaluator
 _CONFIG = {
     "datasets": ["synthetic"],
     "recommenders_enabled": ["bpr", "vbpr", "deepstyle", "avbpr"],
+    # Strict contract: artifacts on disk only become cells when their
+    # backbone/strategy is enabled in the config.
+    "extractors_enabled": ["resnet50"],
     "seeds": [1, 2],
     "seed": 1,
 }
