@@ -9,7 +9,6 @@ recommenders_enabled:
   - vbpr
   - vnpr
   - deepstyle
-  - acf
 
 # Which embedding variants the recommenders are trained on, when a fixed
 # projection is configured under `projection:` in extractors.yaml.
@@ -26,7 +25,7 @@ common:
   learning_rate: [0.001, 0.01]
   l2_reg: [0.0001, 0.001]
   visual_dim: [64, 128] # D (visual projection dimension)
-  epochs: 100
+  epochs: 50
   batch_size: 4096
   early_stopping_patience: 20
   early_stopping_metric: "ndcg@10"
@@ -89,7 +88,7 @@ acf:
 # Optuna falls back to sampling from the discrete lists above as if it
 # were a fancy random search.
 hp_search:
-  strategy: "grid" # "grid" or "optuna"
+  strategy: "optuna" # "grid" or "optuna"
 
   optuna:
     n_trials: 30

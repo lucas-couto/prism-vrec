@@ -80,7 +80,7 @@ pipeline:
 
   # Which condition to run for fuse / train / evaluate steps.
   # "frozen", "finetuned" or "both" (runs each twice in order).
-  condition: "both"
+  condition: "frozen"
 
 # =============================================================================
 # Per-step throughput and cost telemetry
