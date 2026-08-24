@@ -149,6 +149,10 @@ class TestRunResume:
                 "paths": {"data_processed": "p", "embeddings": "e"},
                 "k_values": [10],
                 "datasets": ["amazon_x"],
+                # Strict contract: checkpoints only evaluate when their
+                # model/backbone is enabled in the current config.
+                "recommenders_enabled": ["vbpr"],
+                "extractors_enabled": ["resnet50"],
             },
         )
         monkeypatch.setattr(ev, "resolve_device", lambda d: "cpu")

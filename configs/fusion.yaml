@@ -49,7 +49,7 @@ alignment:
 # `projected` requires every name in fusion_extractors to have a
 # projection configured, all to the SAME dim — otherwise the sources
 # would not share a space and the run fails loudly.
-extractor_variants: native
+extractor_variants: projected
 
 strategies:
   # Strategies that require equal dims
@@ -73,13 +73,13 @@ strategies:
   # (0.731, 0.269) exactly (sigmoid(x) + sigmoid(-x) = 1), so gated
   # uses [1.0, 0.0], where the sigmoid's shape actually differs.
   weighted_mean:
-    w_cnn: [0.7]  # w_vit = 1 - w_cnn
+    w_cnn: [0.7] # w_vit = 1 - w_cnn
 
   attention_weighted:
-    logits: [[1.0, 0.0]]  # one logit per source (cnn, vit)
+    logits: [[1.0, 0.0]] # one logit per source (cnn, vit)
 
   gated:
-    logits: [[1.0, 0.0]]  # one logit per source (cnn, vit)
+    logits: [[1.0, 0.0]] # one logit per source (cnn, vit)
 
   # Strategies that accept differing dims
   concat: {}

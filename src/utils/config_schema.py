@@ -35,6 +35,7 @@ PIPELINE_STEPS = (
     "fuse",
     "train",
     "evaluate",
+    "beyond_accuracy",
     "statistical",
     "export_best",
 )
@@ -53,15 +54,6 @@ class PathsConfig(BaseModel):
     embeddings: str = "data/embeddings"
     checkpoints: str = "checkpoints"
     results: str = "results"
-    logs: str = "logs"
-
-
-class PreprocessingConfig(BaseModel):
-    """k-core filtering parameters applied during preprocessing."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    n_min: int = Field(5, ge=1, description="Minimum interactions per user / item.")
 
 
 class DatasetContract(BaseModel):
@@ -183,6 +175,37 @@ class EvaluationConfig(BaseModel):
             "Seed for per-user negative sampling.  Identical seeds across "
             "model runs guarantee identical pools, which paired Wilcoxon "
             "tests rely on."
+        ),
+    )
+
+
+class BeyondAccuracyConfig(BaseModel):
+    """Knobs for the post-hoc beyond-accuracy step (``src.steps.beyond_accuracy``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        True,
+        description="Toggle the post-hoc EFD/ILD/iCov/cat_entropy computation.",
+    )
+    reference_embedding: str = Field(
+        "resnet50",
+        description=(
+            "Native embedding artifact (``data/embeddings/<dataset>/"
+            "<name>.npy``) used as the FIXED reference space for ILD "
+            "across every system.  Pre-registered decision: never the "
+            "evaluated extractor's own space — self-model diversity is "
+            "not comparable between systems."
+        ),
+    )
+    use_rank_relevance: bool = Field(
+        False,
+        description=(
+            "Off (default): EFD in its Mean Self-Information reduction. "
+            "On: apply the exponential rank discount (base 0.85) of "
+            "Vargas & Castells (2011) eq. 14; the relevance weight is "
+            "still treated as 1 (no post-hoc relevance model).  Kept "
+            "for future comparability with Deldjoo et al. (2021)."
         ),
     )
 
@@ -377,7 +400,6 @@ class FrameworkConfig(BaseModel):
             "without an entry skip the check (backwards compatible)."
         ),
     )
-    preprocessing: PreprocessingConfig = Field(default_factory=PreprocessingConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
@@ -451,6 +473,8 @@ class FrameworkConfig(BaseModel):
         description="Ranking cutoffs used by the evaluate and statistical steps.",
     )
 
+    beyond_accuracy: BeyondAccuracyConfig = Field(default_factory=BeyondAccuracyConfig)
+
     finetuning: FineTuningConfig = Field(default_factory=FineTuningConfig)
 
 
@@ -481,6 +505,5 @@ __all__ = [
     "PIPELINE_STEPS",
     "PathsConfig",
     "PipelineConfig",
-    "PreprocessingConfig",
     "validate_config",
 ]

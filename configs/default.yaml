@@ -26,7 +26,6 @@ paths:
   embeddings: "data/embeddings"
   checkpoints: "checkpoints"
   results: "results"
-  logs: "logs"
 
 datasets:
   - "amazon_fashion"
@@ -55,10 +54,6 @@ dataset_contracts:
   tradesy:
     expects_categories: false
 
-# k-core filtering applied during preprocessing
-preprocessing:
-  n_min: 5 # minimum interactions per user and per item
-
 # =============================================================================
 # Pipeline orchestration (consumed by main.py)
 # =============================================================================
@@ -71,7 +66,7 @@ preprocessing:
 #
 # Available step names:
 #   download, preprocess, extract, finetune, evaluate_finetuning,
-#   fuse, train, evaluate, statistical, export_best
+#   fuse, train, evaluate, beyond_accuracy, statistical, export_best
 pipeline:
   # When true the entire pipeline runs end-to-end (Battery 1 + Battery 2).
   # Set to false to honour ``start_from`` / ``stop_at`` instead.
@@ -85,7 +80,7 @@ pipeline:
 
   # Which condition to run for fuse / train / evaluate steps.
   # "frozen", "finetuned" or "both" (runs each twice in order).
-  condition: "both"
+  condition: "frozen"
 
 # =============================================================================
 # Per-step throughput and cost telemetry

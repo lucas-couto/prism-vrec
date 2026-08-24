@@ -157,3 +157,57 @@ class TestPairedCliffsDelta:
 
         # 1 win, 3 ties: delta = 1/4 (pratt-consistent denominator).
         assert paired_cliffs_delta([1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]) == 0.25
+
+
+class TestConsolidatedTables:
+    """One file per (dataset, kind), metric identity carried in each row."""
+
+    def test_tag_metric_prepends_identity_columns(self) -> None:
+        import pandas as pd
+
+        from src.steps.statistical import _tag_metric
+
+        df = pd.DataFrame({"statistic": [1.0]})
+
+        out = _tag_metric(df, "ndcg", "10")
+
+        assert list(out.columns[:2]) == ["metric", "k"]
+        assert out.loc[0, "metric"] == "ndcg"
+        assert out.loc[0, "k"] == 10
+
+    def test_evaluation_mean_table_written_per_config(self, tmp_path) -> None:
+        import pandas as pd
+
+        from src.steps.evaluate import _write_mean_table
+
+        src = tmp_path / "ds_evaluation_frozen.csv"
+        pd.DataFrame(
+            {
+                "user_id": [1, 2, 1, 2],
+                "model_name": ["vbpr", "vbpr", "bpr", "bpr"],
+                "embedding_name": ["resnet50", "resnet50", "none", "none"],
+                "ndcg@10": [0.2, 0.4, 0.1, 0.1],
+            }
+        ).to_csv(src, index=False)
+
+        _write_mean_table(tmp_path, "ds", "frozen")
+
+        out = pd.read_csv(tmp_path / "ds_evaluation_mean_frozen.csv")
+        assert len(out) == 2  # one row per config, not per user
+        vbpr = out[out["model_name"] == "vbpr"].iloc[0]
+        assert vbpr["ndcg@10"] == 0.30000000000000004 or abs(vbpr["ndcg@10"] - 0.3) < 1e-9
+        assert vbpr["n_users"] == 2
+
+    def test_mean_table_skips_aggregated_input(self, tmp_path) -> None:
+        import pandas as pd
+
+        from src.steps.evaluate import _write_mean_table
+
+        src = tmp_path / "ds_evaluation_frozen.csv"
+        pd.DataFrame(
+            {"model_name": ["vbpr"], "embedding_name": ["resnet50"], "ndcg@10": [0.3]}
+        ).to_csv(src, index=False)
+
+        _write_mean_table(tmp_path, "ds", "frozen")
+
+        assert not (tmp_path / "ds_evaluation_mean_frozen.csv").exists()

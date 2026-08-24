@@ -8,6 +8,61 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-08-24
+
+### Added
+
+- **Beyond-accuracy metrics as a post-hoc step (`beyond_accuracy`,
+  06b)**, between `evaluate` and `statistical`. It consumes the
+  per-user top-20 artifacts persisted at final evaluation
+  (`results/per_user/`) — it never re-ranks and never touches the
+  Evaluator hot path — and merges the new columns into the same
+  per-user tables as the accuracy metrics, for every `k_values` ≤ 20:
+
+  - `efd@k` — novelty as Expected Free Discovery in its Mean
+    Self-Information reduction (Vargas & Castells, RecSys 2011,
+    eq. 14). Item popularity is estimated on the TRAIN split only;
+    items unseen in train are excluded from the average (logged), and
+    an optional `use_rank_relevance` flag (off by default) applies the
+    paper's exponential rank discount (base 0.85) for future
+    comparability with Deldjoo et al. (2021).
+  - `ild@k` — intra-list diversity (Vargas & Castells 2011, eq. 16)
+    over visual embeddings, with the cosine similarity normalised to
+    [0, 1] before the complement so negative cosines cannot produce
+    distances above 1. **Pre-registered decision:** ILD is computed in
+    ONE fixed reference space — the native ResNet50 artifact
+    (`beyond_accuracy.reference_embedding`) — for every system,
+    never in the evaluated extractor's own space: self-model diversity
+    is not comparable across systems. Missing artifact fails loud.
+    Single-item lists report NaN, never a forced 0.
+  - `cat_entropy@k` — Shannon entropy (base 2) of the top-k category
+    distribution, using the same `item_category_array` source as
+    DeepStyle/fine-tuning. Only for datasets with
+    `expects_categories: true`; Tradesy is explicitly N/A (no column
+    written), honouring the category contract.
+  - `icov@k` — item coverage over the TRAIN catalogue. AGGREGATE
+    (one value per cell): the column is replicated across per-user
+    rows for convenience and also written to
+    `{dataset}_beyond_accuracy_coverage.csv`; the statistical step
+    refuses to include `icov` in the per-user Wilcoxon/Friedman
+    families (no per-user distribution — distinct treatment required).
+
+  Adding `efd` / `ild` / `cat_entropy` to
+  `statistical.primary_metrics` runs them through the same
+  Wilcoxon/Holm comparison families as `recall`/`ndcg`. Pure metric
+  functions live in `src/evaluation/beyond_accuracy.py` in the style
+  of `metrics.py`; `compute_all_metrics` is untouched.
+
+### Changed
+
+- The statistical step writes one CSV per (dataset, kind) —
+  `summary` / `friedman` / `pairwise` / `aggregated` — with `metric`
+  and `k` identity columns, instead of one file per `metric@k`; the
+  long-format consolidators split them back per metric group.
+- The evaluate step writes `{dataset}_evaluation_mean_{target}.csv`
+  (one mean row per config plus `n_users`) alongside the per-user
+  table.
+
 ## [2.7.0] - 2026-08-22
 
 ### Added

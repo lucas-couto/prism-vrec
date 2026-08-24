@@ -33,11 +33,16 @@ logger = get_logger(__name__)
 _EVAL_PATTERN = re.compile(r"^(?P<ds>.+?)_evaluation_(?P<cond>frozen|finetuned)\.csv$")
 # [a-z0-9]+ (not [a-z]+) so metrics with a digit like ``f1`` classify;
 # otherwise an f1 table would glob-match but silently fail to parse.
-_SUMMARY_PATTERN = re.compile(r"^(?P<ds>.+?)_summary_(?P<metric>[a-z0-9]+)_at_(?P<k>\d+)\.csv$")
-_FRIEDMAN_PATTERN = re.compile(r"^(?P<ds>.+?)_friedman_(?P<metric>[a-z0-9]+)_at_(?P<k>\d+)\.csv$")
-_PAIRWISE_PATTERN = re.compile(r"^(?P<ds>.+?)_pairwise_(?P<metric>[a-z0-9]+)_at_(?P<k>\d+)\.csv$")
+_SUMMARY_PATTERN = re.compile(r"^(?P<ds>.+?)_summary\.csv$")
+_FRIEDMAN_PATTERN = re.compile(r"^(?P<ds>.+?)_friedman\.csv$")
+_PAIRWISE_PATTERN = re.compile(r"^(?P<ds>.+?)_pairwise\.csv$")
 
-_METRIC_COL_PATTERN = re.compile(r"^(?P<metric>precision|recall|ndcg|map|f1)@(?P<k>\d+)$")
+# icov is deliberately absent: it is an aggregate (per-cell) metric the
+# beyond_accuracy step replicates across per-user rows; melting it into
+# the per-user long format would fake a distribution it does not have.
+_METRIC_COL_PATTERN = re.compile(
+    r"^(?P<metric>precision|recall|ndcg|map|f1|efd|ild|cat_entropy)@(?P<k>\d+)$"
+)
 _EMBEDDING_DIM_PATTERN = re.compile(r"_D(\d+)$")
 _FINETUNED_SUFFIX = "_finetuned"
 _HYBRID_PREFIX = "hybrid_"
@@ -312,9 +317,9 @@ def classify_table_file(path: Path) -> dict[str, str] | None:
     if m := _EVAL_PATTERN.match(name):
         return {"kind": "evaluation", "dataset": m["ds"], "condition": m["cond"]}
     if m := _SUMMARY_PATTERN.match(name):
-        return {"kind": "summary", "dataset": m["ds"], "metric": m["metric"], "k": m["k"]}
+        return {"kind": "summary", "dataset": m["ds"]}
     if m := _FRIEDMAN_PATTERN.match(name):
-        return {"kind": "friedman", "dataset": m["ds"], "metric": m["metric"], "k": m["k"]}
+        return {"kind": "friedman", "dataset": m["ds"]}
     if m := _PAIRWISE_PATTERN.match(name):
-        return {"kind": "pairwise", "dataset": m["ds"], "metric": m["metric"], "k": m["k"]}
+        return {"kind": "pairwise", "dataset": m["ds"]}
     return None

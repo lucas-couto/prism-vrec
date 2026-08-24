@@ -87,6 +87,20 @@ def _aggregate_per_user(long_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _iter_metric_groups(df: pd.DataFrame):
+    """Yield ``((metric, k), sub_frame)`` from a consolidated per-dataset CSV.
+
+    The per-dataset files carry ``metric`` + ``k`` identity columns (one
+    file per kind since 2.9.0); the ``*_to_long`` converters keep their
+    per-metric contract, so this splits the file back into the shape
+    they expect, with the identity columns dropped from the sub-frame.
+    """
+    if df.empty or "metric" not in df.columns:
+        return
+    for (metric, k), sub in df.groupby(["metric", "k"], dropna=False):
+        yield (str(metric), int(k)), sub.drop(columns=["metric", "k"]).reset_index(drop=True)
+
+
 def consolidate_bootstrap(
     tables_dir: Path,
     known_recommenders: list[str] | None = None,
@@ -94,19 +108,20 @@ def consolidate_bootstrap(
     """Concatenate every ``_summary_*.csv`` into one long table."""
     recs = known_recommenders or _known_recommenders()
     frames: list[pd.DataFrame] = []
-    for path in sorted(tables_dir.glob("*_summary_*.csv")):
+    for path in sorted(tables_dir.glob("*_summary.csv")):
         info = classify_table_file(path)
         if info is None or info["kind"] != "summary":
             continue
-        long_df = summary_to_long(
-            pd.read_csv(path),
-            dataset=info["dataset"],
-            metric=info["metric"],
-            k=int(info["k"]),
-            known_recommenders=recs,
-        )
-        if not long_df.empty:
-            frames.append(long_df)
+        for (metric, k), sub in _iter_metric_groups(pd.read_csv(path)):
+            long_df = summary_to_long(
+                sub,
+                dataset=info["dataset"],
+                metric=metric,
+                k=k,
+                known_recommenders=recs,
+            )
+            if not long_df.empty:
+                frames.append(long_df)
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
@@ -122,32 +137,29 @@ def consolidate_statistical_tests(
     recs = known_recommenders or _known_recommenders()
     frames: list[pd.DataFrame] = []
 
-    for path in sorted(tables_dir.glob("*_friedman_*.csv")):
+    for path in sorted(tables_dir.glob("*_friedman.csv")):
         info = classify_table_file(path)
         if info is None or info["kind"] != "friedman":
             continue
-        long_df = friedman_to_long(
-            pd.read_csv(path),
-            dataset=info["dataset"],
-            metric=info["metric"],
-            k=int(info["k"]),
-        )
-        if not long_df.empty:
-            frames.append(long_df)
+        for (metric, k), sub in _iter_metric_groups(pd.read_csv(path)):
+            long_df = friedman_to_long(sub, dataset=info["dataset"], metric=metric, k=k)
+            if not long_df.empty:
+                frames.append(long_df)
 
-    for path in sorted(tables_dir.glob("*_pairwise_*.csv")):
+    for path in sorted(tables_dir.glob("*_pairwise.csv")):
         info = classify_table_file(path)
         if info is None or info["kind"] != "pairwise":
             continue
-        long_df = pairwise_to_long(
-            pd.read_csv(path),
-            dataset=info["dataset"],
-            metric=info["metric"],
-            k=int(info["k"]),
-            known_recommenders=recs,
-        )
-        if not long_df.empty:
-            frames.append(long_df)
+        for (metric, k), sub in _iter_metric_groups(pd.read_csv(path)):
+            long_df = pairwise_to_long(
+                sub,
+                dataset=info["dataset"],
+                metric=metric,
+                k=k,
+                known_recommenders=recs,
+            )
+            if not long_df.empty:
+                frames.append(long_df)
 
     if not frames:
         return pd.DataFrame()

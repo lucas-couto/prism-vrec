@@ -37,7 +37,6 @@ def test_minimal_config_validates_with_defaults_filled() -> None:
     assert out["seed"] == 42
     assert out["pipeline"]["condition"] == "both"
     assert out["paths"]["data_raw"] == "data/raw"
-    assert out["preprocessing"]["n_min"] == 5
     assert out["finetuning"]["epochs_max"] == 15
 
 
@@ -81,9 +80,13 @@ def test_negative_seed_raises() -> None:
         validate_config({**_minimal(), "seed": -1})
 
 
-def test_zero_kcore_raises() -> None:
-    with pytest.raises(ValidationError):
-        validate_config({**_minimal(), "preprocessing": {"n_min": 0}})
+def test_removed_preprocessing_block_passes_as_extra() -> None:
+    # preprocessing.n_min was a DEAD key (no k-core exists in the code);
+    # it is no longer part of the schema.  A stale yaml carrying it must
+    # not crash (root allows extras) and must not resurrect a field.
+    out = validate_config({**_minimal(), "preprocessing": {"n_min": 5}})
+
+    assert "n_min" not in str(out.get("paths", {}))
 
 
 def test_unknown_pipeline_key_rejected() -> None:

@@ -239,9 +239,9 @@ class TestClassifyTableFile:
         [
             ("amazon_fashion_evaluation_frozen.csv", "evaluation"),
             ("amazon_men_evaluation_finetuned.csv", "evaluation"),
-            ("amazon_women_summary_ndcg_at_10.csv", "summary"),
-            ("tradesy_friedman_precision_at_20.csv", "friedman"),
-            ("amazon_fashion_pairwise_map_at_5.csv", "pairwise"),
+            ("amazon_women_summary.csv", "summary"),
+            ("tradesy_friedman.csv", "friedman"),
+            ("amazon_fashion_pairwise.csv", "pairwise"),
         ],
     )
     def test_recognised_patterns(self, filename: str, expected_kind: str) -> None:
@@ -291,12 +291,16 @@ class TestWriteConsolidatedEndToEnd:
                 },
             ]
         )
-        summary_df.to_csv(tables / "amazon_fashion_summary_ndcg_at_10.csv", index=False)
+        summary_df.insert(0, "k", 10)
+        summary_df.insert(0, "metric", "ndcg")
+        summary_df.to_csv(tables / "amazon_fashion_summary.csv", index=False)
 
         friedman_df = pd.DataFrame(
             [{"statistic": 5.0, "p_value": 0.05, "significant": True, "n_configs": 2, "n_users": 2}]
         )
-        friedman_df.to_csv(tables / "amazon_fashion_friedman_ndcg_at_10.csv", index=False)
+        friedman_df.insert(0, "k", 10)
+        friedman_df.insert(0, "metric", "ndcg")
+        friedman_df.to_csv(tables / "amazon_fashion_friedman.csv", index=False)
 
         pairwise_df = pd.DataFrame(
             [
@@ -315,7 +319,9 @@ class TestWriteConsolidatedEndToEnd:
                 }
             ]
         )
-        pairwise_df.to_csv(tables / "amazon_fashion_pairwise_ndcg_at_10.csv", index=False)
+        pairwise_df.insert(0, "k", 10)
+        pairwise_df.insert(0, "metric", "ndcg")
+        pairwise_df.to_csv(tables / "amazon_fashion_pairwise.csv", index=False)
 
         written = write_consolidated(tables)
 

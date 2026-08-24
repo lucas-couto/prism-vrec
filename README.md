@@ -833,8 +833,7 @@ prism-vrec/
 │   │   ├── categories.py         # McAuley-taxonomy → categories.csv helper
 │   │   ├── example_csv.py        # Worked-example provider for CSV+images datasets
 │   │   ├── synthetic.py          # In-process synthetic dataset (backs the smoke profile)
-│   │   ├── auto_register.py      # Auto-discovery for plugins/datasets/<name>/
-│   │   └── preprocessing.py      # k-core filter, leave-one-out split utilities
+│   │   └── auto_register.py      # Auto-discovery for plugins/datasets/<name>/
 │   │
 │   ├── extractors/
 │   │   ├── base.py               # BaseExtractor ABC (FP16 inference, checkpointing)
@@ -925,7 +924,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.8.2},
+  version = {2.8.3},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }

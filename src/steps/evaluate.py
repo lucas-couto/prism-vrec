@@ -32,6 +32,7 @@ from src.utils.device import resolve_device
 from src.utils.logging import get_logger
 from src.utils.splits import assert_holdout_disjoint
 from src.utils.timing import note_skipped_cell, time_cell
+from src.utils.variant_filters import checkpoint_matches_config
 
 logger = get_logger(__name__)
 
@@ -184,6 +185,38 @@ def _route_targets(model_name: str, embedding_name: str) -> list[str]:
     if is_finetuned_artifact(embedding_name):
         return ["finetuned"]
     return ["frozen"]
+
+
+def _write_mean_table(results_dir: Path, dataset_name: str, target: str) -> None:
+    """Write ``{ds}_evaluation_mean_{target}.csv``: one MEAN row per config.
+
+    The per-user ``{ds}_evaluation_{target}.csv`` is the statistical
+    step's input and stays untouched; this companion is the
+    dissertation-facing view — mean of every metric column per
+    (model, embedding) plus ``n_users`` — so nobody has to aggregate
+    per-user rows by hand (or, worse, rank them raw).
+    """
+    src = results_dir / f"{dataset_name}_evaluation_{target}.csv"
+    if not src.exists():
+        return
+    df = pd.read_csv(src)
+    if "user_id" not in df.columns or df.empty:
+        return
+    keys = ["model_name", "embedding_name"]
+    metric_cols = [
+        c
+        for c in df.columns
+        if c not in keys
+        and c not in ("user_id", "dataset")
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    mean_df = df.groupby(keys, as_index=False).agg(
+        **{c: (c, "mean") for c in metric_cols},
+        n_users=("user_id", "size"),
+    )
+    out = results_dir / f"{dataset_name}_evaluation_mean_{target}.csv"
+    mean_df.to_csv(out, index=False)
+    logger.info("  mean table: %d configs -> %s", len(mean_df), out)
 
 
 def _done_path(results_dir: Path, dataset_name: str) -> Path:
@@ -365,6 +398,17 @@ def run(condition: str = "frozen") -> None:
         done_path = _done_path(results_dir, dataset_name)
         done = _load_done(done_path)
         best_models = find_best_models(dataset_name, results_dir=results_root)
+        # The models directory accumulates checkpoints across runs; only
+        # cells the CURRENT config would train are evaluated (same
+        # disk-vs-config rule as the train step's cell filters).
+        eligible = [m for m in best_models if checkpoint_matches_config(m, config)]
+        if len(eligible) != len(best_models):
+            logger.info(
+                "  %d checkpoint(s) on disk skipped (model/backbone/fusion "
+                "not enabled in the current config).",
+                len(best_models) - len(eligible),
+            )
+        best_models = eligible
         logger.info("  Found %d models to evaluate", len(best_models))
 
         for model_info in best_models:
@@ -404,6 +448,8 @@ def run(condition: str = "frozen") -> None:
                 recorded.append((target, mn, en))
             _record_done(done_path, recorded)
 
+        for target in ("frozen", "finetuned"):
+            _write_mean_table(results_dir, dataset_name, target)
         logger.info("  Dataset %s complete.", dataset_name)
 
     logger.info("Evaluation complete.")
