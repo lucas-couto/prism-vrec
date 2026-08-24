@@ -187,6 +187,38 @@ def _route_targets(model_name: str, embedding_name: str) -> list[str]:
     return ["frozen"]
 
 
+def _write_mean_table(results_dir: Path, dataset_name: str, target: str) -> None:
+    """Write ``{ds}_evaluation_mean_{target}.csv``: one MEAN row per config.
+
+    The per-user ``{ds}_evaluation_{target}.csv`` is the statistical
+    step's input and stays untouched; this companion is the
+    dissertation-facing view — mean of every metric column per
+    (model, embedding) plus ``n_users`` — so nobody has to aggregate
+    per-user rows by hand (or, worse, rank them raw).
+    """
+    src = results_dir / f"{dataset_name}_evaluation_{target}.csv"
+    if not src.exists():
+        return
+    df = pd.read_csv(src)
+    if "user_id" not in df.columns or df.empty:
+        return
+    keys = ["model_name", "embedding_name"]
+    metric_cols = [
+        c
+        for c in df.columns
+        if c not in keys
+        and c not in ("user_id", "dataset")
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    mean_df = df.groupby(keys, as_index=False).agg(
+        **{c: (c, "mean") for c in metric_cols},
+        n_users=("user_id", "size"),
+    )
+    out = results_dir / f"{dataset_name}_evaluation_mean_{target}.csv"
+    mean_df.to_csv(out, index=False)
+    logger.info("  mean table: %d configs -> %s", len(mean_df), out)
+
+
 def _done_path(results_dir: Path, dataset_name: str) -> Path:
     """Path of the per-dataset resume sidecar."""
     return results_dir / f"{dataset_name}_evaluation_done.csv"
@@ -416,6 +448,8 @@ def run(condition: str = "frozen") -> None:
                 recorded.append((target, mn, en))
             _record_done(done_path, recorded)
 
+        for target in ("frozen", "finetuned"):
+            _write_mean_table(results_dir, dataset_name, target)
         logger.info("  Dataset %s complete.", dataset_name)
 
     logger.info("Evaluation complete.")

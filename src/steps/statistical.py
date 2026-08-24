@@ -145,8 +145,16 @@ def run(condition: str = "frozen") -> None:
                 families,
             )
 
+        # One file per (dataset, kind), with `metric` + `k` columns
+        # identifying each row — instead of one file per metric@k.
+        summary_frames: list[pd.DataFrame] = []
+        friedman_frames: list[pd.DataFrame] = []
+        pairwise_frames: list[pd.DataFrame] = []
+        aggregated_frames: list[pd.DataFrame] = []
+
         for metric in metrics:
             logger.info("  --- %s ---", metric)
+            metric_name, _, metric_k = metric.partition("@")
 
             if per_user:
                 if bootstrap_enabled:
@@ -156,22 +164,20 @@ def run(condition: str = "frozen") -> None:
                         n_iterations=bootstrap_iters,
                         alpha=alpha,
                     )
-                    out = results_dir / f"{dataset_name}_summary_{_safe(metric)}.csv"
-                    summary.to_csv(out, index=False)
-                    logger.info("    bootstrap CI saved: %s", out)
+                    summary_frames.append(_tag_metric(summary, metric_name, metric_k))
 
                 fried_rows: list[dict] = []
                 if friedman_enabled and instances:
                     fried_rows = _family_friedman_rows(eval_df, instances, metric, alpha)
                     if fried_rows:
-                        out = results_dir / f"{dataset_name}_friedman_{_safe(metric)}.csv"
-                        pd.DataFrame(fried_rows).to_csv(out, index=False)
+                        friedman_frames.append(
+                            _tag_metric(pd.DataFrame(fried_rows), metric_name, metric_k)
+                        )
                         n_sig = sum(1 for r in fried_rows if r["significant"])
                         logger.info(
-                            "    friedman: %d/%d family instances significant -> %s",
+                            "    friedman: %d/%d family instances significant",
                             n_sig,
                             len(fried_rows),
-                            out,
                         )
                     else:
                         logger.info(
@@ -198,15 +204,13 @@ def run(condition: str = "frozen") -> None:
                     ]
                     pairs_df = pd.concat(pair_frames, ignore_index=True)
                     pairs_df["omnibus_significant"] = _omnibus_column(pairs_df, fried_rows)
-                    out = results_dir / f"{dataset_name}_pairwise_{_safe(metric)}.csv"
-                    pairs_df.to_csv(out, index=False)
+                    pairwise_frames.append(_tag_metric(pairs_df, metric_name, metric_k))
                     logger.info(
                         "    pairwise (%s correction, per family): %d pairs across "
-                        "%d family instances -> %s",
+                        "%d family instances",
                         correction,
                         len(pairs_df),
                         len(instances),
-                        out,
                     )
             else:
                 logger.warning(
@@ -221,10 +225,22 @@ def run(condition: str = "frozen") -> None:
                         config=lambda df: df["model_name"] + "_" + df["embedding_name"],
                     )
                     .loc[:, ["config", metric]]
+                    .rename(columns={metric: "value"})
                 )
-                out = results_dir / f"{dataset_name}_aggregated_{_safe(metric)}.csv"
-                comp.to_csv(out, index=False)
-                logger.info("    aggregated table saved: %s", out)
+                aggregated_frames.append(_tag_metric(comp, metric_name, metric_k))
+
+        for kind, frames in (
+            ("summary", summary_frames),
+            ("friedman", friedman_frames),
+            ("pairwise", pairwise_frames),
+            ("aggregated", aggregated_frames),
+        ):
+            if not frames:
+                continue
+            out = results_dir / f"{dataset_name}_{kind}.csv"
+            merged = pd.concat(frames, ignore_index=True)
+            merged.to_csv(out, index=False)
+            logger.info("    %s: %d rows -> %s", kind, len(merged), out)
 
     logger.info("Statistical analyses complete.")
 
@@ -236,6 +252,14 @@ def run(condition: str = "frozen") -> None:
             logger.info("Long-format %s: %s", label, path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Long-format consolidation skipped: %s", exc)
+
+
+def _tag_metric(df: pd.DataFrame, metric: str, k: str) -> pd.DataFrame:
+    """Prepend ``metric`` / ``k`` identity columns to a result frame."""
+    out = df.copy()
+    out.insert(0, "k", int(k) if k else pd.NA)
+    out.insert(0, "metric", metric)
+    return out
 
 
 def _family_friedman_rows(
@@ -339,8 +363,3 @@ def _metrics_to_test(
     for k in k_values:
         candidates.extend(f"{fam}@{k}" for fam in metric_families)
     return [m for m in candidates if m in eval_df.columns]
-
-
-def _safe(metric: str) -> str:
-    """File-system-safe version of a metric name (``ndcg@10`` -> ``ndcg_at_10``)."""
-    return metric.replace("@", "_at_")

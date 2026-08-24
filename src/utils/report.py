@@ -162,13 +162,13 @@ def _section_artefact_links(tables_dir: Path) -> str:
     }
     for path in sorted(tables_dir.iterdir()):
         name = path.name
-        if "_summary_" in name:
+        if name.endswith("_summary.csv"):
             by_kind["bootstrap (per-(model, dataset, condition) CI)"].append(name)
-        elif "_friedman_" in name:
+        elif name.endswith("_friedman.csv"):
             by_kind["Friedman omnibus"].append(name)
-        elif "_pairwise_" in name:
+        elif name.endswith("_pairwise.csv"):
             by_kind["pairwise Wilcoxon"].append(name)
-        elif "_aggregated_" in name:
+        elif name.endswith("_aggregated.csv"):
             by_kind["cross-dataset aggregation"].append(name)
 
     out: list[str] = []
