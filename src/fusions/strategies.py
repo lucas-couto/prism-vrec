@@ -257,10 +257,12 @@ def fuse_weighted_mean(
             raise ValueError("Weights must not sum to zero.")
         weights = [w / total for w in weights]
 
+    # Accumulate in float64 for precision, emit the pipeline's float32
+    # (every feature artifact is validated against FEATURE_DTYPE).
     result = np.zeros_like(embeddings[0], dtype=np.float64)
     for w, emb in zip(weights, embeddings, strict=False):
         result += w * emb
-    return result
+    return result.astype(np.float32, copy=False)
 
 
 def fuse_attention_weighted(
@@ -314,7 +316,7 @@ def fuse_attention_weighted(
     result = np.zeros_like(embeddings[0], dtype=np.float64)
     for alpha, emb in zip(alphas, embeddings, strict=False):
         result += alpha * emb
-    return result
+    return result.astype(np.float32, copy=False)
 
 
 def fuse_gated(
@@ -370,7 +372,7 @@ def fuse_gated(
     result = np.zeros_like(embeddings[0], dtype=np.float64)
     for gate, emb in zip(gates, embeddings, strict=False):
         result += gate * emb
-    return result
+    return result.astype(np.float32, copy=False)
 
 
 def fuse_concat(

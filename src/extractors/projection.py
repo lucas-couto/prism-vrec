@@ -88,6 +88,11 @@ class ProjectionConfig:
     dim: int
     seed: int = 42
 
+    @property
+    def needs_fit(self) -> bool:
+        """Whether the method requires the train-item fit set (any PCA variant)."""
+        return self.method != "random"
+
 
 def _coerce_block(block: Any, source: str) -> dict[str, Any]:
     if block is None:
