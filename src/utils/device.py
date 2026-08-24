@@ -50,3 +50,31 @@ def resolve_device(requested: str) -> str:
 
     logger.warning("unknown device value %r, using cpu", requested)
     return "cpu"
+
+
+def vram_allowance_bytes(device=None) -> int:
+    """Bytes of VRAM THIS process may use, honouring the per-process cap.
+
+    ``torch.cuda.get_device_properties().total_memory`` reports the
+    card, not the allowance: a worker capped by
+    ``torch.cuda.set_per_process_memory_fraction`` sees the full total
+    and overcommits (the 2026-08-24 OOM cascade — VNPR's eval chunk and
+    the default ranking budget were both sized off the card while three
+    workers shared it).  Every VRAM-derived budget must size off THIS
+    value instead.
+
+    :param device: CUDA device (index, str or ``torch.device``);
+        ``None`` = current device.
+    :returns: Allowance in bytes; ``0`` when CUDA is unavailable.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        total = torch.cuda.get_device_properties(device or 0).total_memory
+        getter = getattr(torch.cuda, "get_per_process_memory_fraction", None)
+        fraction = float(getter(device)) if getter is not None else 1.0
+    except (RuntimeError, AssertionError):
+        return 0
+    return int(total * min(max(fraction, 0.0), 1.0))

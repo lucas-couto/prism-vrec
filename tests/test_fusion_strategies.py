@@ -34,6 +34,29 @@ def _e2() -> np.ndarray:
     return np.array([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32)
 
 
+def test_all_offline_strategies_emit_float32() -> None:
+    # Regression: the weighted family accumulated in float64 and returned
+    # it; the train gate validates artifacts against FEATURE_DTYPE
+    # (float32) and refused the fused hybrids.
+    from src.fusions.strategies import get_fusion_strategy
+
+    rng = np.random.default_rng(0)
+    sources = [rng.standard_normal((6, 8)).astype(np.float32) for _ in range(2)]
+    for name in ("mean", "sum", "prod", "max_pool", "concat"):
+        assert get_fusion_strategy(name)(sources, normalize=True).dtype == np.float32, name
+    assert (
+        get_fusion_strategy("weighted_mean", weights=[0.7, 0.3])(sources, normalize=True).dtype
+        == np.float32
+    )
+    assert (
+        get_fusion_strategy("attention_weighted", logits=[1.0, 0.0])(sources, normalize=True).dtype
+        == np.float32
+    )
+    assert (
+        get_fusion_strategy("gated", logits=[1.0, 0.0])(sources, normalize=True).dtype == np.float32
+    )
+
+
 def test_l2_normalize_unit_norm_per_row() -> None:
     x = np.array([[3.0, 4.0], [0.0, 5.0]], dtype=np.float32)
     out = l2_normalize(x)

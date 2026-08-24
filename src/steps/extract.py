@@ -271,9 +271,14 @@ def _extract_for_config(
         )
 
     if need_components:
+        # The streaming part-file lives NEXT TO the final artifact (not in
+        # the checkpoints dir): data/ and checkpoints/ are separate bind
+        # mounts in the container, and same-filesystem placement is what
+        # lets save_components finalise by atomic rename instead of
+        # rewriting a catalogue-sized matrix.
         components, comp_ids = extractor.extract_components_batch(
             dataloader,
-            checkpoint_path=f"{ckpt_base}_comp",
+            checkpoint_path=str(comp_path.with_suffix("")),
             save_every=checkpoint_every,
         )
         extractor.save_components(components, comp_ids, str(comp_path))
@@ -381,7 +386,7 @@ def run() -> None:
 
         for extractor_name, extractor_cls in extractors.items():
             projection = resolve_projection_config(config, extractor_name)
-            if projection is not None and projection.method == "pca" and train_items is None:
+            if projection is not None and projection.needs_fit and train_items is None:
                 train_items = train_item_indices(processed_dir, dataset_name)
 
             with time_cell(

@@ -191,7 +191,8 @@ def _worker_fn(
     # ``get_device_properties``, so the number has to travel by hand.
     worker_vram = 0
     if torch.cuda.is_available():
-        fraction = min(0.95, 1.0 / n_workers + 0.05) if n_workers > 1 else 1.0
+        # 0.90/n keeps the sum of caps below the card (see train.py).
+        fraction = 0.90 / n_workers if n_workers > 1 else 1.0
         if n_workers > 1:
             torch.cuda.set_per_process_memory_fraction(fraction)
         try:

@@ -49,6 +49,9 @@ def _config() -> dict:
         "datasets": [DATASET],
         "recommenders_enabled": ["vbpr", "acf"],
         "embedding_dims": ["D128"],
+        # The fusion filter honours the config: hybrid_* stems on disk
+        # only become cells when their strategy is enabled here.
+        "fusion_strategies_enabled": ["mean"],
         "common": {
             "latent_dim": [64],
             "learning_rate": [0.001],
@@ -142,3 +145,68 @@ def test_vbpr_pool_is_identical_with_and_without_comp_file(tmp_path, monkeypatch
     }
 
     assert baseline == with_comp
+
+
+class TestFusionFilterHonoursConfig:
+    """Disabled fusion strategies must not become cells from stale disk artifacts."""
+
+    def _names(self) -> list[str]:
+        return [
+            "vit_b16_D128",
+            "hybrid_mean_p128",
+            "hybrid_pca_nc128_p128",
+            "hybrid_pca_per_model_nc64_p128",
+            "hybrid_adaptive_gated_p128",
+            "hybrid_gated_l1_0_p128",
+        ]
+
+    def test_empty_list_keeps_no_fusion_cells(self) -> None:
+        from src.steps.train import filter_by_enabled_fusions
+
+        kept = filter_by_enabled_fusions(self._names(), {"fusion_strategies_enabled": []})
+
+        assert kept == ["vit_b16_D128"]
+
+    def test_only_enabled_strategies_survive(self) -> None:
+        from src.steps.train import filter_by_enabled_fusions
+
+        kept = filter_by_enabled_fusions(
+            self._names(), {"fusion_strategies_enabled": ["mean", "gated"]}
+        )
+
+        assert kept == ["vit_b16_D128", "hybrid_mean_p128", "hybrid_gated_l1_0_p128"]
+
+    def test_prefix_collisions_resolve_by_longest_match(self) -> None:
+        # pca enabled must NOT drag pca_per_model along, nor gated drag
+        # adaptive_gated.
+        from src.steps.train import filter_by_enabled_fusions
+
+        kept = filter_by_enabled_fusions(
+            self._names(), {"fusion_strategies_enabled": ["pca", "adaptive_gated"]}
+        )
+
+        assert kept == [
+            "vit_b16_D128",
+            "hybrid_pca_nc128_p128",
+            "hybrid_adaptive_gated_p128",
+        ]
+
+    def test_unknown_hybrid_stem_is_excluded(self) -> None:
+        from src.steps.train import filter_by_enabled_fusions
+
+        kept = filter_by_enabled_fusions(
+            ["hybrid_totally_unknown_thing"], {"fusion_strategies_enabled": ["mean"]}
+        )
+
+        assert kept == []
+
+    def test_disabled_fusions_produce_no_jobs(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        processed_dir, embeddings_dir = _setup(tmp_path, with_comp=True)
+        config = _config()
+        config["fusion_strategies_enabled"] = []
+
+        jobs = build_job_list("frozen", config, processed_dir, embeddings_dir, "cpu")
+
+        assert not any(j.embedding_name.startswith("hybrid_") for j in jobs)
+        assert any(j.embedding_name == "vit_b16_D128" for j in jobs)

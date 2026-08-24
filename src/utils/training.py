@@ -547,8 +547,10 @@ def train_single_run(
                 # Train-vs-eval split per model: the number the efficiency
                 # audit could not answer without instrumentation.
                 logger.info(
-                    "timing model=%s epoch=%d train_s=%.2f eval_s=%.2f",
+                    "timing dataset=%s model=%s embedding=%s epoch=%d train_s=%.2f eval_s=%.2f",
+                    dataset_name,
                     model_name,
+                    embedding_name,
                     epoch,
                     train_seconds,
                     eval_seconds,

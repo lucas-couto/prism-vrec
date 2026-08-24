@@ -33,6 +33,24 @@ def is_finetuned_artifact(name: str) -> bool:
     return FINETUNED_MARKER in name
 
 
+def fusion_strategy_of(stem: str, known_strategies) -> str | None:
+    """Strategy name encoded in a ``hybrid_*`` artifact stem, or ``None``.
+
+    Longest-match against *known_strategies*: names prefix each other
+    (``pca`` / ``pca_per_model``, ``gated`` / ``adaptive_gated``), so a
+    naive prefix test would misattribute ``hybrid_pca_per_model_nc64``
+    to ``pca``.  Non-fusion stems and stems whose strategy is not in
+    *known_strategies* return ``None``.
+    """
+    if not stem.startswith(FUSION_PREFIX):
+        return None
+    rest = stem[len(FUSION_PREFIX) :]
+    for name in sorted(known_strategies, key=len, reverse=True):
+        if rest == name or rest.startswith(f"{name}_"):
+            return name
+    return None
+
+
 def is_component_artifact(name: str) -> bool:
     """Whether an embedding stem is a 3-D per-item component artifact.
 

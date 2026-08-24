@@ -107,21 +107,23 @@ def plan_ranking_batch(requested: int, n_items: int, budget_bytes: int) -> int:
 def default_ranking_budget(device: torch.device) -> int:
     """GPU bytes one process may spend on ranking buffers, by default.
 
-    A fixed fraction of the device's *total* memory, so the value is
-    reproducible on a given host rather than depending on what else
-    happened to be resident.  Callers that know their real allowance —
-    a training worker capped by
-    ``torch.cuda.set_per_process_memory_fraction`` — pass it explicitly
-    instead.  Returns ``0`` on CPU, where the caller's batch size stands
-    (host RAM is an order of magnitude larger and not the constraint).
+    A fixed fraction of this process's VRAM *allowance* (total memory
+    scaled by any ``set_per_process_memory_fraction`` cap), so a capped
+    worker never budgets ranking buffers off the whole card while
+    sharing it with siblings.  Callers that know a tighter allowance
+    still pass it explicitly.  Returns ``0`` on CPU, where the caller's
+    batch size stands (host RAM is an order of magnitude larger and not
+    the constraint).
     """
     if device.type != "cuda" or not torch.cuda.is_available():
         return 0
     try:
-        total = torch.cuda.get_device_properties(device).total_memory
+        from src.utils.device import vram_allowance_bytes
+
+        allowance = vram_allowance_bytes(device)
     except Exception:  # noqa: BLE001 — probing must never break evaluation
         return 0
-    return int(total * _DEFAULT_RANKING_VRAM_FRACTION)
+    return int(allowance * _DEFAULT_RANKING_VRAM_FRACTION)
 
 
 class Evaluator:

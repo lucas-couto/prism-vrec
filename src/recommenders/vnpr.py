@@ -20,20 +20,25 @@ from src.recommenders.base import BaseRecommender
 def _autotune_chunk_pairs() -> int:
     """Pick the (user, item) chunk size for full-ranking eval from VRAM.
 
-    Bounded peaks for an 8 GB / 16 GB / 24+ GB GPU when k=128 and
-    hidden_layers up to [512, 256, 128].  CPU and small-VRAM hosts fall
-    into the conservative 500_000 tier.
+    Bounded peaks for an 8 GB / 16 GB / 24+ GB *allowance* when k=128
+    and hidden_layers up to [512, 256, 128].  The tiers key off this
+    process's VRAM allowance (``set_per_process_memory_fraction``-aware),
+    not the card total: a worker holding a third of the GPU sized its
+    (b, N, h1) eval chunk off the whole card and OOM'd (2026-08-24).
+    CPU and small-allowance hosts fall into the conservative tier.
     """
     try:
-        if not torch.cuda.is_available():
-            return 500_000
-        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        from src.utils.device import vram_allowance_bytes
+
+        allowance_gb = vram_allowance_bytes() / (1024**3)
     except (RuntimeError, AssertionError):
         return 500_000
-
-    if total_gb < 12:
+    if allowance_gb <= 0:
         return 500_000
-    if total_gb < 24:
+
+    if allowance_gb < 12:
+        return 500_000
+    if allowance_gb < 24:
         return 2_000_000
     return 5_000_000
 

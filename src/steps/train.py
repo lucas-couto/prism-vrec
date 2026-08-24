@@ -150,6 +150,47 @@ def _resolve_model_names(config: dict) -> list[str]:
     return [s.name for s in iter_specs() if s.name in enabled]
 
 
+def filter_by_enabled_fusions(names: list[str], config: dict) -> list[str]:
+    """Drop ``hybrid_*`` stems whose strategy is not currently enabled.
+
+    The embeddings directory accumulates fusion artifacts across runs;
+    without this filter, disabling a strategy in
+    ``configs/fusion.yaml -> fusion_strategies_enabled`` stopped the
+    fuse step from WRITING it but the train step still picked the
+    on-disk artifact up as a cell.  The config is the source of truth:
+    an empty/absent list keeps no fusion cells.  Stems whose strategy
+    cannot be parsed against the registered names are excluded loudly.
+    """
+    from src.fusions.registry import registered_fusion_strategies
+    from src.utils.artifact_names import fusion_strategy_of
+
+    enabled = set(config.get("fusion_strategies_enabled") or [])
+    known = registered_fusion_strategies()
+    kept: list[str] = []
+    for name in names:
+        if not name.startswith(FUSION_PREFIX):
+            kept.append(name)
+            continue
+        strategy = fusion_strategy_of(name, known)
+        if strategy is None:
+            logger.warning(
+                "embedding %r looks like a fusion artifact but matches no "
+                "registered strategy; excluded from training.",
+                name,
+            )
+            continue
+        if strategy in enabled:
+            kept.append(name)
+    n_dropped = len(names) - len(kept)
+    if n_dropped:
+        logger.info(
+            "fusion filter: %d hybrid artifact(s) on disk excluded "
+            "(strategy not in fusion_strategies_enabled).",
+            n_dropped,
+        )
+    return kept
+
+
 def _iter_cells(
     condition: str,
     config: dict,
@@ -171,6 +212,7 @@ def _iter_cells(
     for dataset_name in config.get("datasets", []):
         all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
         all_embs = filter_by_variant(all_embs, variant)
+        all_embs = filter_by_enabled_fusions(all_embs, config)
         if condition == "frozen":
             embedding_names = [e for e in all_embs if not is_finetuned_artifact(e)]
         else:
@@ -569,6 +611,7 @@ def _optimize_one_cell(
     processed_dir: str,
     device: str,
     log=logger,
+    ranking_budget_bytes: int | None = None,
 ) -> dict:
     """Create/load the study for *cell* and run its remaining trials.
 
@@ -601,6 +644,7 @@ def _optimize_one_cell(
             device=device,
             config=config,
             trial=trial,
+            ranking_budget_bytes=ranking_budget_bytes,
         )
 
     existing = _legit_trial_count(study)
@@ -642,6 +686,65 @@ def _optimize_one_cell(
     return summary
 
 
+#: OOM retries per Optuna cell; each retry shrinks the ranking budget.
+_OOM_MAX_RETRIES = 2
+_OOM_SHRINK = 0.6
+
+
+def _optimize_cell_with_oom_retry(
+    cell: CellKey,
+    n_users: int,
+    n_items: int,
+    emb_path: str | None,
+    *,
+    config: dict,
+    processed_dir: str,
+    device: str,
+    log=logger,
+) -> dict:
+    """Run one Optuna cell, retrying CUDA OOM with a shrinking budget.
+
+    Mirrors the grid orchestrator's OOM handling at cell granularity:
+    a transient OOM (fragmentation, a sibling worker peaking) must not
+    cost the battery a whole cell.  Each retry empties the CUDA cache
+    and shrinks the explicit ranking budget by ``_OOM_SHRINK`` starting
+    from the allowance-derived default.
+    """
+    import torch
+
+    budget: int | None = None
+    for attempt in range(_OOM_MAX_RETRIES + 1):
+        try:
+            return _optimize_one_cell(
+                cell,
+                n_users,
+                n_items,
+                emb_path,
+                config=config,
+                processed_dir=processed_dir,
+                device=device,
+                log=log,
+                ranking_budget_bytes=budget,
+            )
+        except torch.OutOfMemoryError:
+            if attempt == _OOM_MAX_RETRIES:
+                raise
+            torch.cuda.empty_cache()
+            if budget is None:
+                from src.evaluation.protocol import default_ranking_budget
+
+                budget = default_ranking_budget(torch.device(device))
+            budget = max(1, int(budget * _OOM_SHRINK))
+            log.warning(
+                "  OOM on cell %s (attempt %d/%d) — retrying with ranking budget %.2f GB",
+                cell.study_name(),
+                attempt + 1,
+                _OOM_MAX_RETRIES,
+                budget / 1024**3,
+            )
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def _optuna_cell_worker(
     worker_id: int,
     cell_queue,
@@ -665,7 +768,10 @@ def _optuna_cell_worker(
     wlog = _get_logger(f"optuna_worker_{worker_id}")
 
     if _torch.cuda.is_available() and n_workers > 1:
-        fraction = min(0.95, 1.0 / n_workers + 0.05)
+        # 0.90/n so the SUM of the workers' caps stays below the card
+        # (the old 1/n + 0.05 oversubscribed: 3 workers claimed 115%
+        # and every CUDA context lives outside the cap on top of that).
+        fraction = 0.90 / n_workers
         _torch.cuda.set_per_process_memory_fraction(fraction)
 
     while True:
@@ -678,7 +784,7 @@ def _optuna_cell_worker(
 
         cell, n_users, n_items, emb_path = item
         try:
-            summary = _optimize_one_cell(
+            summary = _optimize_cell_with_oom_retry(
                 cell,
                 n_users,
                 n_items,
@@ -757,6 +863,17 @@ def _run_optuna(
             "sqlite storage for resumable parallel search.",
         )
 
+    storage_url = config["hp_search"]["optuna"].get("storage")
+    if storage_url:
+        # Create the schema ONCE in the parent before any worker touches
+        # the database: N workers racing RDBStorage's create_all on a
+        # fresh sqlite file lose cells to "table studies already exists".
+        import optuna
+
+        if storage_url.startswith("sqlite:///"):
+            Path(storage_url[len("sqlite:///") :]).parent.mkdir(parents=True, exist_ok=True)
+        optuna.storages.RDBStorage(url=storage_url)
+
     import torch.multiprocessing as mp
 
     logger.info("Optuna inter-cell parallelism: %d workers", n_workers)
@@ -784,6 +901,9 @@ def _run_optuna(
     # Parent-side observability only — never touches worker computation.
     # Renders in place under a TTY (compose ``tty: true``); auto-quiet
     # off a TTY via ``disable=None``.
+    import time as _time
+
+    t_start = _time.monotonic()
     with tqdm(total=total, desc="Training (Optuna cells)", unit="cell", disable=None) as pbar:
         while len(results) < total:
             try:
@@ -794,6 +914,22 @@ def _run_optuna(
                     break
                 continue
             pbar.update(1)
+            # Plain-log ETA for `docker logs` followers, where the tqdm
+            # bar does not render (no TTY): rate = cells done / elapsed.
+            done = len(results)
+            elapsed = _time.monotonic() - t_start
+            eta_s = elapsed / done * (total - done)
+            last = results[-1]
+            logger.info(
+                "cell %d/%d done (%s, %s) — avg %.1f min/cell, ETA ~%dh%02dm",
+                done,
+                total,
+                last.get("cell", "?"),
+                last.get("status", "?"),
+                elapsed / done / 60,
+                int(eta_s // 3600),
+                int(eta_s % 3600 // 60),
+            )
     for p in procs:
         p.join(timeout=30)
 
@@ -838,6 +974,7 @@ def _train_one_optuna_trial(
     device: str,
     config: dict,
     trial=None,
+    ranking_budget_bytes: int | None = None,
 ) -> float:
     """Single trial entry point: load data, train one model, return metric."""
     from src.fusions import load_embedding
@@ -893,6 +1030,7 @@ def _train_one_optuna_trial(
         device=device,
         optuna_trial=trial,
         item_categories=item_categories,
+        ranking_budget_bytes=ranking_budget_bytes,
     )
 
 

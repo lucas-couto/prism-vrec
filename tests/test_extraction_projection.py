@@ -66,6 +66,14 @@ class TestConfigResolution:
 
         assert resolve_projection_config(config, "resnet50") is None
 
+    def test_needs_fit_covers_every_pca_variant(self):
+        # Regression: extract/finetune resolved the fit set only for
+        # method == "pca", so pca_whitened crashed the extract step with
+        # "needs the train-item fit set; none was provided".
+        assert ProjectionConfig(method="pca", dim=8).needs_fit is True
+        assert ProjectionConfig(method="pca_whitened", dim=8).needs_fit is True
+        assert ProjectionConfig(method="random", dim=8).needs_fit is False
+
     def test_unknown_method_is_rejected(self):
         with pytest.raises(ValueError, match="projection.method"):
             resolve_projection_config({"projection": {"method": "umap"}}, "resnet50")

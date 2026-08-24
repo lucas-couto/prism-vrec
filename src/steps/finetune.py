@@ -280,7 +280,7 @@ def _project_finetuned(output_path: Path, extractor_name: str, dataset_name: str
 
     train_items = (
         train_item_indices(config["paths"]["data_processed"], dataset_name)
-        if projection.method == "pca"
+        if projection.needs_fit
         else None
     )
     ensure_projected(output_path, projection, train_items)
