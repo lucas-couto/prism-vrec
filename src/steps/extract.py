@@ -295,6 +295,39 @@ def _extract_for_config(
     return True
 
 
+def _components_needed(config: dict) -> bool:
+    """Return ``True`` when component artifacts must be extracted.
+
+    An explicit ``extract_components: true`` in the config always wins.
+    Otherwise component extraction is auto-enabled when any recommender
+    in ``recommenders_enabled`` declares ``requires_components`` (e.g.
+    ACF) — so enabling such a model can never strand the train step on
+    ``EnabledRecommenderHasNoCellsError`` just because the flag was off.
+    Unregistered names are skipped here; the train step already fails
+    loud on them.
+    """
+    if bool(config.get("extract_components", False)):
+        return True
+
+    # Local import: pulling in the recommender package registers every
+    # model spec, and doing it lazily keeps extract importable without it.
+    from src.recommenders import get_recommender_spec
+
+    for name in config.get("recommenders_enabled") or []:
+        try:
+            spec = get_recommender_spec(name)
+        except KeyError:
+            continue
+        if spec.requires_components:
+            logger.info(
+                "extract_components auto-enabled: recommender %r requires "
+                "component embeddings (*_comp.npy).",
+                name,
+            )
+            return True
+    return False
+
+
 def run() -> None:
     """Extract native-dim embeddings for every configured ``(extractor, dataset)``."""
     config = load_config()
@@ -306,7 +339,7 @@ def run() -> None:
     batch_size = config.get("batch_size", 64)
     checkpoint_every = config.get("checkpoint_every", 500)
     datasets = config.get("datasets", [])
-    extract_components = bool(config.get("extract_components", False))
+    extract_components = _components_needed(config)
 
     # Instantiating the manager guarantees the on-disk directories exist.
     CheckpointManager()

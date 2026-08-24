@@ -19,6 +19,7 @@ from src.utils.checkpoint import (
 )
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
+from src.utils.splits import assert_holdout_disjoint
 
 logger = get_logger(__name__)
 
@@ -140,8 +141,46 @@ def _best_effort_resume_checkpoint(checkpoint_mgr, logger, **kwargs) -> None:
         )
 
 
+#: Version of the selection-protocol fingerprint payload.  Bump whenever
+#: a field is added, removed or changes meaning, so checkpoints saved
+#: under an older schema read as "different protocol" and are replaced.
+SELECTION_FINGERPRINT_SCHEMA = 1
+
+
+def selection_protocol_fingerprint(
+    *,
+    dataset_name: str,
+    es_metric: str,
+    eval_sample_size: int | None,
+    eval_sample_seed: int,
+    tiebreak_seed: int,
+    k_values: list[int],
+) -> str:
+    """Hash of everything that gives a validation metric its meaning.
+
+    A ``_best.pt`` metric is only comparable to a new candidate when both
+    were measured under the SAME selection protocol: same dataset split
+    identity, same early-stopping metric, same negative-sampling size and
+    seed, same tie-break seed, same cutoff list.  A checkpoint written
+    under a different protocol carries a number that means something else
+    entirely, so :func:`_save_best_model` treats a fingerprint mismatch
+    as "not comparable" and overwrites instead of keeping a stale winner.
+    """
+    payload = {
+        "schema": SELECTION_FINGERPRINT_SCHEMA,
+        "dataset": dataset_name,
+        "es_metric": es_metric,
+        "eval_sample_size": eval_sample_size,
+        "eval_sample_seed": eval_sample_seed,
+        "tiebreak_seed": tiebreak_seed,
+        "k_values": list(k_values),
+    }
+    key = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
 def _save_best_model(
-    model,
+    model_state: dict,
     hyperparams: dict,
     metric: float,
     n_users: int,
@@ -149,9 +188,17 @@ def _save_best_model(
     dataset_name: str,
     model_name: str,
     embedding_name: str,
+    fingerprint: str,
     results_root: str | Path = "results",
 ) -> None:
-    """Save model weights only if metric beats the existing best on disk."""
+    """Save model weights only if metric beats the existing best on disk.
+
+    ``fingerprint`` (see :func:`selection_protocol_fingerprint`) is stored
+    with the payload; an on-disk best carrying a DIFFERENT fingerprint —
+    including legacy checkpoints saved before the field existed — is not
+    comparable and is overwritten with a prominent warning rather than
+    silently kept.
+    """
     best_model_path = (
         Path(results_root) / "models" / dataset_name / f"{model_name}_{embedding_name}_best.pt"
     )
@@ -166,7 +213,20 @@ def _save_best_model(
             if best_model_path.exists():
                 try:
                     existing = torch.load(best_model_path, map_location="cpu", weights_only=False)
-                    if existing.get("best_metric", 0.0) >= metric:
+                    existing_fp = existing.get("selection_fingerprint")
+                    if existing_fp != fingerprint:
+                        logger.warning(
+                            "SELECTION PROTOCOL CHANGED: existing best model %s "
+                            "was selected under a different protocol "
+                            "(fingerprint %r != %r; legacy checkpoints have "
+                            "none). Its best_metric=%.4f is NOT comparable to "
+                            "the current run — overwriting it.",
+                            best_model_path,
+                            existing_fp,
+                            fingerprint,
+                            float(existing.get("best_metric", 0.0)),
+                        )
+                    elif existing.get("best_metric", 0.0) >= metric:
                         return
                 except (RuntimeError, EOFError, OSError) as exc:
                     logger.warning(
@@ -176,17 +236,106 @@ def _save_best_model(
                     )
 
             payload = {
-                "model_state": model.state_dict(),
+                "model_state": model_state,
                 "hyperparams": hyperparams,
                 "best_metric": metric,
                 "n_users": n_users,
                 "n_items": n_items,
+                "selection_fingerprint": fingerprint,
             }
             # atomic_write adds fsync + retried replace on top of the
             # tmp+rename pattern (networked-FS dirent lag).
             atomic_write(lambda tmp, p=payload: torch.save(p, tmp), best_model_path)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _trial_best_path(
+    results_root: str | Path,
+    dataset_name: str,
+    model_name: str,
+    embedding_name: str,
+    run_id: str,
+) -> Path:
+    """Trial-local best-epoch checkpoint path (never matched by ``*_best.pt``)."""
+    return (
+        Path(results_root)
+        / "models"
+        / dataset_name
+        / f"{model_name}_{embedding_name}_trial_{run_id}.pt"
+    )
+
+
+def _save_trial_best(
+    trial_path: Path,
+    model,
+    hyperparams: dict,
+    metric: float,
+    n_users: int,
+    n_items: int,
+    fingerprint: str,
+) -> None:
+    """Persist the trial's own best epoch to its TRIAL-LOCAL path.
+
+    Intermediate evaluations never touch ``_best.pt`` directly: a trial
+    that is later pruned must leave no winner behind (its config would be
+    invisible to Optuna's ``best_params``, diverging checkpoint and
+    study — audit D2).  Promotion happens once, at normal trial
+    completion, via :func:`_promote_trial_best`.
+    """
+    payload = {
+        "model_state": model.state_dict(),
+        "hyperparams": hyperparams,
+        "best_metric": metric,
+        "n_users": n_users,
+        "n_items": n_items,
+        "selection_fingerprint": fingerprint,
+    }
+    trial_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(lambda tmp, p=payload: torch.save(p, tmp), trial_path)
+
+
+def _promote_trial_best(
+    trial_path: Path,
+    *,
+    best_metric: float,
+    dataset_name: str,
+    model_name: str,
+    embedding_name: str,
+    results_root: str | Path,
+    log,
+) -> None:
+    """Promote the trial-local best epoch to ``_best.pt``, if it wins.
+
+    Called ONLY when the trial finishes without pruning (the epoch loop
+    completed or early-stopped normally); an :class:`optuna.TrialPruned`
+    raise skips this call, so ``_best.pt`` can only hold weights of
+    trials the study also counts as COMPLETE.
+    """
+    if not trial_path.exists():
+        if best_metric > 0.0:
+            # Resume after a kill can restore best_metric from the resume
+            # checkpoint while the trial-local weights were lost with it.
+            log.warning(
+                "trial-local best checkpoint %s missing at promotion time "
+                "(best_metric=%.4f); leaving _best.pt untouched.",
+                trial_path,
+                best_metric,
+            )
+        return
+    payload = torch.load(trial_path, map_location="cpu", weights_only=False)
+    _save_best_model(
+        payload["model_state"],
+        payload["hyperparams"],
+        float(payload["best_metric"]),
+        payload["n_users"],
+        payload["n_items"],
+        dataset_name,
+        model_name,
+        embedding_name,
+        payload["selection_fingerprint"],
+        results_root=results_root,
+    )
 
 
 def _account_flops(model, users, pos_items, neg_items) -> None:
@@ -243,6 +392,18 @@ def train_single_run(
         device.
     """
     logger = get_logger(f"train_{model_name}")
+
+    # R6 guard, mirror of the final-evaluation A3 check: the selection
+    # evaluator masks every TRAIN item to -inf, so a validation held-out
+    # duplicated into train would be unhittable — the user silently
+    # scores 0 on validation, deflating the metric that drives
+    # early stopping and hyperparameter selection.
+    assert_holdout_disjoint(
+        train_interactions,
+        selection_interactions,
+        dataset_name,
+        holdout_name="validation",
+    )
 
     run_id = checkpoint_mgr.get_run_id(dataset_name, embedding_name, model_name, hyperparams)
     epochs = config.get("common", {}).get("epochs", 100)
@@ -327,6 +488,27 @@ def train_single_run(
 
     loss_device = torch.device(device) if use_cuda else torch.device("cpu")
 
+    # D3: everything that gives the validation metric its meaning, stamped
+    # into every checkpoint so a protocol change never silently keeps a
+    # stale winner. Mirrors the Evaluator construction above (k_values,
+    # sampling and tie-break seeds).
+    results_root = config.get("paths", {}).get("results", "results")
+    fingerprint = selection_protocol_fingerprint(
+        dataset_name=dataset_name,
+        es_metric=es_metric,
+        eval_sample_size=eval_sample_size,
+        eval_sample_seed=eval_sample_seed,
+        tiebreak_seed=base_seed,
+        k_values=[10],
+    )
+    trial_best_path = _trial_best_path(
+        results_root, dataset_name, model_name, embedding_name, run_id
+    )
+    if ckpt is None:
+        # Fresh start: discard any trial-local file orphaned by a SIGKILL
+        # of a previous attempt (its epochs will be re-run anyway).
+        trial_best_path.unlink(missing_ok=True)
+
     try:
         for epoch in range(start_epoch, epochs):
             model.train()
@@ -376,16 +558,16 @@ def train_single_run(
                 if current_metric > best_metric:
                     best_metric = current_metric
                     epochs_without_improvement = 0
-                    _save_best_model(
+                    # D2: never promote mid-trial — a later prune would
+                    # leave a winner Optuna's best_params cannot see.
+                    _save_trial_best(
+                        trial_best_path,
                         model,
                         hyperparams,
                         current_metric,
                         n_users,
                         n_items,
-                        dataset_name,
-                        model_name,
-                        embedding_name,
-                        results_root=config.get("paths", {}).get("results", "results"),
+                        fingerprint,
                     )
                 else:
                     epochs_without_improvement += eval_every_epochs
@@ -412,8 +594,26 @@ def train_single_run(
                 rng_states=capture_rng_states(),
             )
 
+        # D2: promotion to _best.pt happens exactly once, after the epoch
+        # loop finished WITHOUT pruning (completed or early-stopped). An
+        # optuna.TrialPruned raised above skips this line, keeping
+        # _best.pt consistent with the study's COMPLETE trials — the
+        # ones best_params (and thus the battery replay seeds) can see.
+        _promote_trial_best(
+            trial_best_path,
+            best_metric=best_metric,
+            dataset_name=dataset_name,
+            model_name=model_name,
+            embedding_name=embedding_name,
+            results_root=results_root,
+            log=logger,
+        )
         return best_metric
     finally:
+        # Trial-local best weights are dead after the trial ends on ANY
+        # path: promoted already (normal exit) or intentionally dropped
+        # (prune / exception).
+        trial_best_path.unlink(missing_ok=True)
         # Clean up the per-trial resume checkpoint on every exit path
         # (normal completion, early stopping, Optuna prune, exception).
         # Without this, checkpoints/training/ grows unboundedly: hundreds

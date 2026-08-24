@@ -68,3 +68,35 @@ def assert_uniform_budget(config: dict) -> None:
                 f"{offending}; the HP-search budget is shared per dataset "
                 f"(configs common:/hp_search:/hp_budget:), never per model."
             )
+
+
+def grid_budget_message(grid_sizes: dict[str, int]) -> str | None:
+    """Warning text when grid budgets differ across models, else ``None``.
+
+    Under ``hp_search.strategy: grid`` each model gets one selection shot
+    per configuration in its declared space, so unequal space sizes are
+    unequal selection budgets — a model with a larger grid gets more
+    chances to look good on validation (audit D1).  The spaces themselves
+    are legitimate per-model choices, so this cannot be equalised
+    silently; it is surfaced loudly instead.  The Optuna/battery path is
+    the equal-budget protocol (one shared ``n_trials`` per dataset).
+
+    Args:
+        grid_sizes: Mapping ``model_name -> number of grid configs``,
+            covering every enabled recommender.
+
+    Returns:
+        The warning message, or ``None`` when all budgets are equal (or
+        fewer than two models are enabled).
+    """
+    if len(grid_sizes) < 2 or len(set(grid_sizes.values())) <= 1:
+        return None
+    listing = ", ".join(f"{model}={n}" for model, n in sorted(grid_sizes.items()))
+    return (
+        "UNEQUAL GRID-SEARCH BUDGETS: configs per model: "
+        f"{listing}. Under strategy 'grid' every configuration is one "
+        "selection shot, so models with larger search spaces are favoured "
+        "in the comparison. For an equal-budget protocol use the "
+        "Optuna/battery path (hp_search.strategy: optuna), which gives "
+        "every cell the same shared n_trials."
+    )

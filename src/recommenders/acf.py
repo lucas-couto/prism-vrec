@@ -43,6 +43,12 @@ class ACF(BaseRecommender):
     consumes_raw_components = True
     wants_history = True
 
+    #: BPR-Opt L2: the aux table ``p`` is gathered per history item in
+    #: :meth:`_l2_gathered_rows` (listing it here excludes its full
+    #: matrix from the shared term).  The projections ``W_c``/``W_v``
+    #: and both attention nets stay shared (every triple touches them).
+    _L2_EXTRA_GATHERED_TABLES = ("aux_embedding",)
+
     def __init__(
         self,
         n_users: int,
@@ -107,6 +113,24 @@ class ACF(BaseRecommender):
             mask[user, :length] = True
         self.register_buffer("history_items", items, persistent=False)
         self.register_buffer("history_mask", mask, persistent=False)
+
+    def _l2_gathered_rows(
+        self,
+        user_ids: torch.Tensor,
+        pos_item_ids: torch.Tensor,
+        neg_item_ids: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Add the rows touched through each user's history ``R(u)``.
+
+        ``p_hat_u`` reads ``gamma``/``p`` rows of every history item, so
+        those rows are part of the triple's parameter set (penalised per
+        occurrence across the batch's users, like all gathered rows).
+        """
+        rows = super()._l2_gathered_rows(user_ids, pos_item_ids, neg_item_ids)
+        touched = self.history_items[user_ids][self.history_mask[user_ids]]
+        rows.append(self.item_embedding(touched))
+        rows.append(self.aux_embedding(touched))
+        return rows
 
     def _projected_components(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Return ``W_c f`` for items: ``(B, M, kv)``. Cached for all-items lookups."""

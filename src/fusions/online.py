@@ -102,9 +102,12 @@ class LearnedAlignmentFusion(nn.Module):
 
     Supported ops mirror the offline equal-dim family: ``mean``,
     ``sum``, ``prod``, ``max_pool``, ``weighted_mean`` (fixed weights
-    from config), ``attention_weighted`` (softmax over learnable
-    logits), ``gated`` (normalised sigmoids over learnable logits) and
-    ``adaptive_gated`` (per-item gate MLP; 2 sources only).
+    from config), ``attention_weighted`` (softmax over fixed
+    configurable logits), ``gated`` (normalised sigmoids over fixed
+    configurable logits) and ``adaptive_gated`` (per-item gate MLP;
+    2 sources only).  Per the thesis spec, the whole weighted-
+    combination family uses FIXED convex weights — only the
+    per-source projections and ``adaptive_gated``'s MLP are learned.
     """
 
     _SIMPLE_OPS = ("mean", "sum", "prod", "max_pool")
@@ -118,6 +121,7 @@ class LearnedAlignmentFusion(nn.Module):
         *,
         normalize: bool = True,
         weights: list[float] | None = None,
+        logits: list[float] | None = None,
     ) -> None:
         super().__init__()
         if not source_dims:
@@ -138,8 +142,13 @@ class LearnedAlignmentFusion(nn.Module):
             total = float(sum(w))
             self.register_buffer("fixed_weights", torch.tensor([x / total for x in w]))
         elif strategy in self._LOGIT_OPS:
-            # Uniform at init (logits 0), co-trained with the recommender.
-            self.logits = nn.Parameter(torch.zeros(m))
+            # FIXED configurable logits (thesis spec), mirroring how
+            # weighted_mean handles fixed_weights: a non-trainable
+            # buffer, never a Parameter.  Defaults to uniform (logits 0).
+            lg = logits if logits is not None else [0.0] * m
+            if len(lg) != m:
+                raise ValueError(f"{strategy} needs {m} logits, got {len(lg)}.")
+            self.register_buffer("fixed_logits", torch.tensor([float(x) for x in lg]))
         elif strategy == "adaptive_gated":
             if m != 2:
                 raise ValueError("adaptive_gated supports exactly 2 sources.")
@@ -173,10 +182,10 @@ class LearnedAlignmentFusion(nn.Module):
             w = self.fixed_weights.view(-1, 1, 1)
             return (stacked * w).sum(dim=0)
         if self.strategy == "attention_weighted":
-            alphas = torch.softmax(self.logits, dim=0).view(-1, 1, 1)
+            alphas = torch.softmax(self.fixed_logits, dim=0).view(-1, 1, 1)
             return (stacked * alphas).sum(dim=0)
         if self.strategy == "gated":
-            gates = torch.sigmoid(self.logits)
+            gates = torch.sigmoid(self.fixed_logits)
             gates = (gates / gates.sum()).view(-1, 1, 1)
             return (stacked * gates).sum(dim=0)
         raise RuntimeError(f"unreachable op {self.strategy!r}")
@@ -199,7 +208,9 @@ class AdaptiveGatedFusion(nn.Module):
 
     where ``MLP_gate`` is ``Linear(2D → D) → ReLU → Linear(D → D)``
     followed by a sigmoid on the output, and ``odot`` denotes the
-    element-wise product.
+    element-wise product.  The FINAL linear layer is zero-initialised
+    so the initial gate is ``sigmoid(0) = 0.5`` everywhere — training
+    starts from the uniform (plain ``mean``) fusion.
 
     Parameters
     ----------
@@ -220,31 +231,22 @@ class AdaptiveGatedFusion(nn.Module):
 
         self.gate = nn.Sequential(
             nn.Linear(2 * dim, self.hidden_dim),
-            # Tanh is used instead of ReLU because its derivative at x=0
-            # is exactly 1 (not 0).  This matters because the first linear
-            # layer (gate.0) is zero-initialised so its pre-activation
-            # output is identically 0 at step 0.  With ReLU the subgradient
-            # at 0 is 0, which would permanently block gradients from
-            # reaching gate.0.weight via the chain rule through gate[-1].
-            # Tanh(0)=0 preserves the initial gate = sigmoid(0) = 0.5
-            # (uniform fusion property), while Tanh'(0)=1 ensures
-            # gate.0.weight receives a non-zero gradient from the first
-            # backward pass.
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(self.hidden_dim, dim),
         )
         # Sigmoid is applied separately so the linear layer is exposed
         # for diagnostics (``gate[-1].weight`` retrieves the gate's
         # final layer).
 
-        # Initialise the FIRST linear layer with zeros so that at step 0:
-        #   gate[0](cat) = 0  →  Tanh(0) = 0  →  gate[-1](0) = bias[-1] = 0
-        #   →  sigmoid(0) = 0.5  (uniform fusion)
-        # The final layer keeps its Kaiming-uniform weight so that
-        # gate[-1].weight.T is non-zero, allowing gradients to propagate
-        # back through Tanh'(0)=1 into gate[0].weight from the first step.
-        nn.init.zeros_(self.gate[0].weight)
-        nn.init.zeros_(self.gate[0].bias)
+        # Zero-initialise the FINAL linear layer (weight and bias), per
+        # the qualification spec, so that at step 0:
+        #   gate[-1](·) = 0  →  sigmoid(0) = 0.5  (uniform fusion)
+        # The first layer keeps its default (Kaiming-uniform) init, so
+        # its ReLU activations are non-zero from the start: gate[-1]
+        # receives a non-zero gradient on the first backward, and once
+        # its weight moves off zero, gradients flow into gate[0] too —
+        # no dead-gradient pathology.
+        nn.init.zeros_(self.gate[-1].weight)
         nn.init.zeros_(self.gate[-1].bias)
 
     def forward(

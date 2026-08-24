@@ -123,6 +123,49 @@ class TestSampledEvaluate:
         assert len(df) == 2
 
 
+class TestMultiItemTestUsers:
+    """B2: records require leave-one-out; plain metrics do not."""
+
+    @staticmethod
+    def _multi_item_evaluator() -> Evaluator:
+        return Evaluator(
+            train_interactions={0: {0, 1}, 1: {2}},
+            test_interactions={0: {10, 11}, 1: {12}},  # user 0 holds out TWO items
+            n_items=50,
+            k_values=[5, 10],
+        )
+
+    def test_metrics_still_work_with_two_held_out_items(self) -> None:
+        evaluator = self._multi_item_evaluator()
+
+        df = evaluator.evaluate_per_user(_ConstantModel(), device="cpu")
+
+        assert len(df) == 2
+        metric_cols = [c for c in df.columns if c != "user_id"]
+        values = df[metric_cols].to_numpy(dtype=float)
+        assert np.all(np.isfinite(values))
+
+    def test_per_user_records_raises_without_leave_one_out(self) -> None:
+        evaluator = self._multi_item_evaluator()
+
+        with pytest.raises(ValueError, match="leave-one-out"):
+            evaluator.per_user_records(_ConstantModel(), device="cpu")
+
+    def test_evaluate_with_records_raises_without_leave_one_out(self) -> None:
+        evaluator = self._multi_item_evaluator()
+
+        with pytest.raises(ValueError, match="leave-one-out"):
+            evaluator.evaluate_with_records(_ConstantModel(), device="cpu")
+
+    def test_leave_one_out_records_still_work(self) -> None:
+        evaluator = _basic_evaluator()
+
+        records = evaluator.per_user_records(_ConstantModel(), device="cpu")
+
+        assert set(records["user_id"]) == {0, 1, 2}
+        assert "rank" in records.columns
+
+
 class TestFullRankingStillWorks:
     """Regression: existing full-ranking path is unchanged."""
 

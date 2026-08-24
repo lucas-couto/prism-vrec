@@ -14,7 +14,7 @@ same ``dim``-dimensional space, so element-wise fusion (``mean``,
 ``sum``, ``prod``, ``max_pool``, ...) consumes them directly, with no
 alignment learned online and no PCA fit inside the fusion step.
 
-Two methods, both linear and both fixed before any recommender sees a
+Three methods, all linear and all fixed before any recommender sees a
 gradient:
 
 ``random``
@@ -29,6 +29,15 @@ gradient:
     ``alignment.method: pca``.  Preserves more variance than a random
     map, at the cost of being dataset-dependent: the projector is fit
     per ``(dataset, artifact)`` and is not transferable between them.
+
+``pca_whitened``
+    ``pca`` followed by whitening: each component's coordinate is
+    divided by the square root of its train-set variance, so every kept
+    direction contributes equally to inner products instead of the
+    first components dominating (Jégou & Chum, ECCV 2012 — standard for
+    visual descriptors).  Same fit set, same leakage guarantees as
+    ``pca``; the whitening scale folds into the persisted matrix, so
+    the projector on disk remains a plain ``(W, mean)`` linear map.
 
 The native artifact is never modified.  Projection is additive, so a
 run comparing native against projected embeddings needs no re-extraction
@@ -55,14 +64,20 @@ logger = get_logger(__name__)
 #: peak memory is a function of the chunk rather than the catalogue.
 CHUNK_ROWS = 8192
 
-METHODS = ("none", "random", "pca")
+METHODS = ("none", "random", "pca", "pca_whitened")
+
+#: Train-set variance below which a whitened component is zeroed instead
+#: of divided by ``sqrt(variance)`` — a numerically dead direction would
+#: otherwise be amplified into pure noise.
+_WHITEN_VARIANCE_FLOOR = 1e-12
 
 
 @dataclass(frozen=True)
 class ProjectionConfig:
     """Resolved ``projection:`` block for one extractor.
 
-    :param method: ``"random"`` or ``"pca"``.  ``"none"`` never reaches
+    :param method: ``"random"``, ``"pca"`` or ``"pca_whitened"``.
+        ``"none"`` never reaches
         here — :func:`resolve_projection_config` returns ``None``.
     :param dim: Target dimensionality shared by every projected artifact.
     :param seed: RNG seed for ``random``; ignored by ``pca``, which is
@@ -148,22 +163,38 @@ def _pca_matrix(
     train_items: np.ndarray,
     seed: int,
     name: str,
+    *,
+    whiten: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Train-only PCA basis as an explicit ``(components, mean)`` pair.
 
     Returned as matrices rather than a fitted estimator so the projector
     persisted on disk is a plain linear map — auditable, and applicable
     without scikit-learn in the loop.
+
+    With ``whiten`` the columns are scaled by ``1/sqrt(variance)`` of
+    the corresponding component on the fit rows, folding the whitening
+    into the matrix itself.  Components with (near-)zero train variance
+    are scaled by zero rather than exploding: a direction the train set
+    does not vary along carries no signal worth amplifying.
     """
     from src.fusions import fit_pca_on_rows
 
     fit_rows = np.asarray(source[train_items], dtype=np.float32)
     k = min(dim, *fit_rows.shape, int(source.shape[1]))
     pca = fit_pca_on_rows(fit_rows, k, seed, f"projection[{name}]", copy=False)
-    return (
-        np.ascontiguousarray(pca.components_.T, dtype=np.float32),
-        np.ascontiguousarray(pca.mean_, dtype=np.float32),
-    )
+    matrix = np.ascontiguousarray(pca.components_.T, dtype=np.float32)
+    if whiten:
+        variance = np.asarray(pca.explained_variance_, dtype=np.float64)
+        # np.where evaluates both branches, so divide by the floored
+        # variance and zero the dead components afterwards.
+        scale = np.where(
+            variance > _WHITEN_VARIANCE_FLOOR,
+            1.0 / np.sqrt(np.maximum(variance, _WHITEN_VARIANCE_FLOOR)),
+            0.0,
+        )
+        matrix = np.ascontiguousarray(matrix * scale[None, :], dtype=np.float32)
+    return matrix, np.ascontiguousarray(pca.mean_, dtype=np.float32)
 
 
 def _write_projector(path: Path, matrix: np.ndarray, mean: np.ndarray | None, cfg, name) -> None:
@@ -192,7 +223,7 @@ def _write_projector(path: Path, matrix: np.ndarray, mean: np.ndarray | None, cf
         "dim": int(matrix.shape[1]),
         "native_dim": int(matrix.shape[0]),
         "seed": cfg.seed if cfg.method == "random" else None,
-        "fit": "train items only" if cfg.method == "pca" else "data-independent",
+        "fit": ("train items only" if cfg.method.startswith("pca") else "data-independent"),
     }
     text = json.dumps(meta, indent=2)
     atomic_write(
@@ -240,10 +271,10 @@ def ensure_projected(
     :param source_npy: Native ``.npy`` to project.
     :param cfg: Resolved projection config (method, dim, seed).
     :param train_items: Item indices forming the PCA fit set.  Required
-        by ``method: pca``, ignored by ``method: random``.
+        by ``pca`` / ``pca_whitened``, ignored by ``random``.
     :param chunk_rows: Rows transformed per pass.
     :returns: The path written, or ``None`` when it already existed.
-    :raises ValueError: When ``method: pca`` is configured without a fit
+    :raises ValueError: When a PCA method is configured without a fit
         set, or when the source is narrower than the requested dim.
     """
     source_npy = Path(source_npy)
@@ -271,10 +302,17 @@ def ensure_projected(
     else:
         if train_items is None or len(train_items) == 0:
             raise ValueError(
-                f"{source_npy}: projection.method 'pca' needs the train-item "
-                f"fit set; none was provided."
+                f"{source_npy}: projection.method {cfg.method!r} needs the "
+                f"train-item fit set; none was provided."
             )
-        matrix, mean = _pca_matrix(source, cfg.dim, np.asarray(train_items), cfg.seed, name)
+        matrix, mean = _pca_matrix(
+            source,
+            cfg.dim,
+            np.asarray(train_items),
+            cfg.seed,
+            name,
+            whiten=cfg.method == "pca_whitened",
+        )
 
     shape = (int(source.shape[0]), int(matrix.shape[1]))
 

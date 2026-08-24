@@ -32,8 +32,8 @@ Provided methods
 * **Bootstrap confidence intervals** (``bootstrap_ci``,
   ``per_model_summary``, ``bootstrap_diff_ci``) — non-parametric
   uncertainty for the per-config mean (descriptive) and for the
-  PAIRED mean difference (inferential; the CI that must agree with
-  the Wilcoxon verdict).
+  PAIRED mean difference (inferential; a raw CI whose agreement is
+  with the raw Wilcoxon p-value, not the Holm-corrected verdict).
 
 Metric redundancy under leave-one-out
 -------------------------------------
@@ -164,8 +164,8 @@ def cohens_d_paired(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
         is therefore OFF by default in the reported tables
         (``statistical.include_cohens_d``).
 
-    Conventional thresholds: ``|d| < 0.2`` small, ``< 0.5`` medium,
-    ``≥ 0.8`` large.  Returns ``0.0`` when the differences have zero
+    Conventional thresholds: ``|d| < 0.2`` negligible, ``≥ 0.2``
+    small, ``≥ 0.5`` medium, ``≥ 0.8`` large.  Returns ``0.0`` when the differences have zero
     variance (everyone changed by the same amount).
     """
     diff = np.asarray(scores_a, dtype=float) - np.asarray(scores_b, dtype=float)
@@ -262,6 +262,13 @@ def bootstrap_diff_ci(
     one that must agree with the Wilcoxon verdict: a paired-difference
     CI excluding zero is consistent with a significant paired test.
 
+    .. note::
+        The CI is a RAW 95% interval: its agreement is with the raw
+        Wilcoxon ``p_value`` at ``alpha``, NOT with the Holm-corrected
+        ``significant`` verdict.  A pair can have a CI excluding zero
+        (raw p < alpha) while Holm marks it non-significant within its
+        family — that is the correction working, not a contradiction.
+
     Returns ``(diff_mean, lower, upper)``.
     """
     diff = np.asarray(scores_a, dtype=float) - np.asarray(scores_b, dtype=float)
@@ -347,9 +354,11 @@ def friedman_test(
     Returns a dict with ``statistic``, ``p_value``, ``significant``
     (bool against ``alpha``), ``n_configs``, ``n_users``.
 
-    Use this as a *gate* before pairwise testing — only run pairwise
-    Wilcoxon when ``significant`` is True (otherwise none of the
-    pairwise effects can be claimed at the family level).
+    The reporting step (:mod:`src.steps.statistical`) computes this
+    omnibus alongside the pairwise tests and ANNOTATES every pairwise
+    row with the family's verdict (``omnibus_significant``) rather than
+    suppressing pairwise rows — readers must not claim a pairwise
+    effect at the family level when its omnibus is not significant.
     """
     if metric not in results_df.columns:
         raise ValueError(
@@ -432,9 +441,11 @@ def pairwise_significance(
         :func:`cohens_d_paired`).
     diff_ci:
         Adds the bootstrap CI of the PAIRED mean difference
-        (``diff_mean``, ``diff_ci_lower``, ``diff_ci_upper``) — the CI
-        that must agree with the Wilcoxon verdict (individual
-        per-config CIs may overlap under a significant paired test).
+        (``diff_mean``, ``diff_ci_lower``, ``diff_ci_upper``) — a RAW
+        95% CI whose agreement is with the raw ``p_value``, not with
+        the Holm-corrected ``significant`` verdict (see
+        :func:`bootstrap_diff_ci`); individual per-config CIs may
+        overlap under a significant paired test.
 
     Returns
     -------

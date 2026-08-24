@@ -30,6 +30,7 @@ from src.utils.artifact_names import (
 from src.utils.config import load_config
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
+from src.utils.splits import assert_holdout_disjoint
 from src.utils.timing import note_skipped_cell, time_cell
 
 logger = get_logger(__name__)
@@ -51,6 +52,8 @@ def load_data(processed_dir: str, dataset_name: str):
     For final evaluation, ``train`` and ``val`` are merged and used as the
     "seen" set whose items are masked from the candidate ranking.
     Metrics are then computed against the held-out ``test`` set.
+    Per-user disjointness ``test ∩ (train ∪ val) = ∅`` is asserted (a
+    duplicated held-out would be masked and become unhittable).
 
     Returns ``(n_users, n_items, seen_interactions, test_interactions,
     train_interactions)``.  The pure-train ``train_interactions`` (without
@@ -81,8 +84,54 @@ def load_data(processed_dir: str, dataset_name: str):
         seen_interactions.setdefault(uid, set()).update(items)
 
     test_interactions = _build_interactions(test_df)
+    # A3 guard: shared with the selection-side val ∩ train check (R6).
+    assert_holdout_disjoint(seen_interactions, test_interactions, dataset_name, holdout_name="test")
 
     return n_users, n_items, seen_interactions, test_interactions, train_interactions
+
+
+def build_evaluator(
+    config: dict,
+    seen_interactions: dict[int, set[int]],
+    test_interactions: dict[int, set[int]],
+    n_items: int,
+) -> Evaluator:
+    """Build the final-evaluation ``Evaluator`` from the ``evaluation:`` block.
+
+    Single construction path shared by the sequential evaluate step
+    (:func:`run`) and the battery executor
+    (``src.battery.execute._evaluate_one_cell``), so both honour
+    ``evaluation.protocol`` / ``n_negatives`` / ``negative_sampling_seed``
+    with identical defaults.
+
+    Tie-break rule (unified): ``tiebreak_seed`` is the run's ACTIVE seed —
+    ``config['seed']``.  The battery executor sets ``config['seed']`` to
+    the cell's seed (matching its per-seed results directories); the
+    sequential step passes the global run config, whose ``seed`` is the
+    run's seed.  Either way the permutation is shared by every
+    model/trial of a ``(dataset, seed)`` run.
+    """
+    eval_cfg = config.get("evaluation") or {}
+    protocol = eval_cfg.get("protocol", "full_ranking")
+    n_negatives = eval_cfg.get("n_negatives", 100)
+    if protocol == "sampled":
+        logger.warning(
+            "evaluate: protocol='sampled' selected (n_negatives=%d).  "
+            "Sampled metrics are inconsistent with full-ranking "
+            "(Krichene & Rendle 2020); use only for comparability with "
+            "prior work, never as the headline benchmark.",
+            n_negatives,
+        )
+    return Evaluator(
+        seen_interactions,
+        test_interactions,
+        n_items,
+        k_values=config.get("k_values", [5, 10, 20]),
+        protocol=protocol,
+        n_negatives=n_negatives,
+        negative_sampling_seed=eval_cfg.get("negative_sampling_seed", 42),
+        tiebreak_seed=int(config.get("seed", 42)),
+    )
 
 
 def find_best_models(dataset_name: str, results_dir: Path | str = "results") -> list[dict]:
@@ -294,25 +343,10 @@ def run(condition: str = "frozen") -> None:
     device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
-    k_values = config.get("k_values", [5, 10, 20])
     datasets = config.get("datasets", [])
     if not datasets:
         logger.info("evaluate step skipped: datasets list is empty in configs/default.yaml.")
         return
-
-    eval_cfg = config.get("evaluation") or {}
-    protocol = eval_cfg.get("protocol", "full_ranking")
-    n_negatives = eval_cfg.get("n_negatives", 100)
-    neg_seed = eval_cfg.get("negative_sampling_seed", 42)
-    tiebreak_seed = config.get("seed", 42)
-    if protocol == "sampled":
-        logger.warning(
-            "evaluate: protocol='sampled' selected (n_negatives=%d).  "
-            "Sampled metrics are inconsistent with full-ranking "
-            "(Krichene & Rendle 2020); use only for comparability with "
-            "prior work, never as the headline benchmark.",
-            n_negatives,
-        )
 
     results_root = Path(config.get("paths", {}).get("results", "results"))
     results_dir = results_root / "tables"
@@ -323,16 +357,10 @@ def run(condition: str = "frozen") -> None:
         n_users, n_items, seen_inter, test_inter, train_only_inter = load_data(
             processed_dir, dataset_name
         )
-        evaluator = Evaluator(
-            seen_inter,
-            test_inter,
-            n_items,
-            k_values=k_values,
-            protocol=protocol,
-            n_negatives=n_negatives,
-            negative_sampling_seed=neg_seed,
-            tiebreak_seed=tiebreak_seed,
-        )
+        # Shared construction path with the battery executor: same
+        # ``evaluation:`` block, same defaults, tiebreak_seed = the run's
+        # active seed (here: the global run seed from config['seed']).
+        evaluator = build_evaluator(config, seen_inter, test_inter, n_items)
 
         done_path = _done_path(results_dir, dataset_name)
         done = _load_done(done_path)

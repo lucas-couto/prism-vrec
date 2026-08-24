@@ -33,6 +33,11 @@ class VBPR(LinearVisualScoreMixin, BaseRecommender):
         ``l2_reg`` is optional (default 0).
     """
 
+    #: BPR-Opt L2: gather ``alpha_u`` rows alongside ``gamma_u``; the
+    #: dense projection ``W_vis`` stays in the shared term (every triple
+    #: touches it).
+    _L2_USER_TABLES = ("user_embedding", "visual_user_embedding")
+
     def __init__(
         self,
         n_users: int,

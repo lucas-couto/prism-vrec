@@ -299,14 +299,15 @@ class ExtractionProjectionConfig(BaseModel):
 
     ``none`` keeps the v2 contract: artifacts stay at the backbone's
     native width.  ``random`` applies a seeded semi-orthogonal matrix,
-    ``pca`` a basis fit on train items only.  Either writes
+    ``pca`` a basis fit on train items only, ``pca_whitened`` the same
+    basis with per-component variance equalisation.  Any of them writes
     ``<extractor>_p<dim>.npy`` *alongside* the native artifact, never in
     place of it.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    method: Literal["none", "random", "pca"] = "none"
+    method: Literal["none", "random", "pca", "pca_whitened"] = "none"
     dim: int = Field(128, ge=1)
     seed: int = Field(42, ge=0, description="RNG seed for method 'random'; ignored by 'pca'.")
 

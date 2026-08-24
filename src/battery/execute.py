@@ -116,19 +116,18 @@ def _evaluate_one_cell(
     (``cfg['paths']['results']``); writes the F artifact to the shared,
     seed-keyed ``f_out_dir`` so all seeds land in one per_user directory.
     """
-    from src.evaluation.protocol import Evaluator
-    from src.steps.evaluate import _evaluate_cell, find_best_models, load_data
+    from src.steps.evaluate import _evaluate_cell, build_evaluator, find_best_models, load_data
 
     _, _, seen_inter, test_inter, train_only = load_data(
         cfg["paths"]["data_processed"], cell.dataset
     )
-    evaluator = Evaluator(
-        seen_inter,
-        test_inter,
-        n_items,
-        k_values=cfg.get("k_values", [5, 10, 20]),
-        tiebreak_seed=int(cfg.get("seed", 42)),
-    )
+    # Shared construction path with src.steps.evaluate.run: honours the
+    # ``evaluation:`` block (protocol / n_negatives / negative_sampling_seed)
+    # with identical defaults.  tiebreak_seed = the run's active seed:
+    # ``execute_cell`` sets ``cfg['seed'] = cell.seed`` (matching the
+    # per-seed results directories), so each seed's cells share one
+    # tie-break permutation.
+    evaluator = build_evaluator(cfg, seen_inter, test_inter, n_items)
     models = [
         m
         for m in find_best_models(cell.dataset, results_dir=cfg["paths"]["results"])

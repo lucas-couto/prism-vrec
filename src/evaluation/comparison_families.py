@@ -17,8 +17,14 @@ Each family below fixes every dimension except one:
   condition; component artifacts are grouped with their base backbone).
 * ``fusion_within_model`` — which fusion strategy is best?  Varies the
   fusion artifact, fixes the recommender.
-* ``frozen_vs_finetuned`` — does fine-tuning help?  One pair per
-  (recommender, base embedding) present in both conditions (``m = 1``).
+* ``frozen_vs_finetuned`` — does fine-tuning help?  ONE instance per
+  dataset containing every (recommender, base embedding) pair present
+  in both conditions, so Holm corrects across all of them
+  (``m = n_pairs`` — the family is one research question, not one
+  question per config).
+* ``vs_baseline`` — does the visual signal help at all?  ONE instance
+  per dataset pairing every config with the pure-BPR baseline
+  (``bpr_none``); Holm corrects across all of them (``m = n_configs``).
 
 ``all_pairs`` remains available as an EXPLORATORY option and is never
 part of the default set.
@@ -37,14 +43,21 @@ from src.utils.artifact_names import (
     FUSION_PREFIX,
     is_finetuned_artifact,
 )
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 DEFAULT_FAMILIES = (
     "backbone_within_model",
     "model_within_backbone",
     "fusion_within_model",
     "frozen_vs_finetuned",
+    "vs_baseline",
 )
 VALID_FAMILIES = DEFAULT_FAMILIES + ("all_pairs",)
+
+BASELINE_MODEL = "bpr"
+BASELINE_EMBEDDING = "none"
 
 
 @dataclass(frozen=True)
@@ -53,12 +66,23 @@ class FamilyInstance:
 
     ``pairs`` lists the ``(config_a, config_b)`` keys to test; Holm runs
     over exactly this set (``m = len(pairs)``).
+
+    ``omnibus_defined`` says whether a K-way Friedman omnibus over
+    ``configs`` answers this family's research question.  It is False
+    for the pair-collection families (``frozen_vs_finetuned``,
+    ``vs_baseline``): their instances bundle many independent
+    two-treatment questions for the Holm correction, so the only K-way
+    hypothesis available — "all ~n configs of the dataset are
+    equivalent" — is trivially false and the gate would never gate.
+    The statistical step skips Friedman for such instances and reports
+    ``omnibus_significant = NaN`` on their pairwise rows.
     """
 
     family: str
     group: str
     pairs: tuple[tuple[str, str], ...]
     configs: tuple[str, ...] = field(default=())
+    omnibus_defined: bool = True
 
 
 def _config_key(model: str, embedding: str) -> str:
@@ -175,31 +199,90 @@ def _fusion_within_model(df: pd.DataFrame) -> list[FamilyInstance]:
 
 
 def _frozen_vs_finetuned(df: pd.DataFrame) -> list[FamilyInstance]:
-    """One m=1 instance per (model, base embedding) present in BOTH conditions.
+    """ONE instance with every (model, base embedding) frozen/finetuned pair.
 
-    Fine-tuned artifacts carry the ``_finetuned`` marker in the embedding
-    name, so both conditions coexist in a ``condition="all"`` table.
+    "Does fine-tuning help?" is one research question, so Holm must
+    correct across ALL its pairs (``m = n_pairs``) — one m=1 instance
+    per pair would leave every test uncorrected.  Fine-tuned artifacts
+    carry the ``_finetuned`` marker in the embedding name, so both
+    conditions coexist in a ``condition="all"`` table.
+
+    ``omnibus_defined=False``: the instance is a bundle of independent
+    two-treatment questions (each config's frozen vs finetuned), not one
+    K-way "which of these treatments differ?" question, so no Friedman
+    over its configs is meaningful (R1).
     """
-    out: list[FamilyInstance] = []
+    pairs: list[tuple[str, str]] = []
     visual = df[df["embedding_name"] != "none"].copy()
     visual["base"] = visual["embedding_name"].map(_backbone_base)
     visual["cond"] = visual["embedding_name"].map(_condition_of)
     for (model, base), grp in visual.groupby(["model_name", "base"], sort=True):
-        by_cond = {c: e for c, e in zip(grp["cond"], grp["embedding_name"], strict=True)}
+        by_cond: dict[str, str] = {}
+        for cond, emb in zip(grp["cond"], grp["embedding_name"], strict=True):
+            if cond in by_cond:
+                raise ValueError(
+                    f"Duplicate {cond!r} embedding for model={model!r}, backbone={base!r}: "
+                    f"{by_cond[cond]!r} vs {emb!r} — cannot build an unambiguous "
+                    "frozen-vs-finetuned pair."
+                )
+            by_cond[cond] = emb
         if {"frozen", "finetuned"} <= set(by_cond):
-            pair = (
-                _config_key(model, by_cond["frozen"]),
-                _config_key(model, by_cond["finetuned"]),
-            )
-            out.append(
-                FamilyInstance(
-                    family="frozen_vs_finetuned",
-                    group=f"model={model},backbone={base}",
-                    pairs=(pair,),
-                    configs=tuple(sorted(pair)),
+            pairs.append(
+                (
+                    _config_key(model, by_cond["frozen"]),
+                    _config_key(model, by_cond["finetuned"]),
                 )
             )
-    return out
+    if not pairs:
+        return []
+    configs = sorted({c for pair in pairs for c in pair})
+    return [
+        FamilyInstance(
+            family="frozen_vs_finetuned",
+            group="all",
+            pairs=tuple(pairs),
+            configs=tuple(configs),
+            omnibus_defined=False,
+        )
+    ]
+
+
+def _vs_baseline(df: pd.DataFrame) -> list[FamilyInstance]:
+    """ONE instance pairing every config with the pure-BPR baseline.
+
+    The central hypothesis — does the visual signal beat pure
+    collaborative BPR? — is one research question, so Holm corrects
+    across every (config vs ``bpr_none``) pair (``m = n_configs − 1``,
+    the baseline pairs with everyone but itself).  Pairs are ordered
+    ``(config, baseline)`` so ``diff_mean`` reads as "config minus
+    baseline".  Absent baseline: empty list (logged).
+
+    ``omnibus_defined=False``: the design is a star — every config
+    against ONE shared baseline — i.e. a bundle of two-treatment
+    questions.  A K-way Friedman over its configs would test "all
+    dataset configs are equivalent", which is trivially rejected and
+    gates nothing (R1).
+    """
+    baseline = _config_key(BASELINE_MODEL, BASELINE_EMBEDDING)
+    keys = [_config_key(m, e) for m, e in zip(df["model_name"], df["embedding_name"], strict=True)]
+    if baseline not in keys:
+        logger.warning(
+            "vs_baseline family skipped: baseline config %r not present in the results.",
+            baseline,
+        )
+        return []
+    pairs = tuple((c, baseline) for c in sorted(keys) if c != baseline)
+    if not pairs:
+        return []
+    return [
+        FamilyInstance(
+            family="vs_baseline",
+            group="all",
+            pairs=pairs,
+            configs=tuple(sorted(keys)),
+            omnibus_defined=False,
+        )
+    ]
 
 
 def _all_pairs(df: pd.DataFrame) -> list[FamilyInstance]:
@@ -221,5 +304,6 @@ _BUILDERS = {
     "model_within_backbone": _model_within_backbone,
     "fusion_within_model": _fusion_within_model,
     "frozen_vs_finetuned": _frozen_vs_finetuned,
+    "vs_baseline": _vs_baseline,
     "all_pairs": _all_pairs,
 }

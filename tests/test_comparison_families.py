@@ -64,6 +64,9 @@ class TestFamilyEnumeration:
                 same_backbone = _backbone_base(emb_of[a]) == _backbone_base(emb_of[b])
                 if inst.family == "frozen_vs_finetuned":
                     assert same_model and same_backbone
+                elif inst.family == "vs_baseline":
+                    # By design every pair anchors on the pure-BPR baseline.
+                    assert b == "bpr_none"
                 else:
                     assert same_model or same_backbone, (
                         f"{inst.family}: pair ({a}, {b}) varies model AND backbone"
@@ -76,12 +79,44 @@ class TestFamilyEnumeration:
             for a, b in inst.pairs:
                 assert ("finetuned" in a) == ("finetuned" in b)
 
-    def test_frozen_vs_finetuned_is_one_pair_per_config(self) -> None:
+    def test_frozen_vs_finetuned_is_one_instance_for_the_whole_family(self) -> None:
         instances = enumerate_family_instances(_cells(), ["frozen_vs_finetuned"])
 
         assert len(instances) == 1
         inst = instances[0]
+        assert inst.group == "all"
         assert inst.pairs == (("vbpr_resnet50", "vbpr_resnet50_finetuned"),)
+
+    def test_frozen_vs_finetuned_holm_m_is_number_of_pairs(self) -> None:
+        # Two (model, backbone) cells present in both conditions must
+        # land in ONE instance so Holm runs with m=2, not twice with m=1.
+        cells = pd.concat(
+            [
+                _cells(),
+                pd.DataFrame([{"model_name": "deepstyle", "embedding_name": "vit_b16_finetuned"}]),
+            ],
+            ignore_index=True,
+        )
+
+        instances = enumerate_family_instances(cells, ["frozen_vs_finetuned"])
+
+        assert len(instances) == 1
+        assert len(instances[0].pairs) == 2
+        assert ("deepstyle_vit_b16", "deepstyle_vit_b16_finetuned") in instances[0].pairs
+
+    def test_frozen_vs_finetuned_duplicate_condition_raises(self) -> None:
+        # Two frozen artifacts collapsing to the same (model, base) would
+        # silently overwrite each other; the builder must refuse instead.
+        cells = pd.DataFrame(
+            [
+                {"model_name": "vbpr", "embedding_name": "resnet50"},
+                {"model_name": "vbpr", "embedding_name": "resnet50_comp"},
+                {"model_name": "vbpr", "embedding_name": "resnet50_finetuned"},
+            ]
+        )
+
+        with pytest.raises(ValueError, match="Duplicate 'frozen' embedding"):
+            enumerate_family_instances(cells, ["frozen_vs_finetuned"])
 
     def test_component_artifacts_group_with_base_backbone(self) -> None:
         instances = enumerate_family_instances(_cells(), ["model_within_backbone"])
@@ -89,6 +124,49 @@ class TestFamilyEnumeration:
         resnet = next(i for i in instances if i.group == "backbone=resnet50,condition=frozen")
         assert "acf_resnet50_comp" in resnet.configs
         assert "vbpr_resnet50" in resnet.configs
+
+    def test_vs_baseline_is_one_instance_pairing_every_config(self) -> None:
+        cells = _cells()
+        instances = enumerate_family_instances(cells, ["vs_baseline"])
+
+        assert len(instances) == 1
+        inst = instances[0]
+        assert inst.group == "all"
+        n_configs = len(cells)  # includes the baseline itself
+        assert len(inst.pairs) == n_configs - 1
+        # (config, baseline) ordering so diff_mean = config - baseline.
+        assert all(b == "bpr_none" for _, b in inst.pairs)
+        assert all(a != "bpr_none" for a, _ in inst.pairs)
+        assert ("vbpr_resnet50", "bpr_none") in inst.pairs
+        assert ("acf_resnet50_comp", "bpr_none") in inst.pairs
+
+    def test_vs_baseline_absent_baseline_yields_no_instance(self) -> None:
+        cells = _cells()
+        cells = cells[~((cells["model_name"] == "bpr") & (cells["embedding_name"] == "none"))]
+
+        instances = enumerate_family_instances(cells, ["vs_baseline"])
+
+        assert instances == []
+
+    def test_vs_baseline_is_part_of_default_families(self) -> None:
+        assert "vs_baseline" in DEFAULT_FAMILIES
+
+    def test_pair_collection_families_declare_no_omnibus(self) -> None:
+        # R1: a K-way Friedman over these instances' configs would test
+        # "all dataset configs are equivalent" — a gate that never gates.
+        instances = enumerate_family_instances(_cells(), ["vs_baseline", "frozen_vs_finetuned"])
+
+        assert instances
+        assert all(inst.omnibus_defined is False for inst in instances)
+
+    def test_one_dimension_families_keep_the_omnibus(self) -> None:
+        instances = enumerate_family_instances(
+            _cells(),
+            ["backbone_within_model", "model_within_backbone", "fusion_within_model"],
+        )
+
+        assert instances
+        assert all(inst.omnibus_defined is True for inst in instances)
 
     def test_unknown_family_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown comparison families"):

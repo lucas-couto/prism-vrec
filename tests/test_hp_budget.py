@@ -8,6 +8,7 @@ import src.steps.train as train_mod
 from src.recommenders.hp_budget import (
     BudgetFairnessError,
     assert_uniform_budget,
+    grid_budget_message,
     resolve_hp_budget,
 )
 
@@ -57,6 +58,33 @@ class TestFairnessGuardRail:
         cfg = _config(vbpr={key: 5})
         with pytest.raises(BudgetFairnessError, match="budget"):
             assert_uniform_budget(cfg)
+
+
+class TestGridBudgetMessage:
+    """Audit D1: unequal grid sizes are unequal selection budgets."""
+
+    def test_returns_none_when_all_budgets_equal(self) -> None:
+        assert grid_budget_message({"bpr": 8, "vbpr": 8, "deepstyle": 8}) is None
+
+    def test_returns_none_for_fewer_than_two_models(self) -> None:
+        assert grid_budget_message({"bpr": 8}) is None
+        assert grid_budget_message({}) is None
+
+    def test_warns_with_per_model_counts_when_unequal(self) -> None:
+        message = grid_budget_message({"bpr": 8, "vnpr": 32, "deepstyle": 32})
+
+        assert message is not None
+        assert "UNEQUAL" in message
+        assert "bpr=8" in message
+        assert "vnpr=32" in message
+        assert "deepstyle=32" in message
+
+    def test_warning_names_the_equal_budget_alternative(self) -> None:
+        message = grid_budget_message({"bpr": 8, "vbpr": 32})
+
+        assert message is not None
+        assert "optuna" in message.lower()
+        assert "n_trials" in message
 
 
 class TestReplayMechanism:

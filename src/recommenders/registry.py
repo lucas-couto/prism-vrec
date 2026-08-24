@@ -74,7 +74,7 @@ class RecommenderSpec:
         grid).
     requires_components:
         ``True`` when the model consumes per-item *component* embeddings
-        (the 3-D ``<extractor>_D<dim>_comp.npy`` artifacts) instead of the
+        (the 3-D ``<extractor>_comp.npy`` artifacts) instead of the
         pooled 2-D embeddings.  The train/eval enumeration routes ``_comp``
         artifacts only to such models and excludes them from the pooled
         pool used by every other recommender.

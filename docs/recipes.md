@@ -363,13 +363,14 @@ The earlier steps' outputs (extracts, fusions) are reused.
 ## 9b. "Run ACF (component-level + item-level attention)"
 
 ACF is the only recommender that consumes per-item *component*
-embeddings (`<extractor>_D<dim>_comp.npy`, shape `(n_items, M, D)`)
-instead of the pooled `(n_items, D)` ones. Two edits enable it: turn on
-component extraction, and add `acf` to the recommender list.
+embeddings (`<extractor>_comp.npy`, shape `(n_items, M, native_dim)`)
+instead of the pooled `(n_items, native_dim)` ones. One edit enables
+it: add `acf` to the recommender list — the extract step auto-enables
+component extraction whenever an enabled recommender requires it
+(`extract_components: true` in `configs/default.yaml` only forces the
+artifacts without such a recommender).
 
 ```yaml
-# configs/default.yaml
-extract_components: true        # extractors also emit the 3-D *_comp artifacts
 
 # configs/recommenders.yaml
 recommenders_enabled:
@@ -417,7 +418,7 @@ GPU.
 | --- | --- | --- |
 | `datasets:` | `configs/default.yaml` | Every step that loops datasets becomes a no-op. |
 | `extractors_enabled` | `configs/extractors.yaml` | `extract` and `finetune` skip. |
-| `extract_components` | `configs/default.yaml` | Off → no `*_comp` artifacts written (ACF cannot run); pooled output unchanged. |
+| `extract_components` | `configs/default.yaml` | Off → auto-enabled while a component recommender (e.g. `acf`) is enabled; `true` forces the `*_comp` artifacts without one. Pooled output unchanged. |
 | `finetuning.extractors` | `configs/finetuning.yaml` | `finetune` and `evaluate_finetuning` skip. |
 | `fusion_strategies_enabled` | `configs/fusion.yaml` | `fuse` step skips entirely. |
 | `recommenders_enabled` | `configs/recommenders.yaml` | `train` step skips entirely. |

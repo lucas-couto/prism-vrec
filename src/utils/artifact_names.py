@@ -36,7 +36,7 @@ def is_finetuned_artifact(name: str) -> bool:
 def is_component_artifact(name: str) -> bool:
     """Whether an embedding stem is a 3-D per-item component artifact.
 
-    Component artifacts (``<extractor>_D<dim>_comp``) feed models that
+    Component artifacts (``<extractor>_comp``) feed models that
     declare ``requires_components`` (e.g. ACF); they are routed only to
     those models and excluded from the pooled-embedding pool.
     """

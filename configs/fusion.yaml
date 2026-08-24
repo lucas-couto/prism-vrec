@@ -59,14 +59,27 @@ strategies:
   max_pool: {}
 
   # Single-variant protocol (decided 2026-05-15): one canonical value
-  # per parameterised strategy. These match the prior expand_grid
-  # defaults, so embeddings stay bit-identical to earlier runs.
+  # per parameterised strategy.  Canonical values revised 2026-08-22:
+  # the previous 0.5 / zero-logit canon made weighted_mean,
+  # attention_weighted and gated numerically identical to plain mean
+  # (all collapsed to the uniform convex combination).  The thesis
+  # defines this family as FIXED configurable weights, so each member
+  # gets a distinct canonical value away from 0.5/uniform:
+  #   weighted_mean       w_cnn=0.7          -> weights (0.700, 0.300)
+  #   attention_weighted  logits [1.0, 0.0]  -> softmax (0.731, 0.269)
+  #   gated               logits [1.0, 0.0]  -> normalised sigmoids
+  #                                             (0.594, 0.406)
+  # Note: gated logits [1.0, -1.0] would reproduce attention's
+  # (0.731, 0.269) exactly (sigmoid(x) + sigmoid(-x) = 1), so gated
+  # uses [1.0, 0.0], where the sigmoid's shape actually differs.
   weighted_mean:
-    w_cnn: [0.5]  # w_vit = 1 - w_cnn
+    w_cnn: [0.7]  # w_vit = 1 - w_cnn
 
-  attention_weighted: {}
+  attention_weighted:
+    logits: [[1.0, 0.0]]  # one logit per source (cnn, vit)
 
-  gated: {}
+  gated:
+    logits: [[1.0, 0.0]]  # one logit per source (cnn, vit)
 
   # Strategies that accept differing dims
   concat: {}

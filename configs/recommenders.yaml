@@ -9,7 +9,7 @@ recommenders_enabled:
   - vbpr
   - vnpr
   - deepstyle
-  - avbpr
+  - acf
 
 # Which embedding variants the recommenders are trained on, when a fixed
 # projection is configured under `projection:` in extractors.yaml.
@@ -25,20 +25,21 @@ common:
   latent_dim: [64, 128]
   learning_rate: [0.001, 0.01]
   l2_reg: [0.0001, 0.001]
-  visual_dim: [64, 128]  # D (visual projection dimension)
+  visual_dim: [64, 128] # D (visual projection dimension)
   epochs: 100
   batch_size: 4096
   early_stopping_patience: 20
   early_stopping_metric: "ndcg@10"
 
   # Evaluation frequency during training (epochs between validations).
-  # Full-ranking over the entire validation set is always used; only the
-  # frequency changed relative to earlier runs (was 5, now 10) to reduce
-  # training cost while preserving the same hyperparameter-selection
-  # metric across all models.
+  # Training-time validation is full-ranking over the eval_sample_size
+  # subset of validation users (see below); the frequency changed
+  # relative to earlier runs (was 5, now 10) to reduce training cost
+  # while preserving the same hyperparameter-selection metric across
+  # all models.
   eval_every_epochs: 10
 
-  # Subset of test users scored during TRAINING-TIME validation (early
+  # Subset of VALIDATION users scored during TRAINING-TIME validation (early
   # stopping + Optuna pruning) — v2 protocol, B6. 2000 users keeps the
   # per-validation standard error of ndcg@10 well below the
   # between-configuration gaps that drive model selection, while cutting
@@ -61,17 +62,17 @@ avbpr:
 
 acf:
   att_hidden: [64, 128]
-  max_history: [50]   # H: max items per user profile (item-level attention)
+  max_history: [50] # H: max items per user profile (item-level attention)
   # Optuna hp_space mirrors the grid lists exactly so both strategies
   # explore the same space (keeps grid/optuna comparable and the
   # hp_space <-> optuna.db distributions consistent).
   hp_space:
-    latent_dim:    { type: categorical, choices: [64, 128] }
+    latent_dim: { type: categorical, choices: [64, 128] }
     learning_rate: { type: categorical, choices: [0.001, 0.01] }
-    l2_reg:        { type: categorical, choices: [0.0001, 0.001] }
-    visual_dim:    { type: categorical, choices: [64, 128] }
-    att_hidden:    { type: categorical, choices: [64, 128] }
-    max_history:   { type: categorical, choices: [50] }
+    l2_reg: { type: categorical, choices: [0.0001, 0.001] }
+    visual_dim: { type: categorical, choices: [64, 128] }
+    att_hidden: { type: categorical, choices: [64, 128] }
+    max_history: { type: categorical, choices: [50] }
 
 # =============================================================================
 # Hyperparameter-search strategy
@@ -88,12 +89,12 @@ acf:
 # Optuna falls back to sampling from the discrete lists above as if it
 # were a fancy random search.
 hp_search:
-  strategy: "grid"   # "grid" or "optuna"
+  strategy: "grid" # "grid" or "optuna"
 
   optuna:
     n_trials: 30
-    sampler: "tpe"           # tpe | random | cmaes
-    pruner: "median"         # median | hyperband | none
+    sampler: "tpe" # tpe | random | cmaes
+    pruner: "median" # median | hyperband | none
     n_startup_trials: 5
     warm_start: true
     timeout_seconds: null

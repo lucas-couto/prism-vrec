@@ -149,6 +149,74 @@ class TestPcaProjection:
             ensure_projected(native, ProjectionConfig(method="pca", dim=64))
 
 
+class TestPcaWhitenedProjection:
+    def test_writes_the_requested_dim(self, native):
+        cfg = ProjectionConfig(method="pca_whitened", dim=64)
+
+        written = ensure_projected(native, cfg, train_items=list(range(150)))
+
+        assert np.load(written).shape == (200, 64)
+
+    def test_train_components_have_unit_variance(self, native):
+        """Whitening's defining property, checked on the fit rows."""
+        train = list(range(150))
+        cfg = ProjectionConfig(method="pca_whitened", dim=16)
+
+        projected = np.load(ensure_projected(native, cfg, train_items=train))
+
+        variances = projected[train].var(axis=0, ddof=1)
+        np.testing.assert_allclose(variances, np.ones(16), rtol=1e-3)
+
+    def test_shares_the_pca_basis_up_to_scale(self, native):
+        """pca_whitened is pca with rescaled columns — same directions."""
+        train = list(range(150))
+        plain = np.load(
+            ensure_projected(native, ProjectionConfig(method="pca", dim=8), train_items=train)
+        )
+
+        second_source = native.with_name("vit_b16.npy")
+        np.save(second_source, np.load(native))
+        white = np.load(
+            ensure_projected(
+                second_source, ProjectionConfig(method="pca_whitened", dim=8), train_items=train
+            )
+        )
+
+        # Column-wise correlation ±1: identical direction, different scale.
+        for j in range(8):
+            corr = np.corrcoef(plain[:, j], white[:, j])[0, 1]
+            assert abs(abs(corr) - 1.0) < 1e-4
+
+    def test_near_zero_variance_component_is_zeroed_not_amplified(self, tmp_path):
+        """A direction the train set does not vary along must map to 0."""
+        rng = np.random.default_rng(5)
+        rows = rng.standard_normal((100, 8)).astype(np.float32)
+        rows[:, 7] = 3.0  # constant column: zero variance in every basis
+        path = tmp_path / "resnet50.npy"
+        np.save(path, rows)
+        cfg = ProjectionConfig(method="pca_whitened", dim=8)
+
+        projected = np.load(ensure_projected(path, cfg, train_items=list(range(80))))
+
+        assert np.isfinite(projected).all()
+        # The dead direction survives as an all-zero component, not inf/NaN.
+        variances = projected[:80].var(axis=0, ddof=1)
+        assert (variances < 1e-6).sum() >= 1
+
+    def test_without_a_fit_set_it_fails_loudly(self, native):
+        with pytest.raises(ValueError, match="train-item"):
+            ensure_projected(native, ProjectionConfig(method="pca_whitened", dim=64))
+
+    def test_projector_metadata_records_the_method(self, native):
+        cfg = ProjectionConfig(method="pca_whitened", dim=32)
+
+        written = ensure_projected(native, cfg, train_items=list(range(150)))
+
+        meta = json.loads(written.with_suffix(".proj.json").read_text())
+        assert meta["method"] == "pca_whitened"
+        assert meta["fit"] == "train items only"
+
+
 class TestContract:
     def test_the_native_artifact_is_never_modified(self, native):
         before = np.load(native).copy()

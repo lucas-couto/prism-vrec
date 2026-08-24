@@ -37,6 +37,11 @@ class AVBPR(LinearVisualScoreMixin, BaseRecommender):
         ``l2_reg`` is optional (default 0).
     """
 
+    #: BPR-Opt L2: gather ``alpha_u`` rows alongside ``gamma_u``; the
+    #: dense ``W_vis`` and attention MLP stay in the shared term (every
+    #: triple touches them).
+    _L2_USER_TABLES = ("user_embedding", "visual_user_embedding")
+
     def __init__(
         self,
         n_users: int,

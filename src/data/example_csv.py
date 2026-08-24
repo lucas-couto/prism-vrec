@@ -274,8 +274,15 @@ class CSVDatasetProvider(DatasetProvider):
         Subclass and override this method to use a different protocol
         (temporal split, k-fold, etc).  The return value must be a
         triple of dataframes with columns ``user_idx, item_idx``.
+
+        Duplicate ``(user_id, item_id)`` rows are dropped BEFORE the
+        split: a duplicated pair could otherwise land in two splits at
+        once — train+test aborts at the evaluation disjointness guard,
+        and train+val would silently deflate the validation metric
+        (the held-out is masked and unhittable).
         """
         rng = np.random.default_rng(self.seed)
+        df = df.drop_duplicates(subset=["user_id", "item_id"])
 
         rows: list[dict] = []
         for _, group in df.groupby("user_id", sort=False):
@@ -291,6 +298,12 @@ class CSVDatasetProvider(DatasetProvider):
                 rows.append({"role": "train", "user_id": tr["user_id"], "item_id": tr["item_id"]})
 
         long_df = pd.DataFrame(rows)
+        if long_df.empty:
+            # Every user fell below min_user_interactions: return empty
+            # splits with the contract columns instead of KeyError-ing
+            # on a column-less frame.
+            empty = pd.DataFrame(columns=["user_idx", "item_idx"])
+            return empty, empty.copy(), empty.copy()
         long_df["user_idx"] = long_df["user_id"].map(user2idx).astype(int)
         long_df["item_idx"] = long_df["item_id"].map(item2idx).astype(int)
 

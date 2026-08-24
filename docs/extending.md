@@ -130,7 +130,7 @@ expose them:
 
 The base class already provides `extract_components_batch` and
 `save_components`; the `extract` step writes
-`<extractor>_D<dim>_comp.npy` (3-D) **only** when
+`<extractor>_comp.npy` (3-D) **only** when
 `extract_components: true` is set in `configs/default.yaml`. The pooled
 path is unchanged and byte-identical when the flag is off. All eight
 built-in extractors implement this (`M`: ResNet-50 / ConvNeXt / CoAtNet

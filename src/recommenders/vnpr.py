@@ -70,6 +70,10 @@ class VNPR(BaseRecommender):
         ``l2_reg`` is optional (default 0).
     """
 
+    # BPR-Opt L2: base defaults gather the user/item rows (no item_bias
+    # table here — skipped automatically); the visual transform and the
+    # scoring MLP stay in the shared term (every triple touches them).
+
     def __init__(
         self,
         n_users: int,

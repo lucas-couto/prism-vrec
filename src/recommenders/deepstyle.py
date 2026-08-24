@@ -59,6 +59,14 @@ class DeepStyle(LinearVisualScoreMixin, BaseRecommender):
     #: models that declare this flag (mirrors ``wants_history``).
     wants_categories = True
 
+    #: BPR-Opt L2: gather ``s_u`` rows alongside ``gamma_u``.  Category
+    #: rows are gathered per touched item in :meth:`_l2_gathered_rows`;
+    #: listing the table here excludes its full matrix from the shared
+    #: term.  The dense projection ``E`` stays shared (every triple
+    #: touches it).
+    _L2_USER_TABLES = ("user_embedding", "style_user_embedding")
+    _L2_EXTRA_GATHERED_TABLES = ("category_embedding",)
+
     def __init__(
         self,
         n_users: int,
@@ -115,6 +123,18 @@ class DeepStyle(LinearVisualScoreMixin, BaseRecommender):
         nn.init.xavier_uniform_(self.visual_projection.weight)
 
         self._item_proj_cache: torch.Tensor | None = None
+
+    def _l2_gathered_rows(
+        self,
+        user_ids: torch.Tensor,
+        pos_item_ids: torch.Tensor,
+        neg_item_ids: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Add the category rows ``c_{cat(i)}`` of the touched items."""
+        rows = super()._l2_gathered_rows(user_ids, pos_item_ids, neg_item_ids)
+        rows.append(self.category_embedding(self.item_category_idx[pos_item_ids]))
+        rows.append(self.category_embedding(self.item_category_idx[neg_item_ids]))
+        return rows
 
     def _visual_user_table(self) -> nn.Embedding:
         return self.style_user_embedding

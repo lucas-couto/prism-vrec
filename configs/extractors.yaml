@@ -96,9 +96,16 @@ fusion_extractors:
 #                     fusion's alignment.method: pca. Keeps more variance,
 #                     but is fit per (dataset, artifact) and does not
 #                     transfer between them.
+#           pca_whitened - pca plus whitening: each component divided by
+#                     the sqrt of its train-set variance, so every kept
+#                     direction weighs equally in inner products instead
+#                     of the first components dominating (Jegou & Chum,
+#                     ECCV 2012 - standard for visual descriptors). Same
+#                     fit set and leakage guarantees as pca.
 #   dim:    target width, shared by every projected artifact. Must not
 #           exceed the narrowest enabled backbone's raw_dim (cvt_13 = 384).
-#   seed:   used by `random` only; `pca` is determined by its fit rows.
+#   seed:   used by `random` only; the pca variants are determined by
+#           their fit rows.
 #
 # Any extractor may override the block under `extractors.<name>.projection`
 # (e.g. `method: none` to keep one backbone native-only).
