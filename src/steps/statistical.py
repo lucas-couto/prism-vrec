@@ -357,6 +357,18 @@ def _metrics_to_test(
     independent evidence.
     """
     metric_families = list(primary_metrics)
+    # icov is an AGGREGATE metric (one value per cell, replicated across a
+    # cell's per-user rows by the beyond_accuracy step): it has no per-user
+    # distribution, so per-user Wilcoxon/Friedman on it is meaningless.
+    # Refuse it here; comparing coverage needs a distinct treatment
+    # (explicit decision, e.g. across seeds/datasets).
+    if "icov" in metric_families:
+        logger.warning(
+            "primary_metrics includes 'icov', an aggregate metric with no "
+            "per-user distribution; excluded from the per-user tests (see "
+            "results/tables/*_beyond_accuracy_coverage.csv for its values)."
+        )
+        metric_families = [m for m in metric_families if m != "icov"]
     if include_derived:
         metric_families += [m for m in ("precision", "map") if m not in metric_families]
     candidates: list[str] = []

@@ -1,5 +1,12 @@
 """Evaluation module: metrics, protocol, and statistical tests."""
 
+from src.evaluation.beyond_accuracy import (
+    catalog_coverage_at_k,
+    category_entropy_at_k,
+    compute_user_beyond_accuracy,
+    efd_at_k,
+    ild_at_k,
+)
 from src.evaluation.metrics import (
     compute_all_metrics,
     f1_at_k,
@@ -22,6 +29,11 @@ __all__ = [
     "map_at_k",
     "ndcg_at_k",
     "compute_all_metrics",
+    "efd_at_k",
+    "ild_at_k",
+    "catalog_coverage_at_k",
+    "category_entropy_at_k",
+    "compute_user_beyond_accuracy",
     "Evaluator",
     "wilcoxon_test",
     "bonferroni_correction",

@@ -37,7 +37,12 @@ _SUMMARY_PATTERN = re.compile(r"^(?P<ds>.+?)_summary\.csv$")
 _FRIEDMAN_PATTERN = re.compile(r"^(?P<ds>.+?)_friedman\.csv$")
 _PAIRWISE_PATTERN = re.compile(r"^(?P<ds>.+?)_pairwise\.csv$")
 
-_METRIC_COL_PATTERN = re.compile(r"^(?P<metric>precision|recall|ndcg|map|f1)@(?P<k>\d+)$")
+# icov is deliberately absent: it is an aggregate (per-cell) metric the
+# beyond_accuracy step replicates across per-user rows; melting it into
+# the per-user long format would fake a distribution it does not have.
+_METRIC_COL_PATTERN = re.compile(
+    r"^(?P<metric>precision|recall|ndcg|map|f1|efd|ild|cat_entropy)@(?P<k>\d+)$"
+)
 _EMBEDDING_DIM_PATTERN = re.compile(r"_D(\d+)$")
 _FINETUNED_SUFFIX = "_finetuned"
 _HYBRID_PREFIX = "hybrid_"

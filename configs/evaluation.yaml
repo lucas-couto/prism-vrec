@@ -31,6 +31,50 @@ metrics:
   - "map"
   - "ndcg"
 
+# Step 06b (beyond_accuracy.py) — POST-HOC beyond-accuracy metrics.
+# Consumes the per-user top-20 artifacts persisted at final evaluation
+# (results/per_user/) — it never re-ranks and never touches the
+# Evaluator hot path — and merges efd@k / ild@k / cat_entropy@k into
+# the same per-user tables as the accuracy metrics, for k_values <= 20.
+#
+#   efd@k         novelty (Mean Self-Information reduction of Vargas &
+#                 Castells 2011, eq. 14); item popularity estimated on
+#                 the TRAIN split only (no test leakage).
+#   ild@k         visual diversity (Vargas & Castells 2011, eq. 16);
+#                 cosine similarity normalised to [0,1] before the
+#                 complement.  Computed in ONE fixed reference space
+#                 for every system (see reference_embedding below).
+#   cat_entropy@k Shannon entropy of top-k categories; only for
+#                 datasets with expects_categories: true.  Tradesy is
+#                 explicitly N/A (no column written).
+#   icov@k        item coverage over the TRAIN catalogue.  AGGREGATE:
+#                 one value per cell, replicated across its per-user
+#                 rows and also written to
+#                 {dataset}_beyond_accuracy_coverage.csv.  It has no
+#                 per-user distribution — step 07 refuses to include
+#                 it in the per-user Wilcoxon/Friedman families.
+#
+# To run inference on the new metrics, add "efd" / "ild" /
+# "cat_entropy" to statistical.primary_metrics below (they then flow
+# through the same Wilcoxon/Holm families as recall/ndcg).
+beyond_accuracy:
+  enabled: true
+
+  # PRE-REGISTERED METHODOLOGICAL DECISION: ILD is computed for EVERY
+  # system in the native ResNet50 space
+  # (data/embeddings/<dataset>/resnet50.npy), never in the evaluated
+  # extractor's own space — "self-model" diversity is not comparable
+  # across systems because each extractor deforms the space in its own
+  # favour.  Missing artifact => the step fails loud.
+  reference_embedding: "resnet50"
+
+  # false (default): EFD in its Mean Self-Information form.
+  # true: exponential rank discount (base 0.85, Vargas & Castells 2011
+  # eq. 14); relevance weighting stays off (no post-hoc relevance
+  # model under LOO).  Kept for future comparability with Deldjoo et
+  # al. (2021).
+  use_rank_relevance: false
+
 # Step 07 (statistical.py) consumes the per-user metrics produced by
 # step 06 and writes one CSV per analysis under results/tables/.
 statistical:

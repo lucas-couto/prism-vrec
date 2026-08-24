@@ -80,6 +80,7 @@ warnings.filterwarnings(
 )
 
 from src.steps import (  # noqa: E402
+    beyond_accuracy,
     download,
     evaluate,
     evaluate_finetuning,
@@ -124,6 +125,7 @@ STEP_ORDER: list[str] = [
     "fuse",
     "train",
     "evaluate",
+    "beyond_accuracy",
     "statistical",
     "export_best",
 ]
@@ -137,6 +139,7 @@ STEP_FUNCTIONS: dict[str, Callable] = {
     "fuse": fuse.run,
     "train": train.run,
     "evaluate": evaluate.run,
+    "beyond_accuracy": beyond_accuracy.run,
     "statistical": statistical.run,
     "export_best": export_best.run,
 }

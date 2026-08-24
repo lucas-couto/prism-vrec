@@ -11,6 +11,7 @@ checkpoint files, ``output_path.exists()`` guards, etc.).
 """
 
 from src.steps import (
+    beyond_accuracy,
     download,
     evaluate,
     evaluate_finetuning,
@@ -32,6 +33,7 @@ __all__ = [
     "fuse",
     "train",
     "evaluate",
+    "beyond_accuracy",
     "statistical",
     "export_best",
 ]

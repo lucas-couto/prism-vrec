@@ -66,7 +66,7 @@ dataset_contracts:
 #
 # Available step names:
 #   download, preprocess, extract, finetune, evaluate_finetuning,
-#   fuse, train, evaluate, statistical, export_best
+#   fuse, train, evaluate, beyond_accuracy, statistical, export_best
 pipeline:
   # When true the entire pipeline runs end-to-end (Battery 1 + Battery 2).
   # Set to false to honour ``start_from`` / ``stop_at`` instead.
