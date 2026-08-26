@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-vrec"
-version = "2.9.0"
+# Single source of truth is src/__init__.__version__ — see that module
+# for why the running code, not the install-time metadata, must win.
+dynamic = ["version"]
 description = "A reproducible framework for evaluating visual feature extractors in recommender systems — pure architectures, CNN-Transformer hybrids, foundation models, and late-fusion strategies."
 requires-python = ">=3.11,<3.13"
 keywords = [
@@ -79,6 +81,9 @@ telemetry = [
     "nvidia-ml-py>=12.535,<13.0; platform_system == 'Linux'",
     "psutil>=5.9,<7.0",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "src.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]

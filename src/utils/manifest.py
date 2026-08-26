@@ -34,6 +34,7 @@ from importlib import metadata as _metadata
 from pathlib import Path
 from typing import Any
 
+from src import __version__
 from src.utils.atomic_io import atomic_write
 from src.utils.dataloader import describe as describe_dataloader_tune
 from src.utils.device import resolve_device
@@ -43,7 +44,15 @@ from src.utils.timing import step_timings as collect_step_timings
 logger = get_logger(__name__)
 
 
+#: Distribution name of the framework itself, resolved specially in
+#: :func:`_package_versions` (see its docstring).
+_FRAMEWORK_DIST = "prism-vrec"
+
 _TRACKED_PACKAGES = (
+    # The framework itself first: for an install with no git checkout
+    # (``pip install prism-vrec``) this is the ONLY identifier of the code
+    # that produced the run, recorded even when the ``git`` block is null.
+    _FRAMEWORK_DIST,
     "torch",
     "torchvision",
     "numpy",
@@ -298,8 +307,21 @@ def _hardware_info() -> dict[str, Any]:
 
 
 def _package_versions(names: tuple[str, ...]) -> dict[str, str | None]:
+    """Resolve each distribution to its version, ``None`` when absent.
+
+    The framework itself is resolved from :data:`src.__version__` rather
+    than from ``importlib.metadata``.  The metadata comes from the
+    ``dist-info`` written at install time, which the Docker setup freezes
+    at image-build time while ``./src`` is bind-mounted over the editable
+    install — reporting that stale number would put a version in the run
+    manifest that never produced the run.  The module attribute travels
+    with the code that is actually executing.
+    """
     versions: dict[str, str | None] = {}
     for name in names:
+        if name == _FRAMEWORK_DIST:
+            versions[name] = __version__
+            continue
         try:
             versions[name] = _metadata.version(name)
         except _metadata.PackageNotFoundError:  # noqa: PERF203
