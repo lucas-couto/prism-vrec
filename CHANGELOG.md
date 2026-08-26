@@ -8,6 +8,69 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-08-26
+
+### Fixed
+
+- **The container no longer writes root-owned files onto the host.** The
+  image declares no `USER`, so the pipeline ran as uid 0; a bind mount,
+  unlike a named volume, writes to the host filesystem with the
+  process's uid. Every dataset, embedding, checkpoint and result was
+  therefore born `root:root` and could not be deleted by the researcher
+  without borrowing Docker's root back through a throwaway container.
+
+  The fix was blocked by `model_cache:/root/.cache` — as uid 1000 the
+  pretrained-weight cache would be unwritable — so the cache moved as
+  part of it:
+
+  - `user: "${PRISM_UID:-1000}:${PRISM_GID:-1000}"` on `pipeline`,
+    `bootstrap` and `shell`, overridable per host.
+  - The weight cache became a bind mount at `/app/.cache` and the named
+    volume was dropped. uid 1000 has no `/etc/passwd` entry inside the
+    image, so `HOME` would resolve to `/` and timm / open_clip /
+    torchvision would fail to cache; `HOME`, `XDG_CACHE_HOME`,
+    `TORCH_HOME` and `HF_HOME` now all point at the writable path.
+  - `results/`, `checkpoints/` and `logs/` are kept in the repo with
+    their own `.gitignore`, as `data/` already was. A bind-mount target
+    missing on the host is created by the daemon **as root**, so without
+    this a fresh clone reproduces the bug.
+
+  No `Dockerfile` change and no rebuild required: every `mkdir` in the
+  image sits under a bind mount that replaces it, and the code creates
+  its subdirectories at runtime.
+
+- **The run manifest records the version of the framework itself**, not
+  only of its dependencies. Previously `package_versions` tracked torch,
+  timm, open_clip and friends but not `prism-vrec`, leaving an install
+  without a git checkout (`pip install prism-vrec`, where the `git`
+  block is null) with no identifier of the code that produced the run.
+
+  Simply adding the distribution to the tracked list would have been
+  worse than the omission. `importlib.metadata` reads the `dist-info`
+  written at *install* time, and the Docker setup bind-mounts `./src`
+  over an editable install — so that metadata is frozen at the version
+  the image was built with while the executing code is whatever the
+  mount provides. On the image in use it reported `2.5.0` for code that
+  was `2.9.0`. A wrong version in a manifest is more dangerous than a
+  missing one: a null is noticed, a plausible number gets cited.
+
+  The version now lives in `src.__init__.__version__` — the one place
+  that travels with the mounted code — and `pyproject.toml` consumes it
+  through `[tool.setuptools.dynamic]` instead of declaring its own, so
+  there is a single place to bump and the packaged metadata cannot
+  disagree with the running code. Verified in both directions: against
+  the stale image and with no rebuild the manifest reports `2.9.1`, and
+  setuptools still resolves the version statically to build a real
+  wheel.
+
+### Changed
+
+- `configs/default.yaml` pins the DataLoader sizing
+  (`num_workers: 10`, `prefetch_factor: 6`, `batch_size: 192`) instead
+  of taking the autotune's "balanced" tier. The override is recorded in
+  the manifest under `dataloader_autotune.yaml_overrides`, alongside the
+  values the autotune would have picked.
+
 ## [2.9.0] - 2026-08-24
 
 ### Added

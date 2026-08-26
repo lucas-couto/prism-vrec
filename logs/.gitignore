@@ -1,0 +1,7 @@
+# Keep the logs/ directory in the repo, but never version its contents.
+# The directory must EXIST before `docker compose up`: a bind-mount
+# target that is missing on the host is created by the Docker daemon as
+# root, and the container (running as the host user) then cannot write
+# into it.  Mirrors the same trick used by data/.gitignore.
+*
+!.gitignore

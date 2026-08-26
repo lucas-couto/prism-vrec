@@ -1,15 +1,11 @@
 # Data (large files, not versioned). The data/ directory is kept in the
 # repo but all of its contents are ignored — see data/.gitignore.
 
-# Checkpoints (extraction, training, finetune, grid search state).
-# Regenerable, opaque binaries.
-checkpoints/
-
-# Results (generated, execution artefacts).
-results/
-
-# Logs
-logs/
+# checkpoints/, results/ and logs/ keep their directory in the repo and
+# ignore their contents via their own .gitignore — the same pattern as
+# data/.  They must exist on the host before `docker compose up`, or the
+# daemon creates the bind-mount target as root and the container (which
+# now runs as the host user) cannot write into it.
 
 # Python
 __pycache__/
@@ -37,3 +33,6 @@ Thumbs.db
 
 # Misc
 *.tmp
+
+# Model weight cache (torch hub / HuggingFace), populated on first extract.
+.cache/
