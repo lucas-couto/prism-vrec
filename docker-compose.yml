@@ -25,8 +25,23 @@ services:
       - ./src:/app/src
       - ./scripts:/app/scripts
       - ./main.py:/app/main.py
-      - model_cache:/root/.cache
+      - ./.cache:/app/.cache
     working_dir: /app
+    # Run as the host user so everything written through the bind mounts
+    # (data/, results/, logs/, checkpoints/) is owned by the researcher
+    # instead of root.  Without this the container runs as uid 0 and a
+    # bind mount does not translate uids, so every artifact is born
+    # root-owned and undeletable without borrowing Docker's root back.
+    # Override on a host whose user is not 1000: PRISM_UID=1001 PRISM_GID=1001 docker compose up
+    user: "${PRISM_UID:-1000}:${PRISM_GID:-1000}"
+    environment:
+      # uid 1000 has no /etc/passwd entry inside the image, so HOME would
+      # default to / (unwritable).  Every library that caches pretrained
+      # weights is pinned to the one path that IS writable.
+      HOME: /app/.cache
+      XDG_CACHE_HOME: /app/.cache
+      TORCH_HOME: /app/.cache/torch
+      HF_HOME: /app/.cache/huggingface
     entrypoint: ["python", "main.py"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
@@ -81,8 +96,23 @@ services:
       - ./configs:/app/configs
       - ./src:/app/src
       - ./main.py:/app/main.py
-      - model_cache:/root/.cache
+      - ./.cache:/app/.cache
     working_dir: /app
+    # Run as the host user so everything written through the bind mounts
+    # (data/, results/, logs/, checkpoints/) is owned by the researcher
+    # instead of root.  Without this the container runs as uid 0 and a
+    # bind mount does not translate uids, so every artifact is born
+    # root-owned and undeletable without borrowing Docker's root back.
+    # Override on a host whose user is not 1000: PRISM_UID=1001 PRISM_GID=1001 docker compose up
+    user: "${PRISM_UID:-1000}:${PRISM_GID:-1000}"
+    environment:
+      # uid 1000 has no /etc/passwd entry inside the image, so HOME would
+      # default to / (unwritable).  Every library that caches pretrained
+      # weights is pinned to the one path that IS writable.
+      HOME: /app/.cache
+      XDG_CACHE_HOME: /app/.cache
+      TORCH_HOME: /app/.cache/torch
+      HF_HOME: /app/.cache/huggingface
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -108,8 +138,23 @@ services:
       - ./src:/app/src
       - ./scripts:/app/scripts
       - ./main.py:/app/main.py
-      - model_cache:/root/.cache
+      - ./.cache:/app/.cache
     working_dir: /app
+    # Run as the host user so everything written through the bind mounts
+    # (data/, results/, logs/, checkpoints/) is owned by the researcher
+    # instead of root.  Without this the container runs as uid 0 and a
+    # bind mount does not translate uids, so every artifact is born
+    # root-owned and undeletable without borrowing Docker's root back.
+    # Override on a host whose user is not 1000: PRISM_UID=1001 PRISM_GID=1001 docker compose up
+    user: "${PRISM_UID:-1000}:${PRISM_GID:-1000}"
+    environment:
+      # uid 1000 has no /etc/passwd entry inside the image, so HOME would
+      # default to / (unwritable).  Every library that caches pretrained
+      # weights is pinned to the one path that IS writable.
+      HOME: /app/.cache
+      XDG_CACHE_HOME: /app/.cache
+      TORCH_HOME: /app/.cache/torch
+      HF_HOME: /app/.cache/huggingface
     entrypoint: ["bash"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
@@ -127,6 +172,3 @@ services:
     shm_size: "4g"
     mem_limit: ${PRISM_MEM_LIMIT:-24g}
     memswap_limit: ${PRISM_MEM_LIMIT:-24g}
-
-volumes:
-  model_cache:
