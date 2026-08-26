@@ -114,7 +114,7 @@ telemetry:
 # (autotuned or pinned) and any active overrides are recorded under
 # ``manifest['dataloader_autotune']``.
 #
-# dataloader:
-#   num_workers: 4
-#   prefetch_factor: 4
-#   batch_size: 64
+dataloader:
+  num_workers: 10
+  prefetch_factor: 6
+  batch_size: 192
