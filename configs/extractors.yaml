@@ -113,7 +113,7 @@ fusion_extractors:
 # The projector itself is written to <extractor>_p<dim>.proj.npz plus a
 # .proj.json describing it, so the map is auditable and reproducible.
 projection:
-  method: pca_whitened
+  method: none
   dim: 128
   seed: 42
 

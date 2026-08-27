@@ -18,7 +18,7 @@ recommenders_enabled:
 #               visible instead of assumed
 # Applies to fusion outputs too: a hybrid built from projected sources
 # carries the same token and is classified with them.
-embedding_variants: both
+embedding_variants: native
 
 common:
   latent_dim: [64, 128]

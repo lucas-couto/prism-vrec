@@ -8,6 +8,42 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.9.2] - 2026-08-27
+
+### Changed
+
+- **Fusion alignment is the learned linear projection, on native
+  features.** `configs/fusion.yaml` sets `extractor_variants: native`
+  (was `projected`), so the equal-dim fusion family (mean, sum, prod,
+  max_pool, weighted_mean, attention_weighted, gated, adaptive_gated)
+  routes through `alignment: {method: learned, dim: 128}` instead of
+  bypassing it: each extractor gets its own `Linear(D_i -> d)`
+  (ResNet-50 2048 -> 128, ViT-B/16 768 -> 128) trained end-to-end by the
+  recommender's BPR loss, and fusion happens after projection. The
+  concatenation family (concat, pca, pca_per_model) is unchanged and
+  keeps native dims. `configs/recommenders.yaml` sets
+  `embedding_variants: native` and `configs/extractors.yaml` sets
+  `projection.method: none`, so no fixed `_p<dim>` artifacts are
+  produced. Runs from 2.9.0/2.9.1 (pca_whitened p128 sources) are not
+  comparable with runs after this change.
+
+### Added
+
+- Methodological guarantee, made structural and documented: every
+  equal-dim fusion instantiates the same projection architecture via
+  the strategy-agnostic `LearnedAlignmentFusion.build_projections`,
+  sized by the single `alignment.dim` key, so a comparison between two
+  fusions isolates the fusion operation. Documented in
+  `src/fusions/online.py`, `configs/fusion.yaml` and
+  `docs/learned_fusion.md`.
+- `tests/test_learned_alignment_guarantee.py`: identical projection
+  signature and parameter count across the eight strategies; projection
+  parameters registered in the optimiser, receiving finite gradients and
+  updating after one BPR step through VBPR; `alignment.dim` propagated
+  from the schema through the fuse sidecar to the module; concat/PCA
+  strategies offline, dim-agnostic and free of the projection.
+
+
 ## [2.9.1] - 2026-08-26
 
 ### Fixed

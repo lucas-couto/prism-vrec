@@ -32,6 +32,12 @@ normalize_before_fusion: true
 #   pca     - per-source PCA to dim, fit ONLY on train items.
 # The concatenation family (concat/pca/pca_per_model) ignores this
 # block and operates on native dims.
+# `dim` is the SINGLE common dimension d shared by every equal-dim
+# strategy. It is deliberately not configurable per strategy: when two
+# fusions (e.g. mean vs prod) are compared, the projection Linear(D_i -> d)
+# must have the same architecture and capacity in both models so the
+# fusion operation is the only thing that differs. See
+# src/fusions/online.py::LearnedAlignmentFusion.
 alignment:
   method: learned
   dim: 128
@@ -49,7 +55,7 @@ alignment:
 # `projected` requires every name in fusion_extractors to have a
 # projection configured, all to the SAME dim — otherwise the sources
 # would not share a space and the run fails loudly.
-extractor_variants: projected
+extractor_variants: native
 
 strategies:
   # Strategies that require equal dims

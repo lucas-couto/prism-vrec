@@ -14,4 +14,4 @@ is whatever the mount provides.  Reading the version from this module
 instead makes the manifest report the code that actually ran.
 """
 
-__version__ = "2.9.1"
+__version__ = "2.9.2"
