@@ -48,6 +48,31 @@ python main.py --from train       # the recommender picks up the
                                   # gate module automatically
 ```
 
+## Learned alignment (`alignment.method: learned`)
+
+With native-dim sources (`extractor_variants: native`), every equal-dim
+strategy — mean, sum, prod, max_pool, weighted_mean, attention_weighted,
+gated, adaptive_gated — first passes each source through its own
+`Linear(D_i -> d)` (ResNet-50: 2048 → d, ViT-B/16: 768 → d), then fuses
+in the `d`-dimensional space.  The projections are parameters of the
+recommender, trained end-to-end by the BPR loss together with everything
+else; nothing is pre-computed or fit separately (unlike PCA).
+
+**`d` is one config key, `alignment.dim` in `configs/fusion.yaml`**, and
+is read by every strategy of the family.  This is a methodological
+guarantee, not a convenience: the projection architecture (one linear
+layer, same `d`, same init) is identical across fusions, so comparing
+two fusions isolates the fusion *operation* — the projection is a
+controlled variable.  The guarantee is structural: all strategies are
+implemented by the single class `LearnedAlignmentFusion`
+(`src/fusions/online.py`), whose `build_projections` is
+strategy-agnostic.  `normalize_before_fusion` is applied to the
+*projected* sources, right before the op.
+
+The concatenation family (concat, pca, pca_per_model) never uses this
+projection: concat juxtaposes native dims (2048 + 768 = 2816) and the
+PCA variants keep their train-only PCA fit.
+
 ## On-disk artefacts
 
 * No ``hybrid_adaptive_gated_*.npy`` is written.

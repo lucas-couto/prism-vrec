@@ -110,6 +110,20 @@ class LearnedAlignmentFusion(nn.Module):
     per-source projections and ``adaptive_gated``'s MLP are learned.
     """
 
+    # METHODOLOGICAL GUARANTEE — identical projection across fusions.
+    # The per-source alignment is a plain ``Linear(D_i -> dim)`` with
+    # bias, Xavier-uniform init, no activation, no normalisation layer,
+    # and it is built once, in ``build_projections``, for every strategy
+    # this class supports.  ``dim`` comes from the single
+    # ``alignment.dim`` config key, so mean/sum/prod/max_pool/
+    # weighted_mean/attention_weighted/gated/adaptive_gated all get
+    # projections of exactly the same architecture and capacity.  Each
+    # trained model learns its own weights (unavoidable and intended),
+    # but when two fusions are compared the fusion *operation* is the
+    # only structural difference between them — the projection is a
+    # controlled variable, never a confound.  Do NOT add per-strategy
+    # branches that change the projection (extra layers, different
+    # dims, dropout) without revisiting this guarantee.
     _SIMPLE_OPS = ("mean", "sum", "prod", "max_pool")
     _LOGIT_OPS = ("attention_weighted", "gated")
 
@@ -129,10 +143,7 @@ class LearnedAlignmentFusion(nn.Module):
         self.source_dims = list(source_dims)
         self.strategy = strategy
         self.normalize = normalize
-        self.projections = nn.ModuleList(nn.Linear(d, dim) for d in source_dims)
-        for proj in self.projections:
-            nn.init.xavier_uniform_(proj.weight)
-            nn.init.zeros_(proj.bias)
+        self.projections = self.build_projections(source_dims, dim)
 
         m = len(source_dims)
         if strategy == "weighted_mean":
@@ -155,6 +166,20 @@ class LearnedAlignmentFusion(nn.Module):
             self.gate = AdaptiveGatedFusion(dim=dim)
         elif strategy not in self._SIMPLE_OPS:
             raise ValueError(f"Unknown learned-alignment fusion op: {strategy!r}.")
+
+    @staticmethod
+    def build_projections(source_dims: list[int], dim: int) -> nn.ModuleList:
+        """The one and only projection architecture (see class comment).
+
+        One ``Linear(D_i -> dim)`` per source, Xavier-uniform weight,
+        zero bias.  Strategy-agnostic by construction: the caller never
+        passes the strategy, so no branch can specialise it.
+        """
+        projections = nn.ModuleList(nn.Linear(d, dim) for d in source_dims)
+        for proj in projections:
+            nn.init.xavier_uniform_(proj.weight)
+            nn.init.zeros_(proj.bias)
+        return projections
 
     def _aligned(self, concat: torch.Tensor) -> list[torch.Tensor]:
         parts = torch.split(concat, self.source_dims, dim=-1)
