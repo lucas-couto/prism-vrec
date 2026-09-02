@@ -30,6 +30,7 @@ from src.data.base import DatasetProvider, register_dataset_provider
 from src.data.categories import derive_categories, write_categories_csv
 from src.utils import telemetry
 from src.utils.logging import get_logger
+from src.utils.splits import deduplicate_leave_one_out
 
 logger = get_logger(__name__)
 
@@ -41,6 +42,23 @@ DATASETS = {
     "amazon_men": "AmazonMenWithImgPartitioned.npy",
     "tradesy": "TradesyImgPartitioned.npy",
 }
+
+
+def _product_id(entry: Any) -> int | None:
+    """Item id of one raw interaction entry, or ``None`` when absent.
+
+    Entries are either bare ids or dicts keyed ``"productid"`` /
+    ``b"productid"``.  The lookups are chained on ``is None``, never on
+    truthiness: item id ``0`` is a legitimate product, and a falsy test
+    used to drop it from every split (users whose held-out was item 0
+    silently vanished from evaluation).
+    """
+    if not isinstance(entry, dict):
+        return int(entry)
+    iid = entry.get("productid")
+    if iid is None:
+        iid = entry.get(b"productid")
+    return None if iid is None else int(iid)
 
 
 class DVBPRDataLoader(DatasetProvider):
@@ -225,6 +243,15 @@ class DVBPRDataLoader(DatasetProvider):
             {user_id: {item_id}} — 1 held-out item per user for test.
         n_users : int
         n_items : int
+
+        Notes
+        -----
+        The pre-packaged partitions are not guaranteed to be leave-one-out
+        disjoint — Tradesy merges a user's purchase and "want" lists, so
+        ~1.6k held-out pairs also sit in that user's training history.  The
+        splits are passed through :func:`deduplicate_leave_one_out` before
+        being returned, which resolves every duplicate in favour of the
+        held-out split.  The clean Amazon partitions pass through untouched.
         """
         data = self._load_raw()
         user_train_raw, user_val_raw, user_test_raw, _, usernum, itemnum = data
@@ -232,21 +259,21 @@ class DVBPRDataLoader(DatasetProvider):
         def _parse_split(raw: dict) -> dict[int, set[int]]:
             result: dict[int, set[int]] = {}
             for uid, interactions in raw.items():
-                items = set()
-                for entry in interactions:
-                    if isinstance(entry, dict):
-                        iid = entry.get("productid") or entry.get(b"productid")
-                    else:
-                        iid = int(entry)
-                    if iid is not None:
-                        items.add(int(iid))
+                items = {
+                    iid
+                    for iid in (_product_id(entry) for entry in interactions)
+                    if iid is not None
+                }
                 if items:
                     result[int(uid)] = items
             return result
 
-        train = _parse_split(user_train_raw)
-        validation = _parse_split(user_val_raw)
-        test = _parse_split(user_test_raw)
+        train, validation, test = deduplicate_leave_one_out(
+            _parse_split(user_train_raw),
+            _parse_split(user_val_raw),
+            _parse_split(user_test_raw),
+            self.dataset_name,
+        )
 
         logger.info(
             "Loaded splits: %d users, %d items, train=%d interactions, val=%d users, test=%d users",

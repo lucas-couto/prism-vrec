@@ -27,7 +27,7 @@ common:
   visual_dim: [64, 128] # D (visual projection dimension)
   epochs: 50
   batch_size: 4096
-  early_stopping_patience: 20
+  early_stopping_patience: 5
   early_stopping_metric: "ndcg@10"
 
   # Evaluation frequency during training (epochs between validations).
@@ -89,6 +89,11 @@ acf:
 # were a fancy random search.
 hp_search:
   strategy: "optuna" # "grid" or "optuna"
+
+  # Parallel training processes.  0 = auto-detect from free VRAM;
+  # pinned to 1 after the 2026-08-29 OOM: an Optuna worker on
+  # amazon_fashion (166k items, full ranking) needs the whole 16 GB GPU.
+  workers: 1
 
   optuna:
     n_trials: 30

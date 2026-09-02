@@ -61,6 +61,69 @@ def timm_canonical_transform(timm_model) -> transforms.Compose:
     return timm.data.create_transform(**data_config, is_training=False)
 
 
+def _dataset_len(dataloader) -> int:
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None:
+        raise ValueError(
+            "streaming extraction needs len(dataloader.dataset) to preallocate "
+            "the on-disk matrix; pass checkpoint_path=None for loaders without a dataset."
+        )
+    return len(dataset)
+
+
+def _resume_state(part_path: Path, progress_path: Path, n_total: int):
+    """Reopen a part file + progress sidecar; restart clean when they don't match."""
+    if not (part_path.exists() and progress_path.exists()):
+        part_path.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
+        return None, 0, 0, []
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        candidate = np.lib.format.open_memmap(part_path, mode="r+")
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        logger.warning("Corrupt extraction checkpoint %s (%s); restarting", part_path, exc)
+        part_path.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
+        return None, 0, 0, []
+    if candidate.shape[0] != n_total or progress.get("n_total") != n_total:
+        del candidate  # catalogue changed under the part file: restart clean
+        part_path.unlink()
+        progress_path.unlink()
+        return None, 0, 0, []
+    logger.info(
+        "  resume: %d/%d rows already on disk (%s)", progress["rows_done"], n_total, part_path.name
+    )
+    return (
+        candidate,
+        progress["last_batch_index"] + 1,
+        progress["rows_done"],
+        list(progress["item_ids"]),
+    )
+
+
+def _finalise_array(array: np.ndarray, npy_path: Path) -> None:
+    """Persist *array* as ``npy_path``.
+
+    A read-mode memmap over a streaming ``.part.npy`` is finalised by
+    atomic rename (same filesystem) or a streamed copy (cross-filesystem)
+    — never materialised in RAM.  Anything else goes through
+    :func:`atomic_np_save`.
+    """
+    source = getattr(array, "filename", None)
+    if source is None or not Path(source).name.endswith(".part.npy"):
+        atomic_np_save(array, npy_path)
+        return
+    source = Path(source)
+    del array  # drop the mapping before moving the file under it
+    try:
+        source.replace(npy_path)
+    except OSError:
+        atomic_np_save(np.load(source, mmap_mode="r"), npy_path)
+        source.unlink()
+    progress = source.with_name(source.name.replace(".part.npy", ".progress.json"))
+    progress.unlink(missing_ok=True)
+
+
 class HFProcessorTransform:
     """Adapter turning a HuggingFace image processor into a transform.
 
@@ -259,101 +322,59 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
         checkpoint_path: str | None = None,
         save_every: int = 500,
     ) -> tuple[np.ndarray, list]:
-        """Extract embeddings from an entire dataloader with checkpoint support.
+        """Extract pooled embeddings ``(N, native_dim)`` from a dataloader.
 
         The dataloader is expected to yield ``(images, item_ids)`` tuples where
         *images* is a batch of PIL images or pre-transformed tensors and
         *item_ids* is a list/tuple of corresponding identifiers.
 
+        With a *checkpoint_path* the catalogue is NEVER accumulated in RAM:
+        batches stream into an fp32 ``<checkpoint_path>.part.npy`` memmap
+        with resume progress in ``<checkpoint_path>.progress.json`` (same
+        mechanism as :meth:`extract_components_batch`).  The former
+        accumulate-and-pickle checkpoint held the whole matrix in RAM three
+        times over at every save and OOM-killed the container on large
+        catalogues.  The returned array is a read-mode memmap; hand it to
+        :meth:`save`, which finalises by rename when possible.
+
         Parameters
         ----------
         dataloader : torch.utils.data.DataLoader
-            Dataloader that yields ``(images, item_ids)`` pairs.  If the
-            images are already tensors they are used directly; otherwise the
-            extractor's ``transform`` is applied.
+            Dataloader that yields ``(images, item_ids)`` pairs.
         checkpoint_path : str, optional
-            Path to a ``.pt`` file used for saving / resuming partial progress.
+            Base path for the streaming part file and progress sidecar.
         save_every : int
-            Save a partial checkpoint every *save_every* batches.
+            Flush progress every *save_every* batches.
 
         Returns
         -------
         tuple[np.ndarray, list]
-            ``(embeddings, item_ids)`` where *embeddings* has shape
-            ``(N, native_dim)`` and *item_ids* is a flat list of length *N*.
+            ``(embeddings, item_ids)`` with *embeddings* of shape ``(N, native_dim)``.
         """
-        all_embeddings: list[np.ndarray] = []
-        all_item_ids: list = []
-        start_batch = 0
-
-        if checkpoint_path is not None:
-            ckpt_file = Path(checkpoint_path)
-            if ckpt_file.exists():
-                ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
-                all_embeddings = [ckpt["embeddings"]]
-                all_item_ids = ckpt["item_ids"]
-                start_batch = ckpt["last_batch_index"] + 1
-                logger.info(
-                    "Resuming from checkpoint: %d items, starting at batch %d",
-                    len(all_item_ids),
-                    start_batch,
-                )
-
-        use_amp = self.device.type == "cuda"
-        self.model.eval()
-        with torch.no_grad():
-            for batch_idx, (images, item_ids) in enumerate(
-                tqdm(dataloader, desc="Extracting features")
-            ):
-                if batch_idx < start_batch:
-                    continue
-
-                if not isinstance(images, torch.Tensor):
-                    images = torch.stack([self.transform(img) for img in images])
-
-                images = images.to(self.device)
-                with cuda_autocast(enabled=use_amp):
-                    embeddings = self.model(images)
-                self._account_flops(images)
-                embeddings = embeddings.float().cpu().numpy()
-
-                all_embeddings.append(embeddings)
-                if isinstance(item_ids, torch.Tensor):
-                    all_item_ids.extend(item_ids.tolist())
-                else:
-                    all_item_ids.extend(list(item_ids))
-
-                if checkpoint_path is not None and (batch_idx + 1) % save_every == 0:
-                    partial_emb = np.concatenate(all_embeddings, axis=0)
-                    torch.save(
-                        {
-                            "embeddings": partial_emb,
-                            "item_ids": all_item_ids,
-                            "last_batch_index": batch_idx,
-                        },
-                        checkpoint_path,
-                    )
-                    logger.info(
-                        "Checkpoint saved at batch %d (%d items)", batch_idx, len(all_item_ids)
-                    )
-
-        if len(all_embeddings) == 0:
-            final_embeddings = np.empty((0, self.native_dim), dtype=np.float32)
-        else:
-            final_embeddings = np.concatenate(all_embeddings, axis=0)
-
-        if checkpoint_path is not None:
-            final_path = Path(checkpoint_path)
-            torch.save(
-                {
-                    "embeddings": final_embeddings,
-                    "item_ids": all_item_ids,
-                    "last_batch_index": -1,
-                },
-                final_path,
+        if checkpoint_path is None:
+            return self._collect_in_memory(
+                self._iter_batches(
+                    dataloader, 0, self.model, self._account_flops, "Extracting features"
+                ),
+                empty_shape=(0, self.native_dim),
+                dtype=np.float32,
             )
-
-        return final_embeddings, all_item_ids
+        legacy = Path(checkpoint_path)
+        if legacy.is_file():
+            # Pre-streaming pickle checkpoint (possibly truncated by an OOM
+            # kill mid-save): it is neither readable nor needed any more.
+            logger.warning("Discarding legacy pooled checkpoint %s", legacy)
+            legacy.unlink()
+        return self._extract_streaming(
+            lambda start: self._iter_batches(
+                dataloader, start, self.model, self._account_flops, "Extracting features"
+            ),
+            dataloader,
+            checkpoint_path,
+            save_every,
+            dtype=np.float32,
+            empty_shape=(0, self.native_dim),
+        )
 
     def _forward_components(self, images: torch.Tensor) -> torch.Tensor:
         """Return per-item component features ``(B, M, native_dim)``.
@@ -381,98 +402,112 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
         """Extract component features for a dataloader, stacking ``(N, M, native_dim)``.
 
         Component matrices are ~50-500x the pooled ones (resnet50 on
-        amazon_fashion: 49 x 2048 per item = 67 GB fp32), so unlike
-        :meth:`extract_batch` this NEVER accumulates the catalogue in
-        RAM when a *checkpoint_path* is given: batches stream into an
-        fp16 ``<checkpoint_path>.part.npy`` memmap, with resume progress
-        (last batch, row cursor, item ids) in
+        amazon_fashion: 49 x 2048 per item = 67 GB fp32), so with a
+        *checkpoint_path* batches stream into an fp16
+        ``<checkpoint_path>.part.npy`` memmap with resume progress in
         ``<checkpoint_path>.progress.json``.  Peak host memory is one
         batch, regardless of catalogue size.  The returned array is a
         read-mode memmap over the part file; hand it to
-        :meth:`save_components`, which finalises by rename instead of
-        rewriting the data.
+        :meth:`save_components`, which finalises by rename.
 
         Streaming needs the total row count upfront
         (``len(dataloader.dataset)``).  Without a *checkpoint_path* the
-        legacy in-memory path is used — fine for tests and small plugin
+        in-memory path is used — fine for tests and small plugin
         catalogues, fatal for real ones.
         """
         if checkpoint_path is None:
             return self._extract_components_in_memory(dataloader)
         return self._extract_components_streaming(dataloader, checkpoint_path, save_every)
 
-    def _iter_component_batches(self, dataloader, start_batch: int):
-        """Yield ``(batch_idx, components_fp16, ids)`` from *start_batch* on."""
+    def _account_component_flops(self, images: torch.Tensor) -> None:
+        self._account_flops(images, forward=self._forward_components, tag="components")
+
+    def _iter_batches(self, dataloader, start_batch: int, forward, account, desc: str):
+        """Yield ``(batch_idx, features_fp32, ids)`` from *start_batch* on.
+
+        *forward* runs under autocast; *account(images)* attributes the
+        batch's FLOPs afterwards, outside autocast (calibration must see
+        the same dtype dispatch as before the streaming refactor).
+        """
         use_amp = self.device.type == "cuda"
         self.model.eval()
         with torch.no_grad():
-            for batch_idx, (images, item_ids) in enumerate(
-                tqdm(dataloader, desc="Extracting components")
-            ):
+            for batch_idx, (images, item_ids) in enumerate(tqdm(dataloader, desc=desc)):
                 if batch_idx < start_batch:
                     continue
                 if not isinstance(images, torch.Tensor):
                     images = torch.stack([self.transform(img) for img in images])
                 images = images.to(self.device)
                 with cuda_autocast(enabled=use_amp):
-                    components = self._forward_components(images)
-                self._account_flops(images, forward=self._forward_components, tag="components")
+                    features = forward(images)
+                account(images)
                 ids = item_ids.tolist() if isinstance(item_ids, torch.Tensor) else list(item_ids)
-                yield batch_idx, components.float().cpu().numpy().astype(np.float16), ids
+                yield batch_idx, features.float().cpu().numpy(), ids
+
+    def _iter_component_batches(self, dataloader, start_batch: int):
+        """Yield ``(batch_idx, components_fp16, ids)`` from *start_batch* on."""
+        gen = self._iter_batches(
+            dataloader,
+            start_batch,
+            self._forward_components,
+            self._account_component_flops,
+            "Extracting components",
+        )
+        for batch_idx, comp, ids in gen:
+            yield batch_idx, comp.astype(np.float16), ids
+
+    @staticmethod
+    def _collect_in_memory(batches, empty_shape: tuple, dtype) -> tuple[np.ndarray, list]:
+        chunks: list[np.ndarray] = []
+        all_item_ids: list = []
+        for _, feats, ids in batches:
+            chunks.append(feats.astype(dtype, copy=False))
+            all_item_ids.extend(ids)
+        if not chunks:
+            return np.empty(empty_shape, dtype=dtype), all_item_ids
+        return np.concatenate(chunks, axis=0), all_item_ids
 
     def _extract_components_in_memory(self, dataloader) -> tuple[np.ndarray, list]:
-        """Legacy accumulate-in-RAM path (no checkpoint, small catalogues only)."""
-        all_components: list[np.ndarray] = []
-        all_item_ids: list = []
-        for _, comp, ids in self._iter_component_batches(dataloader, start_batch=0):
-            all_components.append(comp)
-            all_item_ids.extend(ids)
-        if not all_components:
-            return np.empty((0, 0, self.native_dim), dtype=np.float16), all_item_ids
-        return np.concatenate(all_components, axis=0), all_item_ids
+        """Accumulate-in-RAM path (no checkpoint, small catalogues only)."""
+        return self._collect_in_memory(
+            self._iter_component_batches(dataloader, start_batch=0),
+            empty_shape=(0, 0, self.native_dim),
+            dtype=np.float16,
+        )
 
     def _extract_components_streaming(
+        self, dataloader, checkpoint_path: str, save_every: int
+    ) -> tuple[np.ndarray, list]:
+        """Stream component batches into an fp16 on-disk memmap (resumable)."""
+        return self._extract_streaming(
+            lambda start: self._iter_component_batches(dataloader, start),
+            dataloader,
+            checkpoint_path,
+            save_every,
+            dtype=np.float16,
+            empty_shape=(0, 0, self.native_dim),
+        )
+
+    def _extract_streaming(
         self,
+        batch_factory,
         dataloader,
         checkpoint_path: str,
         save_every: int,
+        dtype,
+        empty_shape: tuple,
     ) -> tuple[np.ndarray, list]:
-        """Stream component batches into an fp16 on-disk memmap (resumable)."""
-        dataset = getattr(dataloader, "dataset", None)
-        if dataset is None:
-            raise ValueError(
-                "streaming component extraction needs len(dataloader.dataset) "
-                "to preallocate the on-disk matrix; pass checkpoint_path=None "
-                "for loaders without a dataset."
-            )
-        n_total = len(dataset)
+        """Stream ``(batch_idx, features, ids)`` into an on-disk memmap (resumable).
+
+        *batch_factory(start_batch)* returns the batch iterator resumed at
+        *start_batch* (see :meth:`_iter_batches`).
+        """
+        n_total = _dataset_len(dataloader)
         part_path = Path(f"{checkpoint_path}.part.npy")
         progress_path = Path(f"{checkpoint_path}.progress.json")
         part_path.parent.mkdir(parents=True, exist_ok=True)
 
-        memmap: np.ndarray | None = None
-        start_batch = 0
-        row = 0
-        all_item_ids: list = []
-        if part_path.exists() and progress_path.exists():
-            progress = json.loads(progress_path.read_text(encoding="utf-8"))
-            candidate = np.lib.format.open_memmap(part_path, mode="r+")
-            if candidate.shape[0] == n_total and progress.get("n_total") == n_total:
-                memmap = candidate
-                start_batch = progress["last_batch_index"] + 1
-                row = progress["rows_done"]
-                all_item_ids = list(progress["item_ids"])
-                logger.info(
-                    "  components resume: %d/%d rows already on disk (%s)",
-                    row,
-                    n_total,
-                    part_path.name,
-                )
-            else:
-                # Catalogue changed under the part file: restart clean.
-                del candidate
-                part_path.unlink()
-                progress_path.unlink()
+        memmap, start_batch, row, all_item_ids = _resume_state(part_path, progress_path, n_total)
 
         def _save_progress(last_batch_index: int) -> None:
             payload = json.dumps(
@@ -488,23 +523,20 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
                 progress_path,
             )
 
-        for batch_idx, comp, ids in self._iter_component_batches(dataloader, start_batch):
+        for batch_idx, feats, ids in batch_factory(start_batch):
             if memmap is None:
                 memmap = np.lib.format.open_memmap(
-                    part_path,
-                    mode="w+",
-                    dtype=np.float16,
-                    shape=(n_total, int(comp.shape[1]), int(comp.shape[2])),
+                    part_path, mode="w+", dtype=dtype, shape=(n_total, *feats.shape[1:])
                 )
-            memmap[row : row + comp.shape[0]] = comp
-            row += comp.shape[0]
+            memmap[row : row + feats.shape[0]] = feats
+            row += feats.shape[0]
             all_item_ids.extend(ids)
             if (batch_idx + 1) % save_every == 0:
                 memmap.flush()
                 _save_progress(batch_idx)
 
         if memmap is None:
-            return np.empty((0, 0, self.native_dim), dtype=np.float16), all_item_ids
+            return np.empty(empty_shape, dtype=dtype), all_item_ids
         memmap.flush()
         _save_progress(-1)
         del memmap  # release the write mapping before reopening read-only
@@ -525,20 +557,7 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
         json_path = base.with_name(base.stem + "_ids.json")
 
         shape = tuple(components.shape)
-        source = getattr(components, "filename", None)
-        if source is not None and Path(source).name.endswith(".part.npy"):
-            source = Path(source)
-            del components  # drop the mapping before moving the file under it
-            try:
-                source.replace(npy_path)
-            except OSError:
-                # Cross-filesystem part file: fall back to a streamed copy.
-                atomic_np_save(np.load(source, mmap_mode="r"), npy_path)
-                source.unlink()
-            progress = source.with_name(source.name.replace(".part.npy", ".progress.json"))
-            progress.unlink(missing_ok=True)
-        else:
-            atomic_np_save(components, npy_path)
+        _finalise_array(components, npy_path)
 
         with open(json_path, "w") as f:
             json.dump(item_ids, f)
@@ -563,7 +582,7 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
         npy_path = base.with_suffix(".npy")
         json_path = base.with_name(base.stem + "_ids.json")
 
-        atomic_np_save(embeddings, npy_path)
+        _finalise_array(embeddings, npy_path)
         with open(json_path, "w") as f:
             json.dump(item_ids, f)
 

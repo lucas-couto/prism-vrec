@@ -8,6 +8,60 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.9.3] - 2026-09-02
+
+### Fixed
+
+- **DVBPR split parser dropped item id 0.** `_parse_split` in
+  `src/data/dvbpr.py` chained the `productid` lookups with `or`, so a
+  product id of `0` was falsy and silently discarded from every split.
+  Users whose held-out was item 0 vanished from `val.csv`/`test.csv`
+  (amazon_men: 55 users lost the item, 5 disappeared from test;
+  amazon_fashion: 1 user gone from test). The lookup now chains on
+  `is None` via `_product_id`. `data/processed/` must be regenerated;
+  every battery run before this fix used the truncated splits.
+- **Leave-one-out disjointness enforced on raw provider splits.**
+  `deduplicate_leave_one_out` (`src/utils/splits.py`) removes held-out
+  items from the user's training history, resolves an item held out for
+  both validation and test in favour of test, and drops users left with
+  no training history. Tradesy's DVBPR partition merges purchase and
+  "want" lists, so ~1.6k held-out pairs also sat in training and were
+  unhittable under the masked ranking (the user silently scored 0). The
+  clean Amazon partitions pass through untouched. Tradesy loses 5 users
+  that only had 2 distinct items.
+- **Pooled extraction streams to disk** (`src/extractors/base.py`). The
+  accumulate-and-pickle checkpoint OOM-killed the container on
+  amazon_women x resnet50 and left a 0-byte checkpoint that crashed the
+  next resume. With a `checkpoint_path` the pooled path now writes an
+  fp32 `<base>.part.npy` memmap with a progress sidecar, exactly like the
+  component path, and ignores stale or corrupt legacy checkpoints.
+- **VRAM sizing uses free memory, not total.** `detect_max_workers`
+  (`src/utils/parallel.py`) reads `torch.cuda.mem_get_info`, and
+  `main.py` releases the orchestrator's cached CUDA blocks between steps,
+  so training workers are budgeted from what is actually available.
+  `hp_search.workers` is pinned to 1 in `configs/recommenders.yaml`
+  after the 2026-08-29 OOM.
+- **VNPR evaluation chunk sized off free VRAM.** `_free_vram_chunk_pairs`
+  (`src/recommenders/vnpr.py`) budgets half of the free allowance per
+  eval call, capped by the static tier; online-fusion cells on
+  amazon_women OOMed with the static chunk. Scores are unchanged.
+- `docker-compose.yml` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  on both services to keep allocator fragmentation from turning the
+  full-ranking eval peaks on the large datasets into CUDA OOMs.
+
+### Changed
+
+- `common.early_stopping_patience` 20 -> 5 epochs (`configs/recommenders.yaml`):
+  with `eval_every_epochs: 10` the counter advances by 10 per validation,
+  so any non-improving validation now stops the run instead of two.
+
+### Added
+
+- `tests/test_dvbpr_parse_item_zero.py`, `tests/test_split_deduplication.py`,
+  `tests/test_pooled_streaming.py`, VNPR chunk-sizing cases in
+  `tests/recommenders/test_vnpr_factorized_eval.py`, and the free-VRAM
+  worker case in `tests/test_hp_search.py`.
+
 ## [2.9.2] - 2026-08-27
 
 ### Changed

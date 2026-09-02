@@ -60,6 +60,39 @@ def _predict_batch_chunk_pairs() -> int:
     return _PREDICT_BATCH_CHUNK_PAIRS
 
 
+def _free_vram_chunk_pairs(mlp: nn.Sequential, device: torch.device) -> int:
+    """Chunk size for one eval call, sized off VRAM that is free NOW.
+
+    The static tier in :func:`_autotune_chunk_pairs` assumes an
+    otherwise-lean process.  The online-fusion cells break that: the
+    resident component features and learned alignment left ~3 GB of
+    headroom while the 16 GB tier asked for a ~4 GB ``(b, N, h1)``
+    chunk (amazon_women OOM, 2026-08-31).  Budget = half of
+    min(card-free, allowance-free) so concurrent allocations and
+    allocator slack keep a margin; the tier stays as the upper cap.
+    The chunk size only affects batching, never the scores.
+    """
+    cap = _predict_batch_chunk_pairs()
+    if device.type != "cuda":
+        return cap
+    try:
+        from src.utils.device import vram_allowance_bytes
+
+        torch.cuda.empty_cache()
+        card_free, _ = torch.cuda.mem_get_info(device)
+        allowance_free = vram_allowance_bytes(device) - torch.cuda.memory_reserved(device)
+        budget = min(card_free, allowance_free) // 2
+    except (RuntimeError, AssertionError):
+        return cap
+    linears = [m for m in mlp if isinstance(m, nn.Linear)]
+    h1 = linears[0].out_features
+    h2 = linears[1].out_features if len(linears) > 1 else 1
+    # Peak live tensors per pair: hidden1 (h1) + its ReLU copy (h1) +
+    # the next linear's output (h2), each element_size bytes.
+    bytes_per_pair = linears[0].weight.element_size() * (2 * h1 + h2)
+    return max(1, min(cap, int(budget) // bytes_per_pair))
+
+
 class VNPR(BaseRecommender):
     """Neural pairwise ranking with visual features.
 
@@ -189,7 +222,7 @@ class VNPR(BaseRecommender):
         the per-pair work for layer 1 becomes a broadcast add, and the
         ``(b·N, 3k)`` concat materialisation disappears.  The remaining
         layers run on the chunked cartesian product as before, bounded by
-        :func:`_predict_batch_chunk_pairs`.
+        :func:`_free_vram_chunk_pairs`.
 
         NOTE: mathematically equivalent to the unfactored form but NOT
         bit-identical (two GEMMs + add reorders float reductions);
@@ -214,7 +247,7 @@ class VNPR(BaseRecommender):
             if cache_eligible:
                 self._item_first_layer_cache = item_first
 
-        users_per_chunk = max(1, _predict_batch_chunk_pairs() // max(N, 1))
+        users_per_chunk = max(1, _free_vram_chunk_pairs(self.mlp, u_u.device) // max(N, 1))
 
         out = torch.empty(B, N, device=u_u.device, dtype=u_u.dtype)
         for start in range(0, B, users_per_chunk):

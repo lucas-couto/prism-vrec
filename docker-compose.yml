@@ -42,6 +42,11 @@ services:
       XDG_CACHE_HOME: /app/.cache
       TORCH_HOME: /app/.cache/torch
       HF_HOME: /app/.cache/huggingface
+      # Full-ranking eval on the large datasets (amazon_women 347k /
+      # tradesy 326k items) peaks within ~600 MB of the 16 GB card;
+      # expandable segments keep allocator fragmentation from turning
+      # those peaks into CUDA OOMs (2026-08-31 crashes).
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     entrypoint: ["python", "main.py"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
@@ -155,6 +160,9 @@ services:
       XDG_CACHE_HOME: /app/.cache
       TORCH_HOME: /app/.cache/torch
       HF_HOME: /app/.cache/huggingface
+      # Same allocator setting as the pipeline service, so manual runs
+      # from the shell behave identically.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     entrypoint: ["bash"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the

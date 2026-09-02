@@ -112,7 +112,13 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
         )
 
     try:
-        total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+        # Free VRAM, not total: the orchestrating process (and anything
+        # else on the GPU) may still hold several GB from an earlier step,
+        # and workers sized from the total then OOM against each other.
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+        free_mb = free_bytes / (1024 * 1024)
+        total_mb = total_bytes / (1024 * 1024)
     except Exception as exc:
         logger.warning("VRAM detection failed (%s), defaulting to 2.", exc)
         return 2
@@ -120,12 +126,13 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
     # ~4 GB per worker: real models with 100K+ items need dedicated GPU bandwidth
     mb_per_worker = 4096
     margin_mb = 1024
-    available_mb = total_mb - margin_mb
+    available_mb = free_mb - margin_mb
     n_workers = max(1, int(available_mb / mb_per_worker))
     n_workers = min(n_workers, max(1, (os.cpu_count() or 4) - 1))
 
     logger.info(
-        "VRAM: total=%.0f MB, ~%d MB/worker, margin=%d MB → %d workers",
+        "VRAM: free=%.0f MB of %.0f MB, ~%d MB/worker, margin=%d MB → %d workers",
+        free_mb,
         total_mb,
         mb_per_worker,
         margin_mb,
