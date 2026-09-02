@@ -1,11 +1,111 @@
-"""VNPR -- Visual Neural Personalised Ranking.
+"""VNPR -- Visual Neural Personalized Ranking (Niu, Caverlee & Lu, 2018).
 
-Prediction rule:
-    v_i   = ReLU(W_v @ f_i + b_v)
-    x_ui  = concat(u_u, q_i, v_i)
-    y_hat = MLP(x_ui)              (scalar output)
+Reference
+---------
+Wei Niu, James Caverlee and Haokai Lu.  *Neural Personalized Ranking
+for Image Recommendation*.  Proceedings of the Eleventh ACM
+International Conference on Web Search and Data Mining (WSDM '18),
+Marina Del Rey, CA, USA, 2018, pp. 423-431.
+https://doi.org/10.1145/3159652.3159728
 
-The MLP has configurable hidden layers and uses ReLU activations.
+This module implements the visual variant VNPR (Section 5.2) of the
+NPR architecture (Sections 4.1-4.3).
+
+Architecture (Sections 4.1 and 5.2)
+-----------------------------------
+NPR is a *pairwise* neural network with two mirrored branches, one for
+the positive item ``i`` and one for the negative item ``j``.  The user
+embedding is shared by both branches; each branch owns its own item
+embedding table.  VNPR adds a second user embedding that lives in the
+image-feature space so the user can be matched against the raw image
+feature of each item::
+
+    p_h  = W_u[h]      ∈ R^k     user latent factors        (shared)
+    q_i  = W_i[i]      ∈ R^k     positive-branch item factors
+    q'_j = W_i'[j]     ∈ R^k     negative-branch item factors
+    v_h  = W_v[h]      ∈ R^dv    user *visual* factors      (shared)
+    f_i               ∈ R^dv    pre-extracted image feature (frozen)
+
+The paper transforms the USER into the dimension of the image feature
+and consumes ``f_i`` as is -- there is no transformation over the
+image.  Each branch merges user and item by element-wise product and
+concatenates the two products::
+
+    m'_hi = [ p_h ∘ q_i , v_h ∘ f_i ]                 ∈ R^{k+dv}      (Eq. 9)
+    r_hi  = ReLU( w^T m'_hi + b )                     one-neuron dense (Eq. 3)
+
+    r_hj  = ReLU( w^T [ p_h ∘ q'_j , v_h ∘ f_j ] + b )  mirrored branch
+
+The dense layer ``(w, b)`` is shared by the two branches.  Dropout is
+applied to the embedding vectors ``p_h``, ``q_i``, ``q'_j`` and ``v_h``
+during training only.
+
+Objective (Section 4.2)
+-----------------------
+The network is trained on the pairwise probability that user ``h``
+prefers ``i`` over ``j``, ``σ(r_hi - r_hj)``, with the negative
+log-likelihood plus an L2 penalty over the embedding matrices::
+
+    L = -Σ_(h,i,j) ln σ(r_hi - r_hj)
+        + λ ( ‖W_u‖² + ‖W_i‖² + ‖W_i'‖² + ‖W_v‖² )
+
+:meth:`BaseRecommender.bpr_loss` supplies ``-ln σ(r_pos - r_neg)``;
+the regulariser is delegated to the group machinery of the base class
+configured so that the WHOLE embedding matrices are penalised (see
+below).
+
+Inference (Section 4.3)
+-----------------------
+Both branches are scoring functions of the same form, so the paper
+feeds ``(h, i, i)`` to the network and averages the two outputs::
+
+    r̂_hi = ½ ( r_hi + r'_hi )
+
+:meth:`VNPR.predict` and :meth:`VNPR.predict_batch` implement this
+average.  ``predict_batch`` never materialises ``(B, N, k+dv)``: since
+``w^T [p∘q, v∘f] = (p ⊙ w_q)·q + (v ⊙ w_f)·f``, each branch is two GEMMs
+``(B,k)@(k,N)`` and ``(B,dv)@(dv,N)`` plus ``b`` followed by the ReLU.
+
+Fidelity to the paper
+---------------------
+Faithful:
+
+* shared user embedding + two item tables (mirrored branches);
+* user visual embedding in the raw image-feature dimension, image
+  feature used unchanged;
+* element-wise product merge, concatenation of the products, single
+  ReLU neuron shared by the branches;
+* pairwise ``-ln σ(r_hi - r_hj)`` objective;
+* L2 over the whole embedding matrices, dense layer unpenalised;
+* dropout on the embeddings, training only;
+* inference as the average of the two branches.
+
+Declared divergences:
+
+* **Regularisation is NOT BPR-Opt.**  Every other recommender in this
+  framework penalises only the embedding rows gathered by the batch
+  (BPR-Opt).  Here ``_L2_USER_TABLES = _L2_ITEM_TABLES = ()`` so the base
+  class penalises ``W_u``, ``W_i``, ``W_i'`` and ``W_v`` IN FULL every
+  step under the single ``l2_reg`` weight, as the paper's objective
+  states.  ``dense`` is excluded via ``_L2_UNREGULARIZED``.  A learned
+  online-fusion module, when present, is a framework-level component
+  and keeps the framework's default (penalised in the shared term).
+* **No learning-rate decay and no per-model patience.**  The paper
+  decays the learning rate and stops after 3 epochs without
+  improvement.  The early-stopping budget of this framework is shared
+  by every model of a dataset (``src/recommenders/hp_budget.py``
+  forbids per-model budget keys), so neither is reproduced here.
+* **Dropout rate is fixed in the config**, not searched: set
+  ``dropout`` (default ``0.0``) in ``configs/recommenders.yaml``.
+* Image features come from the framework's extractors (possibly fused)
+  instead of the paper's AlexNet features; ``dv`` follows the feature.
+* Negative sampling, optimiser and initialisation (Xavier-uniform for
+  the tables, zero bias) are the framework's, not the paper's.
+
+Config
+------
+``latent_dim`` (required) -- ``k``; ``dropout`` (optional, default 0)
+-- embedding dropout rate; ``l2_reg`` (optional, default 0) -- ``λ``.
 """
 
 from __future__ import annotations
@@ -17,100 +117,26 @@ import torch.nn as nn
 from src.recommenders.base import BaseRecommender
 
 
-def _autotune_chunk_pairs() -> int:
-    """Pick the (user, item) chunk size for full-ranking eval from VRAM.
-
-    Bounded peaks for an 8 GB / 16 GB / 24+ GB *allowance* when k=128
-    and hidden_layers up to [512, 256, 128].  The tiers key off this
-    process's VRAM allowance (``set_per_process_memory_fraction``-aware),
-    not the card total: a worker holding a third of the GPU sized its
-    (b, N, h1) eval chunk off the whole card and OOM'd (2026-08-24).
-    CPU and small-allowance hosts fall into the conservative tier.
-    """
-    try:
-        from src.utils.device import vram_allowance_bytes
-
-        allowance_gb = vram_allowance_bytes() / (1024**3)
-    except (RuntimeError, AssertionError):
-        return 500_000
-    if allowance_gb <= 0:
-        return 500_000
-
-    if allowance_gb < 12:
-        return 500_000
-    if allowance_gb < 24:
-        return 2_000_000
-    return 5_000_000
-
-
-_PREDICT_BATCH_CHUNK_PAIRS: int | None = None
-
-
-def _predict_batch_chunk_pairs() -> int:
-    """Cached chunk size, computed lazily on first use.
-
-    Deferred out of import time so that merely importing
-    ``src.recommenders`` does not touch the CUDA runtime (which can
-    misbehave in forked workers / under CUDA_VISIBLE_DEVICES). The chunk
-    size only affects batching, never the scores.
-    """
-    global _PREDICT_BATCH_CHUNK_PAIRS
-    if _PREDICT_BATCH_CHUNK_PAIRS is None:
-        _PREDICT_BATCH_CHUNK_PAIRS = _autotune_chunk_pairs()
-    return _PREDICT_BATCH_CHUNK_PAIRS
-
-
-def _free_vram_chunk_pairs(mlp: nn.Sequential, device: torch.device) -> int:
-    """Chunk size for one eval call, sized off VRAM that is free NOW.
-
-    The static tier in :func:`_autotune_chunk_pairs` assumes an
-    otherwise-lean process.  The online-fusion cells break that: the
-    resident component features and learned alignment left ~3 GB of
-    headroom while the 16 GB tier asked for a ~4 GB ``(b, N, h1)``
-    chunk (amazon_women OOM, 2026-08-31).  Budget = half of
-    min(card-free, allowance-free) so concurrent allocations and
-    allocator slack keep a margin; the tier stays as the upper cap.
-    The chunk size only affects batching, never the scores.
-    """
-    cap = _predict_batch_chunk_pairs()
-    if device.type != "cuda":
-        return cap
-    try:
-        from src.utils.device import vram_allowance_bytes
-
-        torch.cuda.empty_cache()
-        card_free, _ = torch.cuda.mem_get_info(device)
-        allowance_free = vram_allowance_bytes(device) - torch.cuda.memory_reserved(device)
-        budget = min(card_free, allowance_free) // 2
-    except (RuntimeError, AssertionError):
-        return cap
-    linears = [m for m in mlp if isinstance(m, nn.Linear)]
-    h1 = linears[0].out_features
-    h2 = linears[1].out_features if len(linears) > 1 else 1
-    # Peak live tensors per pair: hidden1 (h1) + its ReLU copy (h1) +
-    # the next linear's output (h2), each element_size bytes.
-    bytes_per_pair = linears[0].weight.element_size() * (2 * h1 + h2)
-    return max(1, min(cap, int(budget) // bytes_per_pair))
-
-
 class VNPR(BaseRecommender):
-    """Neural pairwise ranking with visual features.
+    """Visual Neural Personalized Ranking (see the module docstring).
 
     Parameters
     ----------
     n_users, n_items:
         Vocabulary sizes.
     visual_embeddings:
-        Pre-extracted visual features of shape ``(n_items, D_v)``.
+        Pre-extracted image features ``(n_items, dv)`` (or the 3-D /
+        ragged layouts the base class resolves through an online
+        fusion).  Required.
     config:
-        Must contain ``latent_dim`` (embedding size for users and items),
-        ``hidden_layers`` (list[int], e.g. ``[256, 128, 64]``).
-        ``l2_reg`` is optional (default 0).
+        ``latent_dim`` (required), ``dropout`` and ``l2_reg`` (optional).
     """
 
-    # BPR-Opt L2: base defaults gather the user/item rows (no item_bias
-    # table here — skipped automatically); the visual transform and the
-    # scoring MLP stay in the shared term (every triple touches them).
+    # Paper regularisation: whole embedding matrices under ``l2_reg``
+    # (shared term), nothing gathered per batch, dense layer free.
+    _L2_USER_TABLES: tuple[str, ...] = ()
+    _L2_ITEM_TABLES: tuple[str, ...] = ()
+    _L2_UNREGULARIZED: tuple[str, ...] = ("dense",)
 
     def __init__(
         self,
@@ -122,81 +148,51 @@ class VNPR(BaseRecommender):
         config = config or {}
         super().__init__(n_users, n_items, visual_embeddings, config)
 
-        k: int = config["latent_dim"]
-        hidden_layers: list[int] = config["hidden_layers"]
-
         if self.visual_features is None:
             raise RuntimeError("VNPR requires visual embeddings")
+
+        k: int = config["latent_dim"]
         dv: int = self.visual_dim_raw
+        self.latent_dim = k
 
-        self.user_embedding = nn.Embedding(n_users, k)  # u_u
-        self.item_embedding = nn.Embedding(n_items, k)  # q_i
+        self.user_embedding = nn.Embedding(n_users, k)  # W_u  -> p_h
+        self.item_embedding = nn.Embedding(n_items, k)  # W_i  -> q_i  (positive branch)
+        self.item_embedding_neg = nn.Embedding(n_items, k)  # W_i' -> q'_j (negative branch)
+        self.visual_user_embedding = nn.Embedding(n_users, dv)  # W_v  -> v_h
+        self.dense = nn.Linear(k + dv, 1)  # r = ReLU(w^T m' + b)
+        self.dropout = nn.Dropout(float(config.get("dropout", 0.0)))
 
-        # Visual transform: v_i = ReLU(W_v f_i + b_v)
-        self.visual_transform = nn.Linear(dv, k)
+        for table in (
+            self.user_embedding,
+            self.item_embedding,
+            self.item_embedding_neg,
+            self.visual_user_embedding,
+        ):
+            self._init_embedding(table)
+        nn.init.xavier_uniform_(self.dense.weight)
+        nn.init.zeros_(self.dense.bias)
 
-        # Scoring MLP: input is concat(u_u, q_i, v_i) -> dim = 3*k
-        layers: list[nn.Module] = []
-        in_dim = 3 * k
-        for h_dim in hidden_layers:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(nn.ReLU(inplace=True))
-            in_dim = h_dim
-        layers.append(nn.Linear(in_dim, 1))
-        self.mlp = nn.Sequential(*layers)
-
-        self._init_embedding(self.user_embedding)
-        self._init_embedding(self.item_embedding)
-        nn.init.xavier_uniform_(self.visual_transform.weight)
-        nn.init.zeros_(self.visual_transform.bias)
-        for module in self.mlp:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-
-        # Caches populated lazily during evaluation and invalidated on
-        # every train() call: [q_i, v_i] for the full catalogue, and the
-        # item-side half of the first MLP layer (see predict_batch).
-        self._item_feats_cache: torch.Tensor | None = None
-        self._item_first_layer_cache: torch.Tensor | None = None
+        # Full-catalogue image features, cached in eval only (no online
+        # fusion) and invalidated by every train() call.
+        self._catalogue_visual_cache: torch.Tensor | None = None
 
     def train(self, mode: bool = True) -> VNPR:
-        self._item_feats_cache = None
-        self._item_first_layer_cache = None
+        self._catalogue_visual_cache = None
         return super().train(mode)
 
-    def _item_feats(self, item_ids: torch.Tensor) -> torch.Tensor:
-        """Return concat([q_i, v_i]) for the given items, with caching.
-
-        When called with the full catalogue the result is cached and
-        reused across calls until the next ``train()`` toggle.  Cache
-        is bypassed when an online fusion is active because the gate
-        depends on trainable parameters.
-        """
-        cache_eligible = self._online_fusion is None
-        if (
-            cache_eligible
-            and self._item_feats_cache is not None
-            and item_ids.shape[0] == self.n_items
-        ):
-            return self._item_feats_cache
-        q_i = self.item_embedding(item_ids)
-        f_i = self._resolve_visual(item_ids)
-        v_i = torch.relu(self.visual_transform(f_i))
-        feats = torch.cat([q_i, v_i], dim=-1)
-        if cache_eligible and item_ids.shape[0] == self.n_items:
-            self._item_feats_cache = feats
-        return feats
-
-    def _score(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
-        """Compute scalar scores for (user, item) pairs."""
-        u_u = self.user_embedding(user_ids)
-        q_i = self.item_embedding(item_ids)
-        f_i = self._resolve_visual(item_ids)
-        v_i = torch.relu(self.visual_transform(f_i))
-
-        x_ui = torch.cat([u_u, q_i, v_i], dim=-1)
-        return self.mlp(x_ui).squeeze(-1)
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+    def _branch(
+        self,
+        p: torch.Tensor,
+        q: torch.Tensor,
+        v: torch.Tensor,
+        f: torch.Tensor,
+    ) -> torch.Tensor:
+        """``ReLU(w^T [p ∘ q, v ∘ f] + b)`` for aligned ``(B, ·)`` tensors."""
+        merged = torch.cat([p * q, v * f], dim=-1)
+        return torch.relu(self.dense(merged)).squeeze(-1)
 
     def forward(
         self,
@@ -204,57 +200,64 @@ class VNPR(BaseRecommender):
         pos_item_ids: torch.Tensor,
         neg_item_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        score_pos = self._score(user_ids, pos_item_ids)
-        score_neg = self._score(user_ids, neg_item_ids)
-        return score_pos, score_neg
+        """``(r_pos, r_neg)``: positive branch on ``W_i``, negative on ``W_i'``."""
+        p = self.dropout(self.user_embedding(user_ids))
+        v = self.dropout(self.visual_user_embedding(user_ids))
+        q_pos = self.dropout(self.item_embedding(pos_item_ids))
+        q_neg = self.dropout(self.item_embedding_neg(neg_item_ids))
+        f_pos = self._resolve_visual(pos_item_ids)
+        f_neg = self._resolve_visual(neg_item_ids)
+        return self._branch(p, q_pos, v, f_pos), self._branch(p, q_neg, v, f_neg)
 
     def predict(self, user_id: int, item_ids: torch.Tensor) -> torch.Tensor:
+        """``½ (r_ui + r'_ui)`` -- both branches fed ``(u, i, i)`` (Section 4.3)."""
         n = item_ids.shape[0]
         user_ids = torch.full((n,), user_id, dtype=torch.long, device=item_ids.device)
-        return self._score(user_ids, item_ids)
+        p = self.user_embedding(user_ids)
+        v = self.visual_user_embedding(user_ids)
+        f = self._resolve_visual(item_ids)
+        r_pos = self._branch(p, self.item_embedding(item_ids), v, f)
+        r_neg = self._branch(p, self.item_embedding_neg(item_ids), v, f)
+        return 0.5 * (r_pos + r_neg)
 
     def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
-        """Score every (user, item) pair in the cartesian product.
+        """Score the cartesian product ``(B, N)`` without a ``(B, N, k+dv)`` tensor.
 
-        The first MLP layer is factored: ``W1·[u; q; v] + b1`` splits into
-        a user half ``W1u·u`` (computed once per user) and an item half
-        ``W1qv·[q; v] + b1`` (computed ONCE PER EVALUATION and cached) —
-        the per-pair work for layer 1 becomes a broadcast add, and the
-        ``(b·N, 3k)`` concat materialisation disappears.  The remaining
-        layers run on the chunked cartesian product as before, bounded by
-        :func:`_free_vram_chunk_pairs`.
-
-        NOTE: mathematically equivalent to the unfactored form but NOT
-        bit-identical (two GEMMs + add reorders float reductions);
-        rankings are validated unchanged in the tests.
+        ``w^T [p∘q, v∘f] = (p ⊙ w_q)·q + (v ⊙ w_f)·f``: the visual term
+        and the bias are shared by the two branches, each branch adds
+        its own ``(B,k)@(k,N)`` item GEMM before the ReLU, and the two
+        are averaged.  Mathematically identical to :meth:`predict`
+        (float reductions are reordered, so not bit-identical).
         """
-        B = user_ids.shape[0]
-        N = item_ids.shape[0]
-        k = self.user_embedding.embedding_dim
+        k = self.latent_dim
+        w = self.dense.weight.squeeze(0)
+        w_q, w_f = w[:k], w[k:]
 
-        first: nn.Linear = self.mlp[0]
-        rest = self.mlp[1:]  # ReLU + remaining layers
+        p = self.user_embedding(user_ids) * w_q  # (B, k)
+        v = self.visual_user_embedding(user_ids) * w_f  # (B, dv)
+        f = self._catalogue_visual(item_ids)  # (N, dv)
 
-        u_u = self.user_embedding(user_ids)
-        user_first = u_u @ first.weight[:, :k].T  # (B, h1)
+        visual_term = v @ f.T + self.dense.bias  # (B, N)
+        r_pos = torch.relu(p @ self.item_embedding(item_ids).T + visual_term)
+        r_neg = torch.relu(p @ self.item_embedding_neg(item_ids).T + visual_term)
+        return 0.5 * (r_pos + r_neg)
 
-        cache_eligible = self._online_fusion is None and item_ids.shape[0] == self.n_items
-        if cache_eligible and self._item_first_layer_cache is not None:
-            item_first = self._item_first_layer_cache
-        else:
-            item_feats = self._item_feats(item_ids)  # (N, 2k)
-            item_first = item_feats @ first.weight[:, k:].T + first.bias  # (N, h1)
-            if cache_eligible:
-                self._item_first_layer_cache = item_first
+    def _catalogue_visual(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Image features of ``item_ids``, cached for the full catalogue.
 
-        users_per_chunk = max(1, _free_vram_chunk_pairs(self.mlp, u_u.device) // max(N, 1))
-
-        out = torch.empty(B, N, device=u_u.device, dtype=u_u.dtype)
-        for start in range(0, B, users_per_chunk):
-            end = min(start + users_per_chunk, B)
-            b = end - start
-
-            hidden1 = user_first[start:end].unsqueeze(1) + item_first.unsqueeze(0)  # (b, N, h1)
-            scores = rest(hidden1.reshape(b * N, -1)).squeeze(-1)
-            out[start:end] = scores.view(b, N)
-        return out
+        The cache is used only in eval mode, without an online fusion
+        (whose output depends on trainable parameters) and when
+        ``item_ids`` is exactly ``arange(n_items)``.
+        """
+        cacheable = (
+            not self.training
+            and self._online_fusion is None
+            and item_ids.shape[0] == self.n_items
+            and bool(torch.equal(item_ids, torch.arange(self.n_items, device=item_ids.device)))
+        )
+        if cacheable and self._catalogue_visual_cache is not None:
+            return self._catalogue_visual_cache
+        f = self._resolve_visual(item_ids)
+        if cacheable:
+            self._catalogue_visual_cache = f
+        return f

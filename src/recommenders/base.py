@@ -68,12 +68,26 @@ class BaseRecommender(nn.Module, abc.ABC):
     #: positive and the negative item ids.  Missing attributes are
     #: skipped, so a model lacking e.g. ``item_bias`` needs no override.
     #: ``_L2_EXTRA_GATHERED_TABLES`` names tables whose rows are gathered
-    #: by a model-specific :meth:`_l2_gathered_rows` override — listing
+    #: by a model-specific :meth:`_l2_gathered_terms` override — listing
     #: them here only excludes their full weight matrix from the
     #: shared-parameter term.
     _L2_USER_TABLES: tuple[str, ...] = ("user_embedding",)
     _L2_ITEM_TABLES: tuple[str, ...] = ("item_embedding", "item_bias")
     _L2_EXTRA_GATHERED_TABLES: tuple[str, ...] = ()
+
+    #: ``λ`` config key per parameter group, so each model reproduces the
+    #: regularisation its paper declares.  Keys are an attribute name or
+    #: an ``(attribute, role)`` pair with role ``"user"`` / ``"pos"`` /
+    #: ``"neg"`` (gathered rows) or ``"shared"`` (dense parameters);
+    #: anything unlisted uses the single ``"l2_reg"`` key.
+    _L2_LAMBDA_KEYS: dict[str | tuple[str, str], str] = {}
+    #: Value of a ``λ`` key absent from the config (e.g. VBPR's
+    #: ``λ_E = 0``); keys absent here too fall back to ``config["l2_reg"]``.
+    _L2_LAMBDA_DEFAULTS: dict[str, float] = {}
+    #: Top-level attribute names (parameters or submodules) excluded from
+    #: every L2 term — e.g. ACF's attention nets, which its objective
+    #: (Eq. 5) leaves unpenalised.
+    _L2_UNREGULARIZED: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -228,32 +242,36 @@ class BaseRecommender(nn.Module, abc.ABC):
         ...
 
     def bpr_loss(self, score_pos: torch.Tensor, score_neg: torch.Tensor) -> torch.Tensor:
-        """BPR pairwise loss with BPR-Opt L2 regularisation.
+        """BPR pairwise loss plus the model's L2 regulariser.
 
         .. math::
             \\mathcal{L} = -\\frac{1}{N}\\sum_{(u,i,j)}
             \\log\\sigma(\\hat y_{ui} - \\hat y_{uj})
-            + \\lambda \\Big( \\frac{1}{N}\\sum_{(u,i,j)}
-            \\|\\theta_{(u,i,j)}\\|^2 + \\|\\Theta_{shared}\\|^2 \\Big)
+            + \\sum_g \\lambda_g \\Big( \\frac{1}{N}\\sum_{(u,i,j)}
+            \\|\\theta^{g}_{(u,i,j)}\\|^2 + \\|\\Theta^{g}_{shared}\\|^2 \\Big)
 
-        Following the cited BPR-Opt (Rendle et al., 2009), the L2 term
-        penalises only the parameters *touched* by each sampled triple
-        ``(u, i, j)``:
+        Following BPR-Opt (Rendle et al., 2009), the L2 term penalises
+        the parameters *touched* by each sampled triple ``(u, i, j)``:
 
         * ``θ_(u,i,j)`` — the embedding rows gathered for the triple
-          (user row, positive/negative item rows, their biases, plus
-          model-specific per-row extras such as visual-user rows,
-          category rows, or ACF history rows).  Their squared norms are
-          summed *as gathered* and mean-reduced over the ``N`` triples,
-          matching the mean-reduced log-loss.  A row appearing in two
-          triples of the batch is therefore penalised once per
-          occurrence — the natural per-triple reading of BPR-Opt.
+          (user row, positive/negative item rows, plus model-specific
+          per-row extras such as visual-user rows, category rows, or
+          ACF history rows).  Their squared norms are summed *as
+          gathered* and mean-reduced over the ``N`` triples, matching
+          the mean-reduced log-loss.  A row appearing in two triples of
+          the batch is therefore penalised once per occurrence.
         * ``Θ_shared`` — dense parameters that participate in *every*
           triple's score function (visual projections, MLPs, attention
           nets, online-fusion modules).  These are penalised in full
-          each step, which is faithful to BPR-Opt's "parameters of the
-          score function for this triple" because every triple touches
-          all of them.
+          each step.
+
+        Every parameter group ``g`` carries its own constant
+        ``λ_g`` so each model reproduces the regularisation its paper
+        declares (BPR-MF's ``λ_W / λ_H+ / λ_H-``, VBPR's ``λ_Θ / λ_β /
+        λ_E``, ACF's unpenalised attention nets, ...): see
+        :attr:`_L2_LAMBDA_KEYS`, :attr:`_L2_LAMBDA_DEFAULTS` and
+        :attr:`_L2_UNREGULARIZED`.  The single ``l2_reg`` key remains
+        the default group every other key falls back to.
 
         The gathered term needs the ``(user, pos, neg)`` index batch of
         the preceding forward call — recorded transparently by a forward
@@ -264,61 +282,79 @@ class BaseRecommender(nn.Module, abc.ABC):
         # -ln σ(x̂_uij): the old log(sigmoid(x)+1e-10) saturated at ≈23
         # for strongly-wrong pairs and ZEROED their gradient (F9).
         bpr = -torch.nn.functional.logsigmoid(score_pos - score_neg).mean()
-        reg = self.config.get("l2_reg", 0.0) * self.l2_reg()
-        return bpr + reg
+        return bpr + self.l2_reg()
 
     def l2_reg(self) -> torch.Tensor:
-        """BPR-Opt regulariser: batch-gathered rows plus shared params.
+        """Weighted BPR-Opt regulariser: ``Σ_g λ_g (gathered_g / N + shared_g)``.
 
-        Returns ``Σ‖gathered rows‖² / batch_size + Σ‖shared params‖²``
-        (see :meth:`bpr_loss` for the exact reading).  Without a
-        recorded batch only the shared term is returned.  The recorded
-        batch is CONSUMED: a second call without a new forward falls
-        back to the shared term instead of silently reusing a stale
-        batch (R11).
+        Without a recorded batch only the shared terms are returned.  The
+        recorded batch is CONSUMED: a second call without a new forward
+        falls back to the shared terms instead of silently reusing a
+        stale batch (R11).
         """
-        reg = self._l2_shared()
+        reg = torch.tensor(0.0, device=self._device())
+        for key, term in self._l2_shared_terms():
+            reg = reg + self._l2_lambda(key) * term
         batch, self._last_batch = self._last_batch, None
         if batch is None:
             return reg
         user_ids, pos_item_ids, neg_item_ids = batch
-        rows = self._l2_gathered_rows(user_ids, pos_item_ids, neg_item_ids)
-        if not rows:
-            return reg
-        gathered = torch.stack([row.pow(2).sum() for row in rows]).sum()
-        return reg + gathered / user_ids.shape[0]
+        batch_size = user_ids.shape[0]
+        for key, rows in self._l2_gathered_terms(user_ids, pos_item_ids, neg_item_ids):
+            reg = reg + self._l2_lambda(key) * rows.pow(2).sum() / batch_size
+        return reg
 
-    def _l2_gathered_rows(
+    def _l2_lambda_key(self, name: str, role: str) -> str:
+        """Config key of the ``λ`` governing ``name`` in ``role``.
+
+        ``role`` is ``"user"`` / ``"pos"`` / ``"neg"`` for gathered rows
+        and ``"shared"`` for dense parameters.  Lookup order:
+        ``(name, role)`` → ``name`` → ``"l2_reg"``.
+        """
+        keys = self._L2_LAMBDA_KEYS
+        return keys.get((name, role), keys.get(name, "l2_reg"))
+
+    def _l2_lambda(self, key: str) -> float:
+        """Value of the ``λ`` under ``key``: config → class default → ``l2_reg``."""
+        if key in self.config:
+            return float(self.config[key])
+        if key in self._L2_LAMBDA_DEFAULTS:
+            return float(self._L2_LAMBDA_DEFAULTS[key])
+        return float(self.config.get("l2_reg", 0.0))
+
+    def _l2_gathered_terms(
         self,
         user_ids: torch.Tensor,
         pos_item_ids: torch.Tensor,
         neg_item_ids: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        """Embedding rows touched by the batch, penalised as gathered.
+    ) -> list[tuple[str, torch.Tensor]]:
+        """``(λ key, rows)`` pairs of the embedding rows touched by the batch.
 
         Default: rows of :attr:`_L2_USER_TABLES` for the batch users and
         rows of :attr:`_L2_ITEM_TABLES` for the positive and negative
         items.  Models with additional per-triple rows (e.g. category or
         history rows) extend the returned list.
         """
-        rows: list[torch.Tensor] = []
+        terms: list[tuple[str, torch.Tensor]] = []
         for name in self._L2_USER_TABLES:
             table = getattr(self, name, None)
             if table is not None:
-                rows.append(table(user_ids))
+                terms.append((self._l2_lambda_key(name, "user"), table(user_ids)))
         for name in self._L2_ITEM_TABLES:
             table = getattr(self, name, None)
             if table is not None:
-                rows.append(table(pos_item_ids))
-                rows.append(table(neg_item_ids))
-        return rows
+                terms.append((self._l2_lambda_key(name, "pos"), table(pos_item_ids)))
+                terms.append((self._l2_lambda_key(name, "neg"), table(neg_item_ids)))
+        return terms
 
-    def _l2_shared(self) -> torch.Tensor:
-        """Sum of squared norms of dense params shared by every triple.
+    def _l2_shared_terms(self) -> list[tuple[str, torch.Tensor]]:
+        """``(λ key, ‖param‖²)`` for every dense parameter shared by all triples.
 
         Every trainable parameter except the weight matrices of the
-        row-gathered embedding tables (those are penalised per batch row
-        in :meth:`_l2_gathered_rows`).
+        row-gathered embedding tables (penalised per batch row in
+        :meth:`_l2_gathered_terms`) and anything under
+        :attr:`_L2_UNREGULARIZED`.  The key is resolved from the
+        parameter's top-level attribute name with role ``"shared"``.
         """
         gathered_names = (
             *self._L2_USER_TABLES,
@@ -330,11 +366,15 @@ class BaseRecommender(nn.Module, abc.ABC):
             table = getattr(self, name, None)
             if table is not None:
                 excluded.add(id(table.weight))
-        reg = torch.tensor(0.0, device=self._device())
-        for param in self.parameters():
-            if param.requires_grad and id(param) not in excluded:
-                reg = reg + param.pow(2).sum()
-        return reg
+        terms: list[tuple[str, torch.Tensor]] = []
+        for full_name, param in self.named_parameters():
+            top = full_name.split(".", 1)[0]
+            if not param.requires_grad or id(param) in excluded:
+                continue
+            if top in self._L2_UNREGULARIZED:
+                continue
+            terms.append((self._l2_lambda_key(top, "shared"), param.pow(2).sum()))
+        return terms
 
     def save_checkpoint(
         self,

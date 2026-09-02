@@ -68,3 +68,46 @@ def test_item_attention_empty_history_returns_zero() -> None:
     )
 
     assert torch.allclose(out, torch.zeros(2, 4))
+
+
+def test_item_attention_returns_alpha_weighted_aux_only() -> None:
+    """Eq. 6: the profile term is ``Σ α p_l``; ``v_l`` / ``x̄_l`` only feed the energy."""
+    torch.manual_seed(2)
+    latent, hidden, batch, horizon = 4, 6, 3, 5
+    att = ItemAttention(latent, hidden)
+    gamma_u = torch.randn(batch, latent)
+    gamma_h = torch.randn(batch, horizon, latent)
+    p_h = torch.randn(batch, horizon, latent)
+    v_h = torch.randn(batch, horizon, latent)
+    mask = torch.ones(batch, horizon, dtype=torch.bool)
+
+    out = att(gamma_u, gamma_h, p_h, v_h, mask)
+    query = att.user(gamma_u).unsqueeze(1)
+    energy = att.score(torch.relu(query + att.item(gamma_h) + att.aux(p_h) + att.vis(v_h)))
+    alpha = torch.softmax(energy, dim=1)
+    expected = (alpha * p_h).sum(dim=1)
+
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_item_attention_with_constant_energy_is_the_history_mean_of_aux() -> None:
+    torch.manual_seed(3)
+    latent, hidden, batch, horizon = 4, 6, 2, 5
+    att = ItemAttention(latent, hidden)
+    with torch.no_grad():
+        att.score.weight.zero_()
+        att.score.bias.zero_()
+    p_h = torch.randn(batch, horizon, latent)
+    mask = torch.ones(batch, horizon, dtype=torch.bool)
+    mask[1, 3:] = False  # user 1 holds 3 items
+
+    out = att(
+        torch.randn(batch, latent),
+        torch.randn(batch, horizon, latent),
+        p_h,
+        torch.randn(batch, horizon, latent),
+        mask,
+    )
+
+    assert torch.allclose(out[0], p_h[0].mean(dim=0), atol=1e-6)
+    assert torch.allclose(out[1], p_h[1, :3].mean(dim=0), atol=1e-6)

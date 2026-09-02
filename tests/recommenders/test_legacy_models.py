@@ -29,8 +29,8 @@ MODELS = {
         {"latent_dim": 4, "visual_dim": 5, "att_hidden": 6, "l2_reg": 1e-4},
         True,
     ),
-    "deepstyle": (DeepStyle, {"latent_dim": 4, "style_dim": 5, "l2_reg": 1e-4}, True),
-    "vnpr": (VNPR, {"latent_dim": 4, "hidden_layers": [6], "l2_reg": 1e-4}, True),
+    "deepstyle": (DeepStyle, {"latent_dim": 4, "l2_reg": 1e-4}, True),
+    "vnpr": (VNPR, {"latent_dim": 4, "l2_reg": 1e-4}, True),
 }
 
 

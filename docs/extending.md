@@ -218,7 +218,8 @@ Plus the metadata supplied at registration:
 | --- | --- |
 | `priority` | Schedule order (lower = earlier). Cheap models first. |
 | `requires_visual` | `False` for plain BPR; runs only in the `frozen` condition with `embedding_name="none"`. |
-| `uses_visual_dim` | Adds `common.visual_dim` to the hyperparameter grid. |
+| `uses_visual_dim` | The model has a `visual_dim` hyperparameter (derived from `common.total_dim`). |
+| `dim_split` | How `common.total_dim` (T) becomes the model's dimensions: `"latent"` (latent_dim = T, visual_dim = T when used) or `"half"` (T/2 + T/2, the VBPR split). Enforces dimension parity across recommenders. |
 | `extra_hyperparam_keys` | Tuple of keys read from `configs/recommenders.yaml -> <name>:`. Each value may be a scalar or a list (becomes a Cartesian dimension in the grid). |
 | `requires_components` | `True` to consume 3-D per-item component embeddings (`*_comp` artifacts) instead of pooled 2-D ones. The train/eval enumeration routes `_comp` artifacts only to such models. See § 3.4. |
 
