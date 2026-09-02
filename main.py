@@ -156,6 +156,26 @@ def _slice_steps(start: str | None, stop: str | None) -> list[str]:
     return STEP_ORDER[start_idx : stop_idx + 1]
 
 
+def _release_gpu_memory() -> None:
+    """Drop cached CUDA blocks held by this process before the next step.
+
+    Steps such as ``extract`` and ``fuse`` leave the orchestrating process
+    holding several GB of cached VRAM; ``train`` then spawns workers that
+    have to share what is left.  Freeing the cache here keeps the parent's
+    footprint out of the workers' budget.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - torch missing or CUDA broken
+        return
+
+
 def _run_step(name: str, condition: str | None) -> None:
     """Invoke a step, passing ``condition`` only when the step accepts it."""
     from src.utils import telemetry
@@ -164,6 +184,7 @@ def _run_step(name: str, condition: str | None) -> None:
     fn = STEP_FUNCTIONS[name]
     label = name if name not in CONDITION_STEPS else f"{name} ({condition})"
     logger.info("===== %s =====", label)
+    _release_gpu_memory()
     started_iso = now_iso()
     started = time.time()
     marker = telemetry.mark()

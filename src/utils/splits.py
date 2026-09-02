@@ -13,6 +13,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def train_item_indices(processed_dir: str | Path, dataset_name: str) -> list[int]:
     """Item indices with at least one *training* interaction.
@@ -68,3 +72,70 @@ def assert_holdout_disjoint(
         f"ranking, so these held-outs can never be hit and the affected "
         f"users would silently score 0. Deduplicate the splits upstream."
     )
+
+
+def deduplicate_leave_one_out(
+    train: dict[int, set[int]],
+    validation: dict[int, set[int]],
+    test: dict[int, set[int]],
+    dataset_name: str,
+) -> tuple[dict[int, set[int]], dict[int, set[int]], dict[int, set[int]]]:
+    """Enforce leave-one-out disjointness on raw provider splits.
+
+    Some pre-packaged partitions list the same ``(user, item)`` pair more
+    than once — Tradesy in the DVBPR bundle merges a user's purchase and
+    "want" lists, so an item held out for validation/test can still sit
+    in that user's training history.  Under a masked top-N protocol the
+    held-out item is then unhittable and the user silently scores 0
+    (see :func:`assert_holdout_disjoint`).
+
+    The pair is resolved in favour of the *held-out* split, which is what
+    leave-one-out means: an evaluated item must not have been seen.
+
+    1. ``test`` wins over ``validation``: an item held out for both is
+       dropped from validation, so the final evaluation is never masked
+       by the selection split.
+    2. Held-out items are removed from the user's training history.
+    3. Users left with an empty training history are dropped from every
+       split — an untrained user embedding cannot be ranked fairly.
+
+    Clean partitions pass through untouched and log nothing.
+
+    :param train: Per-user training items.
+    :param validation: Per-user validation items.
+    :param test: Per-user test items.
+    :param dataset_name: For the log line.
+    :returns: The ``(train, validation, test)`` triple, deduplicated.
+    """
+    n_validation = sum(len(items) for items in validation.values())
+    validation = {user: items - test.get(user, set()) for user, items in validation.items()}
+    validation = {user: items for user, items in validation.items() if items}
+    val_removed = n_validation - sum(len(items) for items in validation.values())
+
+    clean_train = {
+        user: items - validation.get(user, set()) - test.get(user, set())
+        for user, items in train.items()
+    }
+    cold_users = {user for user, items in clean_train.items() if not items}
+    clean_train = {user: items for user, items in clean_train.items() if items}
+
+    removed = sum(len(items) for items in train.values()) - sum(
+        len(items) for items in clean_train.values()
+    )
+    if removed == 0 and val_removed == 0 and not cold_users:
+        return train, validation, test
+
+    validation = {u: i for u, i in validation.items() if u in clean_train}
+    test = {u: i for u, i in test.items() if u in clean_train}
+
+    logger.warning(
+        "%s: deduplicated leave-one-out splits — removed %d training "
+        "interaction(s) that were also held out, %d validation item(s) that "
+        "were also the user's test item, and dropped %d user(s) left without "
+        "any training history.",
+        dataset_name,
+        removed,
+        val_removed,
+        len(cold_users),
+    )
+    return clean_train, validation, test

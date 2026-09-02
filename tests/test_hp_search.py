@@ -206,3 +206,24 @@ class TestResolveOptunaWorkers:
         from src.steps.train import _resolve_optuna_workers
 
         assert _resolve_optuna_workers(0, "cpu", n_cells=4) >= 1
+
+
+class TestDetectMaxWorkersUsesFreeVram:
+    """Regression for the 2026-08-29 OOM: workers were sized from total VRAM
+    while the parent process still held ~7 GB, so three workers fought over
+    the remaining eight."""
+
+    def test_should_size_workers_from_free_vram_not_total(self, monkeypatch):
+        import torch
+
+        from src.utils import parallel
+
+        gib = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _i=0: (8 * gib, 16 * gib))
+        monkeypatch.setattr(parallel, "plan_pool_workers", lambda **kw: kw["hard_cap"])
+
+        n = parallel.detect_max_workers("cuda")
+
+        assert n == 1  # (8 GB - 1 GB margin) // 4 GB
