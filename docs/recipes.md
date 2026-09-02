@@ -380,7 +380,7 @@ recommenders_enabled:
 
 acf:
   att_hidden: [64, 128]
-  max_history: [50]             # H: items per user profile (item-level attention)
+  max_history: [50]             # H: seeded uniform subsample of the profile when larger; null = full
 ```
 
 ```bash

@@ -8,6 +8,83 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-09-02
+
+Every built-in recommender now reproduces its paper's score and
+regularisation, and all recommenders draw their dimensions from one
+shared budget. Checkpoints and results from earlier versions are not
+comparable with runs after this release; the battery must be retrained.
+
+### Changed
+
+- **Dimension parity.** `common.total_dim` replaces `common.latent_dim`
+  / `common.visual_dim`. Each recommender derives its own dimensions
+  through `RecommenderSpec.dim_split` (`latent`: `latent_dim = T`;
+  `half`: `latent_dim = visual_dim = T/2`, the VBPR 50/50 split), so the
+  BPR-vs-visual comparison (H1) controls capacity as in He & McAuley's
+  baseline protocol. `assert_dimension_parity` refuses a direct
+  `latent_dim` / `visual_dim` in `common:`, a model block or an
+  `hp_space` before training starts. `get_hyperparam_grid` now lives
+  only in `src/recommenders/hp_search.py` (the `train.py` duplicate is
+  gone) and expands `total_dim` for both grid and Optuna.
+- **Per-group L2 regularisation** (`src/recommenders/base.py`).
+  `_L2_LAMBDA_KEYS` maps a table or `(table, role)` to a config key,
+  `_L2_LAMBDA_DEFAULTS` supplies paper defaults, `_L2_UNREGULARIZED`
+  excludes modules; `_l2_gathered_terms` / `_l2_shared_terms` return
+  `(key, tensor)` pairs and `l2_reg()` is the already-weighted penalty
+  (`bpr_loss = bpr + l2_reg()`). Unlisted parameters keep the single
+  `l2_reg`.
+- **BPR** is BPR-MF (Rendle et al. 2009, §4.3.1): `γ_u^T γ_i`, no item
+  bias; `λ_W` (`l2_reg`), `λ_H+` (`l2_reg_item_pos`), `λ_H−`
+  (`l2_reg_item_neg`).
+- **VBPR / AVBPR** carry the visual bias `β'^T f_i` of Eq. 4
+  (`visual_bias`, zero-initialised, dimension of the native feature),
+  with `λ_E = 0` by default (`l2_reg_projection`) and `λ_β`
+  (`l2_reg_visual_bias`). AVBPR mirrors VBPR so attention stays the only
+  difference between them.
+- **DeepStyle** follows Eqs. 2–3 and 6 (Liu et al. 2017): one user vector
+  `p_u`, one `d = latent_dim` (`style_dim` is refused when it differs),
+  no item bias, single `λ`. On Tradesy it degenerates into a restricted
+  VBPR (`γ_u ≡ θ_u`, no `β_i`, no `β'`), which the paired test now
+  states explicitly.
+- **ACF** follows Eq. 6 (Chen et al. 2017): `(γ_u + Σ α(u,l) p_l)^T γ_j`,
+  no visual term in the score, no item bias; the attention nets and
+  projections are unpenalised (Eq. 5); `predict_batch` is a single GEMM
+  (tiling and `_comp_hidden_cache` removed). With uniform attention the
+  model degenerates into SVD++ (tested). `max_history` accepts `null`
+  (full history) and, when the history exceeds it, subsamples
+  **uniformly with a seed** (`history_seed` = the run seed, injected by
+  train and evaluate) instead of keeping the lowest item indices, which
+  correlate with popularity in the DVBPR splits.
+- **VNPR** is the NPR/VNPR architecture (Niu, Caverlee & Lu 2018):
+  user/item embeddings merged by Hadamard product, the user's visual
+  vector `v_u ∈ R^{D_v}` multiplied element-wise by the raw image
+  feature, concatenation of the two products into a single-neuron ReLU
+  dense layer, mirrored item tables `W_i` / `W_i'` for the two branches,
+  `½(r + r')` at inference, optional embedding dropout (`vnpr.dropout`),
+  L2 over the whole embedding matrices. The MLP-over-concatenation
+  model, `hidden_layers`, the VRAM chunk helpers and the Optuna warning
+  filter in `main.py` are gone. Learning-rate decay and a per-model
+  patience are deliberately not reproduced: the early-stopping budget
+  is shared per dataset (`hp_budget`).
+- `LinearVisualScoreMixin` gained neutral hooks `_item_bias_term` and
+  `_item_visual_bias`, and its full-catalogue cache
+  (`_full_catalog_lookup`) only serves eval lookups over
+  `arange(n_items)` — a training batch or an eval `forward` of that
+  length can no longer poison it.
+- Registry: `register_recommender(..., dim_split=...)`; the built-ins
+  declare their `λ` keys as `extra_hyperparam_keys`. Grid sizes: BPR,
+  VBPR, VNPR, DeepStyle 8; AVBPR, ACF 16.
+
+### Added
+
+- `tests/test_dimension_parity.py`, `tests/recommenders/test_vbpr_visual_bias.py`,
+  `tests/recommenders/test_vnpr_paper.py` (replaces
+  `test_vnpr_factorized_eval.py`), and the rewritten
+  `test_recommender_bpr_loss.py`, `test_deepstyle_paper.py`,
+  `test_acf_model.py`, `test_acf_attention.py`,
+  `test_acf_vectorized_eval.py`.
+
 ## [2.9.3] - 2026-09-02
 
 ### Fixed

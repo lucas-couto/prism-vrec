@@ -354,10 +354,15 @@ class CommonTrainingConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    latent_dim: list[int] | int = Field(default_factory=lambda: [64])
+    #: Shared dimension budget T: every recommender derives its own
+    #: latent_dim / visual_dim from it (RecommenderSpec.dim_split), so
+    #: the central comparison controls capacity.  ``latent_dim`` /
+    #: ``visual_dim`` remain only for legacy configs without a budget.
+    total_dim: list[int] | int | None = None
+    latent_dim: list[int] | int | None = None
     learning_rate: list[float] | float = Field(default_factory=lambda: [0.001])
     l2_reg: list[float] | float = Field(default_factory=lambda: [0.0001])
-    visual_dim: list[int] | int = Field(default_factory=lambda: [64])
+    visual_dim: list[int] | int | None = None
     epochs: int = Field(100, ge=1)
     batch_size: int = Field(4096, ge=1)
     early_stopping_patience: int = Field(10, ge=1)

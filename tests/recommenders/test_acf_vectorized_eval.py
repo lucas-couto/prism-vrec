@@ -1,10 +1,10 @@
 """ACF vectorized predict_batch must match the per-user reference path.
 
-The tiled implementation batches users×items through the same math the
-single-user ``predict`` runs; only the GEMM grouping changes.  Batched
-GEMMs may reorder float reductions, so equality is asserted at fp32
-noise level (1e-6/1e-5) AND — the property the metrics actually depend
-on — the stable-sort rankings must be identical.
+``predict_batch`` computes each user's profile ``p̂_u`` once and scores
+the candidates with a single GEMM ``p̂ @ V^T`` (Eq. 6 has no
+per-candidate attention term).  GEMMs may reorder float reductions, so
+equality is asserted at fp32 noise level (1e-5) AND — the property the
+metrics actually depend on — the stable-sort rankings must be identical.
 """
 
 from __future__ import annotations
@@ -68,32 +68,39 @@ def test_rankings_identical_to_reference(model: ACF) -> None:
     assert torch.equal(ref_rank, out_rank)
 
 
-def test_tiling_boundaries_do_not_change_scores(model: ACF, monkeypatch) -> None:
-    # Force tiny tiles so both loops exercise multiple boundaries.
-    monkeypatch.setattr(ACF, "_EVAL_TILE_ELEMENTS", 4 * M * 7)  # ~1 item per tile
+def test_predict_batch_equals_profile_times_item_table(model: ACF) -> None:
     users = torch.arange(N_USERS)
     items = torch.arange(N_ITEMS)
 
     with torch.no_grad():
-        tiny_tiles = model.predict_batch(users, items)
-        model.train()
-        model.eval()
-        monkeypatch.setattr(ACF, "_EVAL_TILE_ELEMENTS", 2**27)
-        big_tiles = model.predict_batch(users, items)
+        out = model.predict_batch(users, items)
+        gamma_u = model.user_embedding(users)
+        p_hat = model._augmented_user(users, gamma_u)
+        expected = p_hat @ model.item_embedding.weight.T
 
-    assert torch.allclose(tiny_tiles, big_tiles, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(out, expected, atol=1e-6)
 
 
-def test_comp_hidden_cache_invalidated_by_train(model: ACF) -> None:
+def test_comp_cache_is_built_in_eval_and_invalidated_by_train(model: ACF) -> None:
     users = torch.arange(2)
     items = torch.arange(N_ITEMS)
 
     with torch.no_grad():
         model.predict_batch(users, items)
-    assert model._comp_hidden_cache is not None
+    assert model._comp_cache is not None
+    assert model._comp_cache.shape[0] == N_ITEMS
 
     model.train()
-    assert model._comp_hidden_cache is None
+    assert model._comp_cache is None
+
+
+def test_training_mode_does_not_use_the_cache(model: ACF) -> None:
+    model.train()
+    users, pos, neg = torch.arange(4), torch.arange(4), torch.arange(4, 8)
+
+    model(users, pos, neg)
+
+    assert model._comp_cache is None
 
 
 def test_subset_of_items_works(model: ACF) -> None:

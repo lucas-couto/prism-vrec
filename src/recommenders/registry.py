@@ -45,6 +45,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+#: Accepted values of :attr:`RecommenderSpec.dim_split`.
+DIM_SPLITS = ("latent", "half")
+
 
 @dataclass(frozen=True)
 class RecommenderSpec:
@@ -78,6 +81,14 @@ class RecommenderSpec:
         pooled 2-D embeddings.  The train/eval enumeration routes ``_comp``
         artifacts only to such models and excludes them from the pooled
         pool used by every other recommender.
+    dim_split:
+        How the shared dimension budget ``common.total_dim`` (``T``) is
+        split into the model's own dimensions, so every recommender of a
+        comparison spends the same number of factor dimensions (VBPR
+        §"Baselines": all MF methods use the same total; VBPR splits it
+        50/50 between latent and visual).  ``"latent"``: ``latent_dim =
+        T`` (and ``visual_dim = T`` when ``uses_visual_dim``); ``"half"``:
+        ``latent_dim = T // 2`` and ``visual_dim = T - T // 2``.
     """
 
     name: str
@@ -87,6 +98,7 @@ class RecommenderSpec:
     uses_visual_dim: bool = False
     extra_hyperparam_keys: tuple[str, ...] = field(default_factory=tuple)
     requires_components: bool = False
+    dim_split: str = "latent"
 
 
 _REGISTRY: dict[str, RecommenderSpec] = {}
@@ -101,6 +113,7 @@ def register_recommender(
     uses_visual_dim: bool = False,
     extra_hyperparam_keys: tuple[str, ...] | list[str] = (),
     requires_components: bool = False,
+    dim_split: str = "latent",
 ) -> None:
     """Register a recommender class under ``name``.
 
@@ -116,6 +129,11 @@ def register_recommender(
     # Local import avoids circular dependency (base.py -> registry).
     from src.recommenders.base import BaseRecommender
 
+    if dim_split not in DIM_SPLITS:
+        raise ValueError(
+            f"register_recommender({name!r}): dim_split must be one of {DIM_SPLITS}, "
+            f"got {dim_split!r}"
+        )
     if not issubclass(cls, BaseRecommender):
         raise TypeError(
             f"register_recommender({name!r}): {cls.__name__} must subclass BaseRecommender"
@@ -129,6 +147,7 @@ def register_recommender(
         uses_visual_dim=uses_visual_dim,
         extra_hyperparam_keys=tuple(extra_hyperparam_keys),
         requires_components=requires_components,
+        dim_split=dim_split,
     )
 
 

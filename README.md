@@ -253,7 +253,7 @@ batch_size: 256 # extraction batch size
 checkpoint_every: 500 # save partial extraction every N batches
 ```
 
-Extraction is **native-dim** (v2 protocol): each extractor saves the backbone's own pooled feature. `raw_dim` is a declaration validated against a probe forward through the real model — a mismatch fails extraction loudly. The learned projection `E` inside each recommender maps the native feature to the shared latent dim (`common.visual_dim` in `recommenders.yaml`).
+Extraction is **native-dim** (v2 protocol): each extractor saves the backbone's own pooled feature. `raw_dim` is a declaration validated against a probe forward through the real model — a mismatch fails extraction loudly. The learned projection `E` inside each recommender maps the native feature to the model's visual dim, derived from the shared dimension budget (`common.total_dim` in `recommenders.yaml`).
 
 Optionally, a **fixed linear projection** brings every extractor into one shared width — for a reviewer who asks that all backbones emit, say, 128-d, or to feed the element-wise fusion family equal-dim sources with nothing learned online:
 
@@ -336,25 +336,32 @@ strategies:
 recommenders_enabled: ["bpr", "vbpr", "vnpr", "deepstyle", "acf"]
 
 common: # shared by every recommender
-  latent_dim: [64, 128]
+  total_dim: [64, 128]  # shared dimension budget T (parity guard; see below)
   learning_rate: [0.001, 0.01]
   l2_reg: [0.0001, 0.001]
-  visual_dim: [64, 128] # used by VBPR / AVBPR
-  epochs: 100
+  epochs: 50
   batch_size: 4096
-  early_stopping_patience: 20
+  early_stopping_patience: 5
   early_stopping_metric: "ndcg@10"
   eval_every_epochs: 10
   eval_sample_size: 2000 # training-time validation user subsample (final eval is always full ranking)
 
-vnpr:
-  hidden_layers: [[256, 128], [512, 256, 128]]
+# Per-paper regularisation constants; absent keys fall back to common.l2_reg.
+bpr:
+  l2_reg_item_pos: 0.0001 # λ_H+ (Rendle et al. 2009)
+  l2_reg_item_neg: 0.0001 # λ_H−
 
-deepstyle:
-  style_dim: [64, 128]
+vbpr:
+  l2_reg_projection: 0.0 # λ_E = 0 (He & McAuley 2016)
+  l2_reg_visual_bias: 0.0001 # λ_β
+
+vnpr:
+  dropout: 0.0 # embedding dropout (Niu et al. 2018)
 
 avbpr:
   att_hidden: [64, 128]
+  l2_reg_projection: 0.0
+  l2_reg_visual_bias: 0.0001
 
 # ACF needs per-item component embeddings (*_comp artifacts) and the
 # user history. With `acf` in recommenders_enabled the extract step
@@ -362,19 +369,21 @@ avbpr:
 # fails loud if the *_comp artifacts are still missing.
 acf:
   att_hidden: [64, 128]
-  max_history: [50]
+  max_history: [50] # seeded uniform subsample when |R(u)| > H; null = full history
 ```
+
+**Dimension parity.** `common.total_dim` is the one dimension budget every recommender draws from, so the central comparison controls capacity (the VBPR baseline protocol: all MF methods use the same total number of factors, VBPR splits it 50/50). Each model's `RecommenderSpec.dim_split` derives its own dimensions: BPR-MF `latent_dim = T`; VBPR/AVBPR `latent_dim = visual_dim = T/2`; DeepStyle `d = T`; ACF `k = T`; VNPR latent `k = T` (its visual user vector lives in the image-feature space by construction). Declaring `latent_dim` / `visual_dim` directly — in `common:`, a model block or an `hp_space` — is refused by the parity guard before training.
 
 Each list becomes a Cartesian dimension; scalars stay constant. Combination counts per recommender:
 
 | Recommender | Combinations | Dimensions                         |
 | ----------- | -----------: | ---------------------------------- |
-| BPR         |            8 | latent × LR × L2                   |
-| VBPR        |           16 | + visual_dim                       |
-| VNPR        |           16 | + hidden_layers                    |
-| DeepStyle   |           16 | + style_dim                        |
-| AVBPR       |           32 | + visual_dim + att_hidden          |
-| ACF         |           32 | + visual_dim + att_hidden (+ max_history) |
+| BPR         |            8 | total_dim × LR × L2                |
+| VBPR        |            8 | same (T split 50/50)               |
+| VNPR        |            8 | same                               |
+| DeepStyle   |            8 | same                               |
+| AVBPR       |           16 | + att_hidden                       |
+| ACF         |           16 | + att_hidden (+ max_history)       |
 
 ### `configs/finetuning.yaml`
 
@@ -576,7 +585,7 @@ A non-empty list reports schema violations.
 | 7   | **DINOv2 ViT-B/14** | ViT (self-supervised)                        | Foundation |        768 |
 | 8   | **ConvNeXt-Base**   | Modernised CNN (ImageNet-22k → 1k)           | Hybrid     |       1024 |
 
-Extraction saves each backbone's **native** pooled feature with the backbone's canonical preprocessing, resolved from the library that ships the weights. There is no shared projection head at extraction time: the learned projection `E` inside each recommender maps the native dim to the common latent dim (`common.visual_dim`), trained jointly by the BPR loss. Every artifact carries a `.meta.json` sidecar (backbone, native dim, extraction point, exact weights id, transform recipe) that the loader cross-checks on read. See `docs/protocol.md` for every methodological declaration.
+Extraction saves each backbone's **native** pooled feature with the backbone's canonical preprocessing, resolved from the library that ships the weights. There is no shared projection head at extraction time: the learned projection `E` inside each recommender maps the native dim to the model's visual dim (derived from the shared budget `common.total_dim`), trained jointly by the BPR loss. Every artifact carries a `.meta.json` sidecar (backbone, native dim, extraction point, exact weights id, transform recipe) that the loader cross-checks on read. See `docs/protocol.md` for every methodological declaration.
 
 ---
 
@@ -610,12 +619,12 @@ Because sources keep their native dims in v2, the equal-dim family (1-7 plus 11,
 
 | Model         | Score                                                        | Visual features     |
 | ------------- | ------------------------------------------------------------ | ------------------- |
-| **BPR**       | γ_u^T γ_i + β_i                                              | None (CF baseline)  |
-| **VBPR**      | γ_u^T γ_i + α_u^T (W · f_i) + β_i                            | Linear projection   |
-| **VNPR**      | MLP(concat(u, q, v))                                         | Fully neural        |
-| **DeepStyle** | γ_u^T γ_i + s_u^T (E f_i − c_{cat(i)}) + β_i                 | Style = linear E minus learned category embedding (Liu et al., SIGIR 2017) |
-| **AVBPR**     | γ_u^T γ_i + α_u^T (a ⊙ W · f_i) + β_i, a = softmax(g(W·f_i)) | Attention-weighted  |
-| **ACF**       | p̂_u^T (γ_l + v_l) + β_l, with component- and item-level attention | Component + history attention (Chen et al., SIGIR 2017) |
+| **BPR**       | γ_u^T γ_i (BPR-MF, no item bias; Rendle et al., UAI 2009)    | None (CF baseline)  |
+| **VBPR**      | γ_u^T γ_i + θ_u^T (E f_i) + β_i + β'^T f_i (Eq. 4, He & McAuley, AAAI 2016; α, β_u cancel pairwise) | Linear projection E, λ_E = 0 |
+| **VNPR**      | ½ Σ_branches ReLU(w^T [p_u ∘ q_i, v_u ∘ f_i] + b), mirrored item tables W_i / W_i' (Niu et al., WSDM 2018) | User visual vector v_u in the image-feature space |
+| **DeepStyle** | p_u^T ((E f_i − l_cat(i)) + q_i), one user vector, no item bias (Eqs. 2–3, Liu et al., SIGIR 2017) | Style = linear E minus learned category embedding |
+| **AVBPR**     | VBPR with θ_i = (E f_i) ⊙ softmax(g(E f_i)) — own attentional adaptation, not a published model | Attention-weighted  |
+| **ACF**       | (γ_u + Σ_{l∈R(u)} α(u,l) p_l)^T γ_j (Eq. 6, Chen et al., SIGIR 2017); visual enters the item-level attention only | Component + history attention |
 
 All trained with BPR loss, Adam optimiser, mixed-precision (FP16 via `torch.amp`), and early stopping on validation NDCG@10.
 

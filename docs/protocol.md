@@ -15,12 +15,14 @@ projection), so the benchmark compared "backbone × random compression",
 not backbones.
 
 This protocol saves the **native** feature of each backbone at
-extraction; the learned projection `E` inside each recommender (VBPR's `W_vis`,
-DeepStyle's linear style projection, VNPR's visual transform, ACF's
-component projection) maps `D_backbone → d`, trained jointly by the BPR loss with
-the backbone frozen (fine-tuning end-to-end would be DVBPR, out of
-scope). `d` (`common.visual_dim`) is fixed and identical across all
-backbones of a comparison.
+extraction; the learned projection `E` inside each recommender (VBPR's `E`,
+DeepStyle's linear style projection, ACF's component projection) maps
+`D_backbone → d`, trained jointly by the BPR loss with the backbone frozen
+(fine-tuning end-to-end would be DVBPR, out of scope). `d` is derived
+from the shared dimension budget `common.total_dim` (see §7) and is
+identical across all backbones of a comparison. VNPR is the exception,
+by construction of its paper: it maps the *user* into the image-feature
+space (`v_u ∈ R^{D_backbone}`) and consumes `f_i` as is.
 
 | Backbone | Weights (exact) | Extraction point | Native dim |
 |---|---|---|---|
@@ -302,20 +304,47 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   component artifacts (`*_comp.npy`; M = 49–256 depending on the
   backbone), so component-level attention has real components to
   attend. Its user-history side is built from train interactions only.
-- **DeepStyle (paper-faithful)**: the item style term is
-  `θ_i = E·f_i − c_cat(i)` — a linear projection `E` (`D_backbone → d`)
+- **Dimension parity**: every recommender draws its dimensions from one
+  budget `common.total_dim` (`RecommenderSpec.dim_split`): BPR-MF
+  `latent_dim = T`, VBPR/AVBPR `latent_dim = visual_dim = T/2` (the
+  paper's 50/50 split), DeepStyle `d = T`, ACF `k = T`, VNPR latent
+  `k = T`. `assert_dimension_parity` refuses a direct `latent_dim` /
+  `visual_dim` anywhere. VNPR's visual user vector is `D_backbone`-wide
+  by construction and is declared outside the budget.
+- **Per-paper formulations and regularisation** (2.10.0): each built-in
+  reproduces its paper's score and L2 scheme rather than a shared
+  convention. BPR-MF: `γ_u^T γ_i`, no item bias, `λ_W / λ_H+ / λ_H−`
+  (`l2_reg`, `l2_reg_item_pos`, `l2_reg_item_neg`). VBPR: Eq. 4 with the
+  visual bias `β'^T f_i`, `λ_E = 0` by default (`l2_reg_projection`),
+  `λ_β` (`l2_reg_visual_bias`); AVBPR mirrors it so attention is the
+  only difference. DeepStyle: one user vector `p_u`, one `d`, no item
+  bias, single `λ` (Eq. 6). ACF: Eq. 6 score (no visual term, no item
+  bias), attention nets and projections unpenalised (Eq. 5). VNPR:
+  Hadamard merge + single-neuron ReLU dense, mirrored item tables,
+  ½-averaged branches at inference, L2 over the whole embedding
+  matrices. The BPR-Opt gathered-row reading of the L2 term stays the
+  framework default for the MF family; the constants are per group.
+- **DeepStyle (paper formulation)**: the item style term is
+  `s_i = E·f_i − l_cat(i)` — a linear projection `E` (`D_backbone → d`)
   minus a **learned category embedding** subtracted in the style space,
-  as in the original paper. On the Amazon datasets, whose per-item
-  category varies (declared `expects_categories: true`), this makes
-  DeepStyle differ from VBPR. On Tradesy, which has no category
-  (`expects_categories: false`, enforced at preprocess), every item maps
-  to a single null category, so `c_cat(i)` is constant across items;
-  the `α_u·c₀` term is item-independent and cancels in every BPR
-  pairwise comparison, so DeepStyle **analytically degenerates into
-  VBPR**. This is the expected, verified behaviour (see
+  and the score is `p_u^T (s_i + q_i)` with a single user vector. On
+  the Amazon datasets, whose per-item category varies (declared
+  `expects_categories: true`), this makes DeepStyle differ from VBPR.
+  On Tradesy, which has no category (`expects_categories: false`,
+  enforced at preprocess), every item maps to a single null category,
+  so `l_cat(i)` is constant across items; the `p_u·l₀` term is
+  item-independent and cancels in every BPR pairwise comparison, so
+  DeepStyle **analytically degenerates into a restricted VBPR**
+  (`γ_u ≡ θ_u`, `k_v = k`, no `β_i`, no `β'`) — not into the production
+  VBPR. This is the expected, verified behaviour (see
   `tests/recommenders/test_deepstyle_paper.py::TestTradesyDegeneration`),
   not a bug. An earlier MLP-style variant (which did not subtract a
   category vector) was removed in commit `60c7436`.
+- **ACF history**: the paper sums over the full `R(u)`; `max_history`
+  (H = 50) is an implementation bound. When `|R(u)| > H` the profile is a
+  **seeded uniform subsample** (`history_seed` = the run seed), never the
+  lowest item indices, which correlate with popularity in the DVBPR
+  splits. `max_history: null` keeps the full history.
 - **Trainable-parameter counts differ across backbones** because `E`'s
   input is the native dim — an expected second-order effect, reported
   per cell (`n_trainable_params` column), never hidden.

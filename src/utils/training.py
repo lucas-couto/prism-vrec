@@ -431,7 +431,14 @@ def train_single_run(
     )
     set_seed(job_seed)
 
-    model_config = {**hyperparams, "l2_reg": hyperparams.get("l2_reg", 0.0001)}
+    # ``history_seed`` fixes the seeded history subsample of
+    # history-consuming models (ACF) to the run seed, so evaluation
+    # rebuilds the same profile the model was trained on.
+    model_config = {
+        **hyperparams,
+        "l2_reg": hyperparams.get("l2_reg", 0.0001),
+        "history_seed": base_seed,
+    }
 
     # Only models that declare ``wants_history`` accept the
     # ``train_interactions`` keyword (e.g. ACF item-level attention), and

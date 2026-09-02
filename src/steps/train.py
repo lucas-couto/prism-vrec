@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-from itertools import product
 from pathlib import Path
 
 from tqdm import tqdm
@@ -35,7 +34,9 @@ from src.recommenders import (
 )
 from src.recommenders.hp_search import (
     CellKey,
+    assert_dimension_parity,
     create_study,
+    get_hyperparam_grid,
     get_strategy,
     sample_hyperparams,
 )
@@ -366,34 +367,6 @@ def _cell_counts(
     return counts
 
 
-def get_hyperparam_grid(model_name: str, config: dict) -> list[dict]:
-    """Cartesian product of grid-search hyperparameters for a recommender.
-
-    Reads the model's :class:`RecommenderSpec` to decide which keys to
-    include, there are no model-specific branches here.  Plugin authors
-    declare their hyperparameters via ``extra_hyperparam_keys`` /
-    ``uses_visual_dim`` when registering.
-    """
-    spec = get_recommender_spec(model_name)
-    common = config.get("common", {})
-    model_specific = config.get(model_name, {})
-
-    params: dict = {
-        "latent_dim": common.get("latent_dim", [64]),
-        "learning_rate": common.get("learning_rate", [0.001]),
-        "l2_reg": common.get("l2_reg", [0.0001]),
-    }
-    if spec.uses_visual_dim:
-        params["visual_dim"] = common.get("visual_dim", [64])
-    for key in spec.extra_hyperparam_keys:
-        if key in model_specific:
-            params[key] = model_specific[key]
-
-    keys = list(params.keys())
-    values = [params[k] if isinstance(params[k], list) else [params[k]] for k in keys]
-    return [dict(zip(keys, combo, strict=False)) for combo in product(*values)]
-
-
 def build_job_list(
     condition: str,
     config: dict,
@@ -491,6 +464,9 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     from src.recommenders.hp_budget import assert_uniform_budget
 
     assert_uniform_budget(config)
+    # Dimension-parity guard-rail: every recommender draws its dimensions
+    # from the shared common.total_dim budget (H1 controls capacity).
+    assert_dimension_parity(config)
 
     # Feature sanity gate (Task G): fail loud before burning battery time
     # on a corrupt matrix. Validates every backbone + fused .npy consumed.

@@ -30,7 +30,7 @@ values; the framework runs the **Cartesian product** of every list.
 
 ```yaml
 common:
-  latent_dim: [64, 128]
+  total_dim: [64, 128]      # shared dimension budget (parity guard)
   learning_rate: [0.001, 0.01]
   l2_reg: [0.0001, 0.001]
 
@@ -42,11 +42,15 @@ avbpr:
 
 acf:
   att_hidden: [64, 128]   # extra_hyperparam_keys for ACF
-  max_history: [50]       # H: items per user profile (item-level attention)
+  max_history: [50]       # H: seeded uniform subsample when larger; null = full history
 ```
 
 Jobs are distributed across workers via `TrainingOrchestrator`; every
 combination produces one row in the final results table.
+
+`common.total_dim` is expanded per model by `RecommenderSpec.dim_split`
+(`latent_dim`, `visual_dim`); `latent_dim` / `visual_dim` may not be
+declared directly anywhere (`assert_dimension_parity`).
 
 ---
 
@@ -64,10 +68,9 @@ with Optuna:
 ```yaml
 vbpr:
   hp_space:
-    latent_dim:    { type: int,         low: 8,    high: 256, log: true }
+    total_dim:     { type: categorical, choices: [64, 128, 256] }
     learning_rate: { type: float,       low: 1e-5, high: 1e-1, log: true }
     l2_reg:        { type: float,       low: 1e-7, high: 1e-2, log: true }
-    visual_dim:    { type: categorical, choices: [64, 128, 256] }
 ```
 
 Supported entry types:
@@ -85,7 +88,7 @@ orders of magnitude).
 ### Without `hp_space` declaration
 
 Recommenders that have no `hp_space:` block fall back to **sampling
-from the legacy lists** (`common.latent_dim`, `common.learning_rate`,
+from the legacy lists** (`common.total_dim`, `common.learning_rate`,
 etc.) as if Optuna were a smarter random sampler over the discrete
 grid.  Useful as an opt-in migration path.
 

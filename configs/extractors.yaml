@@ -72,7 +72,7 @@ fusion_extractors:
 
 # v2: extraction always emits the backbone's NATIVE dimensionality
 # (raw_dim above); the learned projection E inside each recommender maps
-# it to the common latent dim (common.visual_dim in recommenders.yaml).
+# it to the model's visual dim (derived from common.total_dim in recommenders.yaml).
 
 # =============================================================================
 # Fixed linear projection to a common dimension (optional)

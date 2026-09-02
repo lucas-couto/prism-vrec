@@ -53,7 +53,6 @@ import argparse
 import os
 import sys
 import time
-import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -64,20 +63,6 @@ from typing import Any
 # ``os._exit(0)``, which lands on the terminal *after* the shell prompt
 # returned and leaves the cursor parked on the warning text.
 os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
-
-# Optuna emits a UserWarning every time a categorical distribution receives a
-# list (e.g. ``hidden_layers: [[256, 128], [512, 256, 128]]``) because lists
-# are not hashable and Optuna recommends tuples for persistent storage.  In
-# this project the lists are intentional, they round-trip through YAML and
-# are consumed elsewhere as lists.  Functionally the warning is harmless
-# (Optuna pickles the choices regardless); silencing it just keeps the log
-# readable when training neural recommenders.
-warnings.filterwarnings(
-    "ignore",
-    message=r"Choices for a categorical distribution should be a tuple",
-    category=UserWarning,
-    module=r"optuna\.distributions",
-)
 
 from src.steps import (  # noqa: E402
     beyond_accuracy,

@@ -3,9 +3,10 @@
 Two small networks implement ACF's two attention levels:
 
 * :class:`ComponentAttention` weights an item's ``M`` visual components
-  (spatial feature-map cells / patch tokens) conditioned on the user.
+  (spatial feature-map cells / patch tokens) conditioned on the user
+  (Eqs. 10-12).
 * :class:`ItemAttention` weights the items in a user's history to build
-  the augmented user profile.
+  the augmented user profile (Eqs. 8-9).
 
 Both broadcast over arbitrary leading batch dimensions so the same
 module serves single-item, candidate-list, and history tensors.
@@ -25,7 +26,11 @@ def _init_linear(layer: nn.Linear) -> None:
 
 
 class ComponentAttention(nn.Module):
-    """Component-level attention over an item's ``M`` projected components."""
+    """Component-level attention over an item's ``M`` projected components.
+
+    Eqs. 10-12: ``b(i,l,m) = w_2^T φ(W_2u u_i + W_2x x_{lm} + b_2) + c_2``,
+    ``β(i,l,m) = softmax_m b(i,l,m)`` and ``x̄_l = Σ_m β(i,l,m) x_{lm}``.
+    """
 
     def __init__(self, latent_dim: int, visual_dim: int, hidden: int) -> None:
         super().__init__()
@@ -35,41 +40,27 @@ class ComponentAttention(nn.Module):
         for layer in (self.user_proj, self.comp_proj, self.score):
             _init_linear(layer)
 
-    def forward(
-        self,
-        gamma_u: torch.Tensor,
-        components: torch.Tensor,
-        comp_hidden: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return the attended visual vector ``(..., visual_dim)``.
+    def forward(self, gamma_u: torch.Tensor, components: torch.Tensor) -> torch.Tensor:
+        """Return the attended visual vector ``x̄`` of shape ``(..., visual_dim)``.
 
         ``gamma_u`` has shape ``(..., latent_dim)`` and ``components`` has
         shape ``(..., M, visual_dim)`` with matching leading dims.
-
-        ``comp_hidden`` is the optional precomputed ``comp_proj(components)``
-        — this term does NOT depend on the user, so evaluation over many
-        users can compute it once per catalogue instead of once per user
-        (see :meth:`precompute_components`).  Passing it changes nothing
-        numerically: it is the same tensor the un-precomputed path builds.
         """
         query = self.user_proj(gamma_u).unsqueeze(-2)  # (..., 1, hidden)
-        if comp_hidden is None:
-            comp_hidden = self.comp_proj(components)
-        energy = self.score(torch.relu(query + comp_hidden))  # (..., M, 1)
+        energy = self.score(torch.relu(query + self.comp_proj(components)))  # (..., M, 1)
         alpha = torch.softmax(energy, dim=-2)
         return (alpha * components).sum(dim=-2)
-
-    def precompute_components(self, components: torch.Tensor) -> torch.Tensor:
-        """User-independent half of the attention: ``comp_proj(components)``."""
-        return self.comp_proj(components)
 
 
 class ItemAttention(nn.Module):
     """Item-level attention building the augmented user profile.
 
-    Aggregates, over the user's history, ``alpha_i * (p_i + v_i)`` where
-    ``p_i`` is the auxiliary item embedding and ``v_i`` the item's
-    component-attended visual vector mapped to the latent space.
+    Eq. 8: ``a(i,l) = w_1^T φ(W_1u u_i + W_1v v_l + W_1p p_l + W_1x x̄_l + b_1) + c_1``
+    with ``α(i,l) = softmax_l a(i,l)`` over the user's history ``R(i)``
+    (Eq. 9).  The module returns ``Σ_{l∈R(i)} α(i,l) p_l`` — the history
+    term of Eq. 6.  The item latent ``v_l`` and the component-attended
+    visual ``x̄_l`` (already mapped to the latent space) enter the
+    attention *energy* only; neither is aggregated into the profile.
     """
 
     def __init__(self, latent_dim: int, hidden: int) -> None:
@@ -90,11 +81,12 @@ class ItemAttention(nn.Module):
         v_h: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the profile contribution ``(B, latent_dim)``.
+        """Return ``Σ_l α(u,l) p_l`` of shape ``(B, latent_dim)``.
 
-        ``gamma_u`` is ``(B, k)``; ``gamma_h``/``p_h``/``v_h`` are
-        ``(B, H, k)``; ``mask`` is ``(B, H)`` with ``True`` for valid
-        history slots.  Users with empty history contribute zero.
+        ``gamma_u`` is ``(B, k)``; ``gamma_h`` (item latents ``v_l``),
+        ``p_h`` (auxiliary ``p_l``) and ``v_h`` (visual ``x̄_l`` in latent
+        space) are ``(B, H, k)``; ``mask`` is ``(B, H)`` with ``True`` for
+        valid history slots.  Users with empty history contribute zero.
         """
         query = self.user(gamma_u).unsqueeze(1)  # (B, 1, hidden)
         energy = self.score(
@@ -102,4 +94,4 @@ class ItemAttention(nn.Module):
         )  # (B, H, 1)
         energy = energy.masked_fill(~mask.unsqueeze(-1), float("-inf"))
         alpha = torch.nan_to_num(torch.softmax(energy, dim=1))  # empty rows -> 0
-        return (alpha * (p_h + v_h)).sum(dim=1)
+        return (alpha * p_h).sum(dim=1)

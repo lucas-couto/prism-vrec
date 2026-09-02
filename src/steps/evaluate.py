@@ -301,6 +301,8 @@ def _evaluate_cell(
         state_dict = saved
         model_config = {"latent_dim": 64, "l2_reg": 0.0001}
         logger.warning("    Legacy checkpoint (no hyperparams): %s", model_info["path"])
+    # Same seeded history subsample (ACF) the training run used.
+    model_config["history_seed"] = seed
 
     # History-consuming models (ACF) need the pure-train interactions at
     # construction; category-consuming models (DeepStyle) need the item→
