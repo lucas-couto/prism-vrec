@@ -107,6 +107,56 @@ class TestRoundTrip:
         assert len(read_df["top_items"].iloc[0]) == 20
 
 
+class TestFoldProvenanceCompatibility:
+    def _meta(self, **overrides) -> CellMetadata:
+        return CellMetadata(
+            dataset="synthetic",
+            visual_config="resnet50",
+            recommender="vbpr",
+            seed=7,
+            d=64,
+            split="test",
+            n_users=_NU,
+            n_items=_NI,
+            **overrides,
+        )
+
+    def test_fold_defaults_to_none_for_leave_one_out_cells(self, tmp_path) -> None:
+        records = _evaluator().per_user_records(_ScoreModel(_distinct_scores()), device="cpu")
+
+        path = write_cell_artifact(records, self._meta(), tmp_path)
+        read_meta, _ = read_cell_artifact(path)
+
+        assert "fold" in read_meta and read_meta["fold"] is None
+        assert CellMetadata(**read_meta).fold is None
+
+    def test_legacy_meta_without_fold_key_still_reads(self, tmp_path) -> None:
+        import json
+
+        records = _evaluator().per_user_records(_ScoreModel(_distinct_scores()), device="cpu")
+        path = write_cell_artifact(records, self._meta(), tmp_path)
+        meta_path = path.with_name(path.name.replace(".csv.gz", ".meta.json"))
+        legacy = json.loads(meta_path.read_text())
+        del legacy["fold"]
+        meta_path.write_text(json.dumps(legacy))
+
+        read_meta, read_df = read_cell_artifact(path)
+
+        assert "fold" not in read_meta
+        assert len(read_df) == _NU
+        assert CellMetadata(**read_meta).fold is None
+
+    def test_fold_provenance_round_trips(self, tmp_path) -> None:
+        records = _evaluator().per_user_records(_ScoreModel(_distinct_scores()), device="cpu")
+        fold = {"index": 1, "k": 5, "seed": 8, "n_users": _NU}
+
+        path = write_cell_artifact(records, self._meta(fold=fold), tmp_path)
+        read_meta, _ = read_cell_artifact(path)
+
+        assert read_meta["fold"] == fold
+        assert CellMetadata(**read_meta) == self._meta(fold=fold)
+
+
 def _write_cell(tmp_path, evaluator, scores, recommender, visual_config, seed=7) -> None:
     records = evaluator.per_user_records(_ScoreModel(scores), device="cpu")
     meta = CellMetadata(

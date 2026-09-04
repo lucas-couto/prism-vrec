@@ -1,4 +1,4 @@
-"""Tests for the synthetic dataset provider used by the smoke profile."""
+"""Tests for the in-process synthetic dataset provider."""
 
 from __future__ import annotations
 
@@ -113,21 +113,3 @@ class TestSyntheticDatasetProvider:
 
         with pytest.raises(ValueError, match="interactions_per_user"):
             SyntheticDatasetProvider(raw_dir=tmp_path / "raw", interactions_per_user=2)
-
-
-class TestSmokeConfigParses:
-    def test_smoke_yamls_load_against_schema(self) -> None:
-        from src.utils.config import load_config
-
-        smoke_dir = Path(__file__).resolve().parent.parent / "configs" / "smoke"
-        config = load_config(str(smoke_dir))
-
-        assert "datasets" in config
-        assert config["datasets"] == ["synthetic"]
-        assert config["pipeline"]["condition"] == "frozen"
-        assert config["hp_search"]["strategy"] == "optuna"
-        assert config["hp_search"]["optuna"]["n_trials"] == 1
-        # The smoke profile keeps the bundle small.
-        assert config["extractors_enabled"] == ["resnet50"]
-        assert config["fusion_strategies_enabled"] == ["mean"]
-        assert set(config["recommenders_enabled"]) == {"bpr", "vbpr"}

@@ -37,7 +37,7 @@ class TestEmbeddingMatchesConfig:
         cfg = _config()
 
         assert embedding_matches_config("hybrid_mean_p128", cfg)
-        assert not embedding_matches_config("hybrid_gated_l1_0_p128", cfg)
+        assert not embedding_matches_config("hybrid_sigmoid_gated_l1_0_p128", cfg)
 
     def test_variant_gate_applies(self) -> None:
         cfg = _config(embedding_variants="projected")
@@ -91,7 +91,7 @@ class TestFeatureGateHonoursConfig:
         # Disabled backbone: poisoned (float64 would fail the gate).
         np.save(emb / "clip_vitb32.npy", np.zeros((4, 8), dtype=np.float64))
         # Disabled fusion: poisoned too.
-        np.save(emb / "hybrid_gated_l1_0.npy", np.zeros((4, 8), dtype=np.float64))
+        np.save(emb / "hybrid_sigmoid_gated_l1_0.npy", np.zeros((4, 8), dtype=np.float64))
         # Component artifact (fp16, 3-D): out of the gate's scope.
         np.save(emb / "resnet50_comp.npy", np.zeros((4, 3, 8), dtype=np.float16))
         return str(tmp_path / "p"), str(tmp_path / "e")

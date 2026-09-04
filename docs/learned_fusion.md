@@ -51,8 +51,8 @@ python main.py --from train       # the recommender picks up the
 ## Learned alignment (`alignment.method: learned`)
 
 With native-dim sources (`extractor_variants: native`), every equal-dim
-strategy — mean, sum, prod, max_pool, weighted_mean, attention_weighted,
-gated, adaptive_gated — first passes each source through its own
+strategy — mean, sum, prod, max_pool, weighted_mean, softmax_weighted,
+sigmoid_gated, adaptive_gated — first passes each source through its own
 `Linear(D_i -> d)` (ResNet-50: 2048 → d, ViT-B/16: 768 → d), then fuses
 in the `d`-dimensional space.  The projections are parameters of the
 recommender, trained end-to-end by the BPR loss together with everything
@@ -141,5 +141,5 @@ correctness is preserved.
 
 This implementation follows the specification of the
 ``adaptive_gated`` strategy in the qualification document of
-**Couto, L. (2026), "Hybrid Visual Recommendation for Fashion"**,
+**Couto, L. S. (2026), "Hybrid Visual Feature Extraction for Fashion Recommendation Based on Deep Learning"**,
 chapter "Methodology — Fusion strategies".

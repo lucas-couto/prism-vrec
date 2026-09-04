@@ -313,3 +313,106 @@ def test_max_history_none_keeps_the_complete_history() -> None:
     assert model.history_mask[FULL_HISTORY_USER].all()
     assert set(model.history_items[FULL_HISTORY_USER].tolist()) == set(range(N_ITEMS))
     assert model.history_mask[0].sum().item() == 3
+
+
+# ------------------------------------------- SVD++ degeneration under training
+def _freeze_uniform_item_attention(model: ACF) -> None:
+    """Zero AND freeze the energy head: ``a(u,l)`` stays constant through training."""
+    _force_uniform_item_attention(model)
+    model.item_attention.score.weight.requires_grad_(False)
+    model.item_attention.score.bias.requires_grad_(False)
+
+
+def _svdpp_scores(model: ACF, users: torch.Tensor, items: torch.Tensor) -> torch.Tensor:
+    """Explicit ``(γ_u + |R(u)|⁻¹ Σ_{l∈R(u)} p_l) · γ_j`` over the model's own ``R(u)``."""
+    rows = []
+    for user in users.tolist():
+        history = model.history_items[user][model.history_mask[user]]
+        aux = model.aux_embedding.weight[history]
+        pooled = aux.mean(dim=0) if history.numel() else torch.zeros_like(aux.sum(dim=0))
+        rows.append(
+            model.item_embedding.weight[items] @ (model.user_embedding.weight[user] + pooled)
+        )
+    return torch.stack(rows)
+
+
+def _sampleable_history() -> dict[int, set[int]]:
+    """Users with at least one negative: the full-history user has none to draw."""
+    return {u: s for u, s in _history().items() if len(s) < N_ITEMS}
+
+
+def _train_uniform_acf(steps: int = 25) -> ACF:
+    from src.utils.amp_compat import get_grad_scaler
+    from src.utils.training import BPRBatchSampler, bpr_step
+
+    model = _model()
+    _freeze_uniform_item_attention(model)
+    model.train()
+    sampler = BPRBatchSampler(_sampleable_history(), N_ITEMS, batch_size=4, seed=13)
+    batches = [batch for epoch in range(steps) for batch in sampler.epoch(epoch)][:steps]
+    assert len(batches) == steps
+    optimiser = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.05)
+    scaler = get_grad_scaler(enabled=False)
+    for users, pos, neg in batches:
+        bpr_step(model, optimiser, scaler, users, pos, neg, device="cpu", use_cuda=False)
+    return model.eval()
+
+
+def test_frozen_uniform_attention_keeps_alpha_uniform_after_training() -> None:
+    model = _train_uniform_acf()
+    fresh = _model()
+
+    assert torch.all(model.item_attention.score.weight == 0)
+    assert torch.all(model.item_attention.score.bias == 0)
+    # Real training: U, V and P moved.
+    assert not torch.allclose(model.user_embedding.weight, fresh.user_embedding.weight)
+    assert not torch.allclose(model.item_embedding.weight, fresh.item_embedding.weight)
+    assert not torch.allclose(model.aux_embedding.weight, fresh.aux_embedding.weight)
+
+
+def test_svdpp_degeneration_holds_after_training_in_every_scoring_path() -> None:
+    model = _train_uniform_acf()
+    users, items = torch.arange(N_USERS), torch.arange(N_ITEMS)
+    expected = _svdpp_scores(model, users, items)  # (n_users, n_items)
+    b_users, pos, neg = _batch()
+
+    with torch.no_grad():
+        batched = model.predict_batch(users, items)
+        single = torch.stack([model.predict(u, items) for u in range(N_USERS)])
+        score_pos, score_neg = model(b_users, pos, neg)
+
+    assert torch.allclose(batched, expected, atol=1e-6)
+    assert torch.allclose(single, expected, atol=1e-6)
+    assert torch.allclose(score_pos, expected[b_users, pos], atol=1e-6)
+    assert torch.allclose(score_neg, expected[b_users, neg], atol=1e-6)
+
+
+def test_svdpp_degeneration_holds_in_train_mode_too() -> None:
+    """The formula is not an artefact of the eval-mode component cache."""
+    model = _train_uniform_acf().train()
+    users, items = torch.arange(N_USERS), torch.arange(N_ITEMS)
+
+    with torch.no_grad():
+        batched = model.predict_batch(users, items)
+
+    assert torch.allclose(batched, _svdpp_scores(model, users, items), atol=1e-6)
+
+
+def test_unfrozen_energy_head_breaks_uniformity_under_training() -> None:
+    """Negative control: zeroing alone is NOT enough — training moves ``w_1``/``c_1``."""
+    from src.utils.amp_compat import get_grad_scaler
+    from src.utils.training import BPRBatchSampler, bpr_step
+
+    model = _model()
+    _force_uniform_item_attention(model)  # zeroed, not frozen
+    model.train()
+    optimiser = torch.optim.SGD(model.parameters(), lr=0.05)
+    scaler = get_grad_scaler(enabled=False)
+    sampler = BPRBatchSampler(_sampleable_history(), N_ITEMS, batch_size=4, seed=13)
+    for users, pos, neg in list(sampler.epoch(0))[:3]:
+        bpr_step(model, optimiser, scaler, users, pos, neg, device="cpu", use_cuda=False)
+    model.eval()
+
+    assert not torch.all(model.item_attention.score.bias == 0) or not torch.all(
+        model.item_attention.score.weight == 0
+    )

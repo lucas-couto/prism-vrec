@@ -3,8 +3,11 @@
 Every assertion is written against the paper's equations computed by
 hand: mirrored branches with two item tables, element-wise product
 merge, one-neuron ReLU dense, inference as the average of the two
-branches, dropout on the embeddings and L2 over the WHOLE embedding
-matrices (not BPR-Opt).
+branches and dropout on the embeddings.  Regularisation is the ONE
+declared divergence: BPR-Opt gathered rows instead of the paper's whole
+embedding matrices — under Adam the whole-matrix penalty drives every
+rarely-gathered row to exactly zero (measured 2026-09-04, see
+``docs/protocol.md`` §"VNPR regularisation"), leaving a visual-only model.
 """
 
 from __future__ import annotations
@@ -117,21 +120,64 @@ def test_dense_layer_is_a_single_neuron_over_k_plus_dv(model: VNPR) -> None:
     assert model.dense.in_features == K + DV
 
 
-def test_l2_penalises_whole_embedding_matrices_and_not_the_dense_layer() -> None:
+def test_l2_penalises_only_the_gathered_rows_and_not_the_dense_layer() -> None:
+    """BPR-Opt reading: ``W_i`` rows of the positives, ``W_i'`` rows of the
+    negatives, ``W_u`` / ``W_v`` rows of the users; nothing else."""
     model = _make({"l2_reg": 1e-2}).eval()
     users, pos, neg = torch.arange(4), torch.arange(4), torch.arange(4, 8)
-    untouched_row = N_ITEMS - 1  # never in pos / neg
+    untouched_item = N_ITEMS - 1  # never in pos / neg
+    untouched_user = N_USERS - 1
+
+    def reg() -> float:
+        model(users, pos, neg)  # records the batch l2_reg() consumes
+        return model.l2_reg().item()
 
     with torch.no_grad():
-        loss_before = model.bpr_loss(*model(users, pos, neg)).item()
-        model.item_embedding_neg.weight[untouched_row] *= 10.0
-        loss_after = model.bpr_loss(*model(users, pos, neg)).item()
-        reg_before = model.l2_reg().item()
+        reg_0 = reg()
+        model.item_embedding_neg.weight[untouched_item] *= 10.0
+        model.item_embedding.weight[untouched_item] *= 10.0
+        model.user_embedding.weight[untouched_user] *= 10.0
+        model.visual_user_embedding.weight[untouched_user] *= 10.0
         model.dense.weight *= 10.0
-        reg_after = model.l2_reg().item()
+        reg_untouched = reg()
+        model.item_embedding.weight[pos[0]] *= 10.0
+        reg_pos = reg()
+        model.item_embedding_neg.weight[neg[0]] *= 10.0
+        reg_neg = reg()
+        model.item_embedding_neg.weight[pos[0]] *= 10.0  # W_i' row of a POSITIVE
+        reg_cross = reg()
 
-    assert loss_after > loss_before
-    assert reg_after == pytest.approx(reg_before)
+    assert reg_untouched == pytest.approx(reg_0)
+    assert reg_pos > reg_untouched
+    assert reg_neg > reg_pos
+    assert reg_cross == pytest.approx(reg_neg), "W_i' is gathered by the negatives only"
+
+
+def test_adam_training_keeps_rows_outside_the_batch_at_their_initial_norm() -> None:
+    """Regression for the 2026-09-04 collapse: with the paper's whole-matrix
+    L2, Adam moved every rarely-gathered row ~lr per step towards zero
+    regardless of ``λ``, so ``W_u``/``W_i``/``W_i'`` trained to EXACTLY 0.
+    Under BPR-Opt a row outside the batch receives no gradient at all."""
+    model = _make({"l2_reg": 1e-4, "dropout": 0.0}).train()
+    users, pos, neg = torch.arange(4), torch.arange(4), torch.arange(4, 8)
+    untouched_user, untouched_item = N_USERS - 1, N_ITEMS - 1
+    tables = (model.user_embedding, model.visual_user_embedding)
+    item_tables = (model.item_embedding, model.item_embedding_neg)
+    before_user = [t.weight[untouched_user].detach().clone() for t in tables]
+    before_item = [t.weight[untouched_item].detach().clone() for t in item_tables]
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+    for _ in range(60):
+        optimizer.zero_grad()
+        loss = model.bpr_loss(*model(users, pos, neg)) + model.l2_reg()
+        loss.backward()
+        optimizer.step()
+
+    for t, b in zip(tables, before_user, strict=True):
+        assert torch.equal(t.weight[untouched_user].detach(), b)
+    for t, b in zip(item_tables, before_item, strict=True):
+        assert torch.equal(t.weight[untouched_item].detach(), b)
+    assert model.user_embedding.weight[users].norm(dim=1).min().item() > 0.0
 
 
 def test_dropout_perturbs_training_forward_and_is_inert_in_eval() -> None:

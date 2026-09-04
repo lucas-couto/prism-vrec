@@ -116,6 +116,16 @@ class TestGridExpansion:
 
 
 class TestParityGuard:
+    def test_should_pass_on_a_schema_validated_config(self) -> None:
+        """The config schema materialises latent_dim/visual_dim as None; that
+        is not a direct declaration (caught by the pre-battery validation run)."""
+        from src.utils.config_schema import validate_config
+
+        cfg = validate_config({"common": {"total_dim": [64]}, "recommenders_enabled": []})
+
+        assert cfg["common"]["latent_dim"] is None
+        assert_dimension_parity(cfg)
+
     def test_should_pass_when_only_total_dim_is_declared(self) -> None:
         cfg = {"common": {"total_dim": [64]}, "recommenders_enabled": ["parity_half"]}
 

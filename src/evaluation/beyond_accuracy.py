@@ -53,13 +53,18 @@ def efd_at_k(
 ) -> float:
     """EFD@K (novelty): mean self-information of the top-K items.
 
-    ``EFD@k(u) = (1/k) · Σ_{i ∈ top-k(u)} log2(1 / pop(i))`` — the
-    Mean Self-Information reduction of Vargas & Castells (2011), eq. 14.
+    ``EFD@k(u) = (1/|valid|) · Σ_{i ∈ valid(u)} log2(1 / pop(i))`` — the
+    Mean Self-Information reduction of Vargas & Castells (2011), eq. 14,
+    where ``valid(u)`` are the top-k items with ``pop(i) > 0``.
 
     Items with ``pop(i) <= 0`` (never seen in TRAIN) carry infinite
     self-information; they are EXCLUDED from the average (the mean is
     taken over the remaining items) rather than floored with an
-    arbitrary epsilon.  The caller logs how often this happens.
+    arbitrary epsilon.  The denominator is therefore ``|valid|``, not
+    ``k``, so EFD is only comparable across models that recommend a
+    similar share of cold items: :func:`efd_excluded_frac_at_k` reports
+    that share per user (``efd_excluded_frac@k``) and the step
+    aggregates it per cell, so the comparability is checked, not assumed.
 
     Parameters
     ----------
@@ -104,6 +109,21 @@ def efd_at_k(
     ranks = np.flatnonzero(valid)  # 0-indexed positions of the valid items
     discounts = RANK_DISCOUNT_BASE ** ranks.astype(np.float64)
     return float((discounts * self_information).sum() / discounts.sum())
+
+
+def efd_excluded_frac_at_k(top_items: list[int], popularity: np.ndarray, k: int) -> float:
+    """Share of the top-K items excluded from EFD@K (zero TRAIN popularity).
+
+    Companion of :func:`efd_at_k`: ``|{i ∈ top-k : pop(i) <= 0}| / |top-k|``,
+    ``nan`` for an empty list.  A model whose value is materially higher
+    than another's has its EFD averaged over fewer terms, and the two
+    EFD values are not directly comparable.
+    """
+    top_k = top_items[:k]
+    if not top_k:
+        return float("nan")
+    pops = np.asarray(popularity, dtype=np.float64)[np.asarray(top_k, dtype=np.int64)]
+    return float(np.mean(pops <= 0.0))
 
 
 def ild_at_k(top_items: list[int], embeddings: np.ndarray, k: int) -> float:
@@ -236,8 +256,10 @@ def compute_user_beyond_accuracy(
 
     Additive companion of
     :func:`src.evaluation.metrics.compute_all_metrics` (whose signature
-    is a contract and stays untouched).  Keys: ``efd@k``, ``ild@k`` and
-    — only when the dataset ships categories — ``cat_entropy@k``.
+    is a contract and stays untouched).  Keys: ``efd@k``,
+    ``efd_excluded_frac@k`` (share of the top-k left out of EFD for zero
+    train popularity), ``ild@k`` and — only when the dataset ships
+    categories — ``cat_entropy@k``.
     The aggregate iCov is NOT computed here (it has no per-user value);
     see :func:`catalog_coverage_at_k`.
     """
@@ -246,6 +268,7 @@ def compute_user_beyond_accuracy(
         results[f"efd@{k}"] = efd_at_k(
             top_items, popularity, k, use_rank_relevance=use_rank_relevance
         )
+        results[f"efd_excluded_frac@{k}"] = efd_excluded_frac_at_k(top_items, popularity, k)
         results[f"ild@{k}"] = ild_at_k(top_items, embeddings, k)
         entropy = category_entropy_at_k(top_items, item_categories, k)
         if entropy is not None:
@@ -259,5 +282,6 @@ __all__ = [
     "category_entropy_at_k",
     "compute_user_beyond_accuracy",
     "efd_at_k",
+    "efd_excluded_frac_at_k",
     "ild_at_k",
 ]

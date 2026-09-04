@@ -75,6 +75,19 @@ class BaseRecommender(nn.Module, abc.ABC):
     _L2_ITEM_TABLES: tuple[str, ...] = ("item_embedding", "item_bias")
     _L2_EXTRA_GATHERED_TABLES: tuple[str, ...] = ()
 
+    #: Every ``nn.Embedding`` attribute indexed by USER id — the rows a
+    #: fold-in routine (:func:`src.folds.foldin.fold_in_users`) re-
+    #: initialises and optimises for a held-out user while the rest of
+    #: the model stays frozen.  DISTINCT from :attr:`_L2_USER_TABLES`,
+    #: which only governs regularisation (a model may own a user table
+    #: it does not regularise per row; VNPR did until 2026-09-04, when
+    #: its whole-matrix L2 proved fatal under Adam — see its module
+    #: docstring).  Models whose per-user state is NOT a
+    #: parameter (ACF's history buffers) refresh it through
+    #: :meth:`rebuild_user_state` instead.  A test guards that every
+    #: ``nn.Embedding`` with ``num_embeddings == n_users`` is listed.
+    _USER_TABLES: tuple[str, ...] = ("user_embedding",)
+
     #: ``λ`` config key per parameter group, so each model reproduces the
     #: regularisation its paper declares.  Keys are an attribute name or
     #: an ``(attribute, role)`` pair with role ``"user"`` / ``"pos"`` /
@@ -240,6 +253,24 @@ class BaseRecommender(nn.Module, abc.ABC):
             Predicted scores, same length as *item_ids*.
         """
         ...
+
+    def rebuild_user_state(self, interactions: dict[int, set[int]]) -> None:
+        """Refresh NON-parametric per-user state from ``interactions``.
+
+        Hook for the fold-in routine.  Models whose user representation
+        is entirely parametric (the :attr:`_USER_TABLES` rows) have
+        nothing to do — the default is a no-op.  Models that derive
+        per-user state from the interaction history at construction
+        time (ACF's ``history_items`` / ``history_mask`` buffers)
+        override it to update ONLY the rows of the users present in
+        ``interactions``, leaving every other user untouched.
+
+        Parameters
+        ----------
+        interactions:
+            ``{user_idx: set(item_idx)}`` — the profile of the users
+            being folded in.
+        """
 
     def bpr_loss(self, score_pos: torch.Tensor, score_neg: torch.Tensor) -> torch.Tensor:
         """BPR pairwise loss plus the model's L2 regulariser.

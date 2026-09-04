@@ -1,0 +1,151 @@
+# Recommender model configuration.
+#
+# `recommenders_enabled` controls which recommenders run in this
+# experiment. An empty or absent list = no recommender runs. To disable
+# a model just remove it from this list. Valid names: bpr, vbpr, vnpr,
+# deepstyle, avbpr, acf.
+recommenders_enabled:
+  - bpr
+  - vbpr
+
+# Which embedding variants the recommenders are trained on, when a fixed
+# projection is configured under `projection:` in extractors.yaml.
+#   native    - the backbones' own widths only (the v2 default)
+#   projected - the fixed-dim <extractor>_p<dim> artifacts only
+#   both      - one cell per variant, so the cost of the projection is
+#               visible instead of assumed
+# Applies to fusion outputs too: a hybrid built from projected sources
+# carries the same token and is classified with them.
+embedding_variants: native
+
+common:
+  # Shared dimension budget T (dimension parity, He & McAuley 2016
+  # baselines protocol): every recommender derives its own dimensions
+  # from T through RecommenderSpec.dim_split so the comparison controls
+  # capacity — BPR-MF latent_dim = T; VBPR/AVBPR latent_dim = visual_dim
+  # = T/2; DeepStyle d = T; ACF k = T; VNPR latent k = T (its visual
+  # user vector lives in the image-feature space by construction).
+  # Declaring latent_dim / visual_dim directly is refused (parity guard).
+  total_dim: 20
+  learning_rate: 0.001
+  l2_reg: 0.0001
+  epochs: 50
+  batch_size: 4096
+  early_stopping_patience: 5
+  early_stopping_metric: "ndcg@10"
+
+  # Evaluation frequency during training (epochs between validations).
+  # Training-time validation is full-ranking over the eval_sample_size
+  # subset of validation users (see below); the frequency changed
+  # relative to earlier runs (was 5, now 10) to reduce training cost
+  # while preserving the same hyperparameter-selection metric across
+  # all models.
+  eval_every_epochs: 10
+
+  # Subset of VALIDATION users scored during TRAINING-TIME validation (early
+  # stopping + Optuna pruning) — v2 protocol, B6. 2000 users keeps the
+  # per-validation standard error of ndcg@10 well below the
+  # between-configuration gaps that drive model selection, while cutting
+  # validation cost by ~an order of magnitude on the larger datasets.
+  # The subset is drawn once, deterministically (seed = global seed) and
+  # is IDENTICAL across every model/embedding/trial of a dataset, so
+  # selection stays a paired comparison. Final reported metrics are NOT
+  # affected: the evaluate step always ranks the full test set
+  # (src/steps/evaluate.py constructs its Evaluator without sample_size).
+  eval_sample_size: 2000
+
+# Per-model regularisation constants (each paper's own scheme).  Every
+# key absent here falls back to common.l2_reg; scalars stay constant in
+# the search, lists become search dimensions.
+bpr:
+  # BPR-MF (Rendle et al. 2009, §4.3.1): λ_W = l2_reg, λ_H+ / λ_H− below.
+  l2_reg_item_pos: 0.0001
+  l2_reg_item_neg: 0.0001
+
+vbpr:
+  # VBPR (He & McAuley 2016): λ_E = 0 (never regularised in the paper),
+  # λ_β for the visual bias β'.
+  l2_reg_projection: 0.0
+  l2_reg_visual_bias: 0.0001
+
+vnpr:
+  # NPR/VNPR (Niu et al. 2018): dropout on the embeddings; L2 over the
+  # whole embedding matrices under common.l2_reg.
+  dropout: 0.0
+
+avbpr:
+  att_hidden: 64
+  l2_reg_projection: 0.0
+  l2_reg_visual_bias: 0.0001
+
+acf:
+  att_hidden: 64
+  # H: max items per user profile (item-level attention).  The paper
+  # uses the full history; when |R(u)| > H the profile is a seeded
+  # uniform subsample (never the lowest item indices, which correlate
+  # with popularity).  null = full history.
+  max_history: [50]
+  # Optuna hp_space mirrors the grid lists exactly so both strategies
+  # explore the same space (keeps grid/optuna comparable and the
+  # hp_space <-> optuna.db distributions consistent).
+  hp_space:
+    total_dim: { type: categorical, choices: [64, 128] }
+    learning_rate: { type: categorical, choices: [0.001, 0.01] }
+    l2_reg: { type: categorical, choices: [0.0001, 0.001] }
+    att_hidden: { type: categorical, choices: [64, 128] }
+    max_history: { type: categorical, choices: [50] }
+
+# =============================================================================
+# Hyperparameter-search strategy
+# =============================================================================
+# When ``strategy: grid`` (default), the framework runs the full Cartesian
+# product of every list above (legacy behaviour).
+#
+# When ``strategy: optuna``, the framework runs Bayesian search via Optuna,
+# sequential within each (dataset, model, embedding) cell.  Median pruning
+# kills bad trials early — typically 40-60% wall-clock saved per study.
+#
+# Per-recommender ``hp_space`` blocks (commented examples below) declare
+# continuous / log-uniform / categorical search ranges.  Without ``hp_space``,
+# Optuna falls back to sampling from the discrete lists above as if it
+# were a fancy random search.
+hp_search:
+  # "grid"   — Cartesian product over the lists declared per recommender.
+  # "optuna" — Bayesian search (block below), one study per cell.
+  # "fixed"  — NO search: every hyperparameter above (common.total_dim,
+  #            learning_rate, l2_reg and each model's extra keys) must be
+  #            a scalar or a one-element list; each cell is trained exactly
+  #            once with that configuration through train_replay, without
+  #            creating or reading an Optuna study (battery.db is never
+  #            opened).  A key with more than one value is a hard error —
+  #            nothing is picked silently.  This is the K-fold path, where
+  #            the hyperparameters were chosen beforehand (e.g. copied from
+  #            results/best_hyperparams.json of the search run).
+  strategy: "fixed" # validation profile: no search
+
+  # Parallel training processes.  0 = auto-detect from free VRAM;
+  # pinned to 1 after the 2026-08-29 OOM: an Optuna worker on
+  # amazon_fashion (166k items, full ranking) needs the whole 16 GB GPU.
+  workers: 1
+
+  optuna:
+    n_trials: 30
+    sampler: "tpe" # tpe | random | cmaes
+    pruner: "median" # median | hyperband | none
+    n_startup_trials: 5
+    warm_start: true
+    timeout_seconds: null
+    # Persistent study storage so the HP search resumes after a spot-
+    # instance restart (completed trials survive; the battery skips
+    # finished cells). The parent dir is created automatically.
+    storage: "sqlite:///results/optuna/battery.db"
+
+# --- Optional: declare continuous / log-uniform search spaces ---------------
+# Uncomment and adjust under each recommender to use Optuna's smart sampling
+# instead of falling back to the discrete lists above.
+#
+# vbpr:
+#   hp_space:
+#     total_dim:     { type: categorical, choices: [64, 128, 256] }
+#     learning_rate: { type: float,       low: 1e-5, high: 1e-1, log: true }
+#     l2_reg:        { type: float,       low: 1e-7, high: 1e-2, log: true }

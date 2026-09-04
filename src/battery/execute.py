@@ -7,6 +7,9 @@ functions rather than reimplementing training/evaluation:
   (``_optimize_one_cell``), which saves the best-trial checkpoint;
 * replay cells (other seeds) → ``train_replay`` (Task H) with the search's
   best config, under the cell's own seed;
+* under ``hp_search.strategy: fixed`` both roles collapse to one
+  ``train_replay`` of the pinned configuration (no study is created or
+  read) and the returned dict carries ``hyperparam_origin``;
 * then a single-cell final evaluation writes the per-user artifact (F).
 
 The battery runner supplies idempotency/resume/manifest around this.
@@ -21,9 +24,14 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from src.battery.cells import NO_VISUAL, BatteryCell
 from src.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from src.recommenders.hp_search import CellKey
+    from src.recommenders.hp_source import HyperparamOrigin
 
 logger = get_logger(__name__)
 
@@ -50,7 +58,7 @@ def _embedding_path(embeddings_dir: str, dataset: str, visual_config: str) -> st
 
 def execute_cell(cell: BatteryCell, config: dict) -> dict:
     """Run one battery cell: search|replay → final evaluation (F artifact)."""
-    from src.recommenders.hp_search import CellKey, create_study
+    from src.recommenders.hp_search import CellKey, create_study, get_strategy
     from src.steps.train import _optimize_one_cell, train_replay
     from src.utils.device import resolve_device
 
@@ -70,6 +78,24 @@ def execute_cell(cell: BatteryCell, config: dict) -> dict:
     n_users, n_items = _dims(processed_dir, cell.dataset)
     emb_path = _embedding_path(embeddings_dir, cell.dataset, cell.visual_config)
     ck = CellKey(cell.dataset, cell.recommender, cell.visual_config)
+
+    if get_strategy(cfg) == "fixed":
+        # No search anywhere: both roles train the pinned configuration
+        # once via train_replay.  No study is created or read, so the
+        # Optuna storage is never opened.
+        origin = _fixed_origin(cfg, ck)
+        train_replay(
+            cell=ck,
+            hyperparams=origin.hyperparams,
+            n_users=n_users,
+            n_items=n_items,
+            embeddings_path=emb_path,
+            processed_dir=processed_dir,
+            device=device,
+            config=cfg,
+        )
+        _evaluate_one_cell(cell, cfg, n_users, n_items, emb_path, device, f_out_dir=base_results)
+        return {"seed": cell.seed, "role": cell.role, "hyperparam_origin": origin.to_dict()}
 
     if cell.role == "search":
         _optimize_one_cell(
@@ -98,6 +124,19 @@ def execute_cell(cell: BatteryCell, config: dict) -> dict:
 
     _evaluate_one_cell(cell, cfg, n_users, n_items, emb_path, device, f_out_dir=base_results)
     return {"seed": cell.seed, "role": cell.role}
+
+
+def _fixed_origin(cfg: dict, ck: CellKey) -> HyperparamOrigin:
+    """Pinned hyperparameters of *ck* under ``hp_search.strategy: fixed``."""
+    from src.recommenders.hp_source import resolve_cell_hyperparams
+
+    return resolve_cell_hyperparams(
+        cfg,
+        dataset=ck.dataset_name,
+        model_name=ck.model_name,
+        embedding_name=ck.embedding_name,
+        results_root=Path(cfg["paths"]["results"]),
+    )
 
 
 def _evaluate_one_cell(

@@ -210,7 +210,12 @@ class TestPairwiseToLong:
                     "mean_b": 0.55,
                     "cohens_d": 0.1,
                     "cliffs_delta": 0.05,
-                    "cliffs_magnitude": "negligible",
+                    "n_wins": 6,
+                    "n_losses": 1,
+                    "n_ties": 93,
+                    "pct_wins": 0.06,
+                    "pct_losses": 0.01,
+                    "pct_ties": 0.93,
                 }
             ]
         )
@@ -315,7 +320,12 @@ class TestWriteConsolidatedEndToEnd:
                     "mean_b": 0.3,
                     "cohens_d": 0.5,
                     "cliffs_delta": 0.3,
-                    "cliffs_magnitude": "small",
+                    "n_wins": 40,
+                    "n_losses": 10,
+                    "n_ties": 50,
+                    "pct_wins": 0.4,
+                    "pct_losses": 0.1,
+                    "pct_ties": 0.5,
                 }
             ]
         )

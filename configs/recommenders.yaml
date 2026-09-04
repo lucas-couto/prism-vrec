@@ -28,9 +28,18 @@ common:
   # = T/2; DeepStyle d = T; ACF k = T; VNPR latent k = T (its visual
   # user vector lives in the image-feature space by construction).
   # Declaring latent_dim / visual_dim directly is refused (parity guard).
+  # Search space (validation Phase D, 2026-09-04; results/validation/
+  # phase_d_search_cost.md): of the 182 Optuna studies of the 2026-08
+  # battery only learning_rate (0.001 in 153 cells) and total_dim (128
+  # in 138) carried signal; l2_reg split 87/95 and every per-model axis
+  # ~50/50.  The grid is therefore lr x total_dim (4 points per cell),
+  # searched exhaustively under ``hp_search.strategy: grid``; l2_reg is
+  # pinned to 1e-4 (the modal full config of VBPR and DeepStyle, and the
+  # per-group lambda already used below).  Optuna re-sampled winners on
+  # this tiny categorical space (median 17 trials, 6 distinct combos).
   total_dim: [64, 128]
   learning_rate: [0.001, 0.01]
-  l2_reg: [0.0001, 0.001]
+  l2_reg: [0.0001]
   epochs: 50
   batch_size: 4096
   early_stopping_patience: 5
@@ -112,7 +121,18 @@ acf:
 # Optuna falls back to sampling from the discrete lists above as if it
 # were a fancy random search.
 hp_search:
-  strategy: "optuna" # "grid" or "optuna"
+  # "grid"   — Cartesian product over the lists declared per recommender.
+  # "optuna" — Bayesian search (block below), one study per cell.
+  # "fixed"  — NO search: every hyperparameter above (common.total_dim,
+  #            learning_rate, l2_reg and each model's extra keys) must be
+  #            a scalar or a one-element list; each cell is trained exactly
+  #            once with that configuration through train_replay, without
+  #            creating or reading an Optuna study (battery.db is never
+  #            opened).  A key with more than one value is a hard error —
+  #            nothing is picked silently.  This is the K-fold path, where
+  #            the hyperparameters were chosen beforehand (e.g. copied from
+  #            results/best_hyperparams.json of the search run).
+  strategy: "grid" # "grid" | "optuna" | "fixed" — grid: see the common: note (Phase D)
 
   # Parallel training processes.  0 = auto-detect from free VRAM;
   # pinned to 1 after the 2026-08-29 OOM: an Optuna worker on

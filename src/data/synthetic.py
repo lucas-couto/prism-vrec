@@ -1,4 +1,4 @@
-"""Synthetic dataset provider for end-to-end smoke tests.
+"""Synthetic dataset provider for tests and plumbing checks.
 
 Generates a tiny, deterministic dataset entirely in-process — no
 download, no external dependency.  Used to validate that the pipeline

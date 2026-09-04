@@ -25,8 +25,8 @@ EQUAL_DIM_OPS = [
     "prod",
     "max_pool",
     "weighted_mean",
-    "attention_weighted",
-    "gated",
+    "softmax_weighted",
+    "sigmoid_gated",
     "adaptive_gated",
 ]
 CONCAT_OPS = ["concat", "pca", "pca_per_model"]

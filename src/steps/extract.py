@@ -271,7 +271,7 @@ def _extract_for_config(
         num_workers=extract_settings.num_workers,
     )
 
-    # Honour the configured checkpoints path (e.g. checkpoints/smoke) instead
+    # Honour the configured checkpoints path (e.g. checkpoints/validation) instead
     # of a fixed 'checkpoints/' — otherwise a run under a different profile
     # resumes from another profile's stale extraction checkpoint.
     checkpoints_dir = config.get("paths", {}).get("checkpoints", "checkpoints")

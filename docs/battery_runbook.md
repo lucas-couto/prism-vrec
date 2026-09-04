@@ -80,9 +80,33 @@ uv run python main.py --battery --retry-failed
   GPU utilisation / power / memory, CPU usage and integrated energy —
   see [`observability.md`](observability.md)).
 - **Best-trial checkpoints:** `results/models/<dataset>/`.
-- **Optuna studies:** `results/optuna/battery.db`.
+- **Search progress:** grid resume records via the checkpoint manager (`hp_search.strategy: grid`); `results/optuna/battery.db` only under `strategy: optuna`.
 
 Any accuracy metric is **recomputable** from the persisted rank, for any
 `k`, without a GPU (`src/evaluation/derive_metrics.py`); the paired
 users × systems matrix for the statistical tests comes from
 `src/evaluation/paired_loader.py`.
+
+## K-fold cross-validation over the battery (`--folds`)
+
+After the hyperparameter search has finished (or with
+`hp_search.strategy: fixed`), enable `folds:` in `configs/default.yaml`
+and run:
+
+```bash
+python main.py --folds
+```
+
+The runner (`src/folds/runner.py`) is resumable through
+`results/folds/manifest.json`: a cell whose concatenated per-user
+artifact already exists is skipped. Per fold it writes the trained
+checkpoint under `<results>_fold<i>/models/` and the partial artifact
+under `results/per_user/<dataset>/folds/fold<i>/`; the final artifact
+lands in the canonical `results/per_user/<dataset>/` location, so
+`--report` and the paired statistics consume it unchanged. The manifest
+entry of every cell records the hyperparameter origin (prior search,
+with the source cell reference, or fixed config values), the partition
+summary (fold sizes, excluded users by reason), the per-fold seeds and
+fold-in reports, the between-fold mean/std of recall@k and ndcg@k, and
+the note that this variability is combined (partition + optimisation).
+See `docs/protocol.md` §3b.

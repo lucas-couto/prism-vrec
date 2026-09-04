@@ -27,12 +27,11 @@ Authored by **Lucas Silva Couto** ([ORCID 0009-0000-0641-8166](https://orcid.org
 9. [Extending the framework](#9-extending-the-framework)
 10. [Evaluation](#10-evaluation)
 11. [Performance optimisations](#11-performance-optimisations)
-12. [Smoke profile (installation validation)](#12-smoke-profile-installation-validation)
-13. [Reproducibility](#13-reproducibility)
-14. [Project structure](#14-project-structure)
-15. [Hardware requirements](#15-hardware-requirements)
-16. [Citation](#16-citation)
-17. [License](#17-license)
+12. [Reproducibility](#12-reproducibility)
+13. [Project structure](#13-project-structure)
+14. [Hardware requirements](#14-hardware-requirements)
+15. [Citation](#15-citation)
+16. [License](#16-license)
 
 ---
 
@@ -107,17 +106,7 @@ cd prism-vrec
 pip install -e . && python main.py
 ```
 
-The DataLoader workers, prefetch factor, training batch size and VNPR chunk size are picked at startup from the host's CPU count, cgroup memory budget and visible GPU VRAM (see [§13 Reproducibility](#13-reproducibility) and [`docs/observability.md`](docs/observability.md)). No manual tuning needed.
-
-### Smoke profile, validate the install in 5 minutes
-
-Before launching a multi-day run, exercise the full pipeline end-to-end on a tiny synthetic dataset (100 users, 200 items, 64×64 random images, no download). Works on any host (CPU, MPS, CUDA):
-
-```bash
-python main.py --all --config-dir configs/smoke
-```
-
-The synthetic results are meaningless by design; this is a plumbing check, every step from `preprocess` to `statistical` should complete without errors. See [§12 Smoke profile](#12-smoke-profile-installation-validation) for details.
+The DataLoader workers, prefetch factor, training batch size and VNPR chunk size are picked at startup from the host's CPU count, cgroup memory budget and visible GPU VRAM (see [§12 Reproducibility](#12-reproducibility) and [`docs/observability.md`](docs/observability.md)). No manual tuning needed.
 
 ### Inspect remaining work
 
@@ -288,8 +277,8 @@ fusion_strategies_enabled:
   - prod
   - max_pool
   - weighted_mean
-  - attention_weighted
-  - gated
+  - softmax_weighted
+  - sigmoid_gated
   - concat
   - pca
   - pca_per_model
@@ -316,10 +305,10 @@ strategies:
   # Weighted strategies are FIXED convex combinations (thesis spec);
   # distinct canonical values keep them from collapsing into `mean`.
   weighted_mean:
-    w_cnn: [0.7]          # weights (0.700, 0.300)
-  attention_weighted:
+    w_cnn: [0.3, 0.7]     # weights (0.300, 0.700) and (0.700, 0.300)
+  softmax_weighted:
     logits: [[1.0, 0.0]]  # softmax -> (0.731, 0.269)
-  gated:
+  sigmoid_gated:
     logits: [[1.0, 0.0]]  # normalised sigmoids -> (0.594, 0.406)
   concat: {}
   pca:
@@ -338,7 +327,7 @@ recommenders_enabled: ["bpr", "vbpr", "vnpr", "deepstyle", "acf"]
 common: # shared by every recommender
   total_dim: [64, 128]  # shared dimension budget T (parity guard; see below)
   learning_rate: [0.001, 0.01]
-  l2_reg: [0.0001, 0.001]
+  l2_reg: [0.0001]
   epochs: 50
   batch_size: 4096
   early_stopping_patience: 5
@@ -482,7 +471,7 @@ The framework is agnostic to the recommendation domain. The fashion starter pack
 
 - **Drop a directory** under `plugins/datasets/<name>/` with `interactions.csv` (`user_id, item_id, image_path`) plus an `images/` folder. The auto-discovery (`src/data/auto_register.py`) registers it at startup and the pipeline picks it up.
 - **Use `CSVDatasetProvider`** (`src/data/example_csv.py`) programmatically when you need finer control over splits, categories, or image sources.
-- **Use `SyntheticDatasetProvider`** (`src/data/synthetic.py`) for installation validation — it generates a tiny, deterministic dataset entirely in-process with no external download. Backs the [smoke profile](#12-smoke-profile-installation-validation).
+- **Use `SyntheticDatasetProvider`** (`src/data/synthetic.py`) for plumbing checks and tests — it generates a tiny, deterministic dataset entirely in-process with no external download. Used by the unit tests (`tests/test_synthetic_dataset.py`).
 
 The full contract for custom providers lives in `src/data/base.py`.
 
@@ -721,7 +710,7 @@ With exactly one relevant item per user, only two independent signals exist: hit
 
 #### Effect sizes and paired-difference CI
 
-- **Cliff's delta (primary)**, non-parametric and tie-robust, in `[-1, 1]`; the qualitative label (`negligible` / `small` / `medium` / `large`) follows Romano et al. thresholds. Consistent with Wilcoxon+pratt on 0/1-heavy per-user LOO metrics.
+- **Paired Cliff's delta (primary)**, `(wins − losses) / n` over per-user differences, in `[-1, 1]`, reported together with the win / loss / tie triplet (`n_wins`, `n_losses`, `n_ties` and their fractions). No magnitude label: the Romano et al. cut-offs were calibrated for the between-groups delta, and under leave-one-out the ties that dominate the denominator would make every comparison read "negligible". Read the effect as "A beats B in X% of users, loses in Y%, ties in Z%" alongside `diff_mean` and its CI. Consistent with Wilcoxon+pratt on 0/1-heavy per-user LOO metrics.
 - **Cohen's d (diagnostic only, off by default)** — parametric; on zero-dominated paired differences the `std` shrinks and `d` inflates without a sensible interpretation. Enable with `include_cohens_d: true` if needed.
 - **Paired-difference bootstrap CI** (`diff_mean`, `diff_ci_lower/upper`) on every pairwise row, resampling users: this CI must agree with the RAW (uncorrected) Wilcoxon p-value — the `significant` column is Holm-corrected, so a corrected non-significant verdict can coexist with a CI excluding zero. Per-config CIs in the summary table are descriptive — because the inference is paired, overlapping individual CIs do **not** imply absence of a significant difference.
 
@@ -755,41 +744,13 @@ Each method is toggled individually in `configs/evaluation.yaml` -> `statistical
 
 ---
 
-## 12. Smoke profile (installation validation)
-
-The framework ships with a "smoke" configuration that runs the full pipeline end-to-end on a tiny synthetic dataset (100 users, 200 items, 64×64 RGB random images, no external download). It exercises every step from `preprocess` to `statistical`, including the registry plumbing for extractors, fusions and recommenders. Wall-clock under 5 minutes on a typical laptop (CPU or MPS).
-
-> **Numerical results from the smoke profile are meaningless by design.** It is a plumbing check, not a benchmark. Use it after `pip install -e .` to confirm the install works end-to-end before launching a multi-day run.
-
-### Run it
-
-```bash
-python main.py --all --config-dir configs/smoke
-```
-
-What runs:
-
-| Knob                       | Smoke value                                            |
-| -------------------------- | ------------------------------------------------------ |
-| Dataset                    | `synthetic` (`src/data/synthetic.py`, auto-registered) |
-| Extractor                  | `resnet50` only                                        |
-| Fusion                     | `mean` only                                            |
-| Recommenders               | `bpr`, `vbpr`                                          |
-| Fusion alignment dim       | `learned`, `D32`                                       |
-| Optuna trials per cell     | 1                                                      |
-| Epochs                     | 2                                                      |
-| Condition                  | `frozen` only (skips fine-tuning)                      |
-| Output dirs                | `data/smoke_*`, `results/smoke`, `logs/smoke`          |
-
-The configs live in `configs/smoke/` (default, extractors, fusion, recommenders, evaluation, finetuning) and override the equivalents in `configs/`. The `--config-dir` flag is the canonical way to swap config bundles — useful for ablation profiles, CI smoke jobs, or experiment-specific configs without touching `configs/default.yaml`.
-
 ### Need a process supervisor?
 
 The previous `scripts/watchdog.sh` supervisor (RunPod-era operational scaffolding) has been removed in favour of platform-native supervisors. For long runs on cloud pods, use the host's own facilities (systemd unit, Kubernetes liveness probe, `tini --restart-on-exit`, Docker `restart: unless-stopped`). The pipeline is idempotent: a hard kill followed by `python main.py` resumes from the last checkpoint regardless of which supervisor restarted it.
 
 ---
 
-## 13. Reproducibility
+## 12. Reproducibility
 
 Every grid-search run uses a deterministic per-job seed derived from the job identity (`dataset`, `model`, `embedding`, `hyperparams`) XOR-ed with the global base seed (42 by default; see `_derive_job_seed` in `src/utils/training.py`). CUDA matmul is non-deterministic by default, so numerical drift between runs is about 1e-5 in FP32.
 
@@ -820,7 +781,7 @@ See [`docs/observability.md`](docs/observability.md) for the full schema and rec
 
 ---
 
-## 14. Project structure
+## 13. Project structure
 
 ```
 prism-vrec/
@@ -833,7 +794,6 @@ prism-vrec/
 │   ├── recommenders.yaml         # Grid-search hyperparameters (6 models)
 │   ├── evaluation.yaml           # Metrics, k-values, statistical tests
 │   ├── finetuning.yaml           # Fine-tuning hyperparameters
-│   └── smoke/                    # Minimal end-to-end config (see §12) — swap via --config-dir
 │
 ├── src/
 │   ├── data/
@@ -841,7 +801,7 @@ prism-vrec/
 │   │   ├── dvbpr.py              # DVBPR provider (4 fashion datasets, auto-derives categories)
 │   │   ├── categories.py         # McAuley-taxonomy → categories.csv helper
 │   │   ├── example_csv.py        # Worked-example provider for CSV+images datasets
-│   │   ├── synthetic.py          # In-process synthetic dataset (backs the smoke profile)
+│   │   ├── synthetic.py          # In-process synthetic dataset (backs the unit tests)
 │   │   └── auto_register.py      # Auto-discovery for plugins/datasets/<name>/
 │   │
 │   ├── extractors/
@@ -909,7 +869,7 @@ prism-vrec/
 
 ---
 
-## 15. Hardware requirements
+## 14. Hardware requirements
 
 The same image runs on all three tiers below. `docker compose up -d --build` is the only command the user needs, and the framework auto-detects the host (GPU presence, CPU count, cgroup memory, VRAM) at startup. The resolved values are recorded under `manifest['device']` and `manifest['dataloader_autotune']`.
 
@@ -922,7 +882,7 @@ The same image runs on all three tiers below. `docker compose up -d --build` is 
 
 ---
 
-## 16. Citation
+## 15. Citation
 
 ### Citing the framework (software)
 
@@ -933,7 +893,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.8.3},
+  version = {2.11.0},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }
@@ -947,7 +907,7 @@ The author's M.Sc. dissertation is one reported use of this framework:
 
 ```bibtex
 @mastersthesis{couto2026hybrid,
-  title   = {Hybrid Visual Feature Extraction for Clothing Recommendation Based on Deep Learning},
+  title   = {Hybrid Visual Feature Extraction for Fashion Recommendation Based on Deep Learning},
   author  = {Couto, Lucas Silva},
   advisor = {Domingues, Marcos Aurelio},
   year    = {2026},
@@ -960,10 +920,10 @@ The author's M.Sc. dissertation is one reported use of this framework:
 
 Rendered in IEEE format:
 
-> [1] L. S. Couto, "Hybrid Visual Feature Extraction for Clothing Recommendation Based on Deep Learning," M.Sc. dissertation, Graduate Program in Computer Science, Universidade Estadual de Maringá, Maringá, PR, Brazil, 2026.
+> [1] L. S. Couto, "Hybrid Visual Feature Extraction for Fashion Recommendation Based on Deep Learning," M.Sc. dissertation, Graduate Program in Computer Science, Universidade Estadual de Maringá, Maringá, PR, Brazil, 2026.
 
 ---
 
-## 17. License
+## 16. License
 
 The framework code is released under the [MIT License](LICENSE), Copyright (c) 2026 Lucas Silva Couto. Datasets bundled or referenced by the fashion starter pack remain subject to their original licenses (see [DVBPR](https://github.com/kang205/DVBPR)); review and comply with each dataset's terms before redistribution.

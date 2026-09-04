@@ -16,32 +16,7 @@ overrides. None of these knobs is mutually exclusive.
 
 ---
 
-## 0. "Smoke test — validate my install in under 5 minutes"
-
-No editing required, a `configs/smoke/` bundle ships with the framework.
-Synthetic dataset (100 users, 200 items, in-process images), one
-extractor, one fusion, two recommenders, 1 Optuna trial, 2 epochs.
-Numerical results are meaningless by design; the goal is to confirm
-that `preprocess → extract → fuse → train → evaluate → statistical →
-export_best` completes without errors on your host.
-
-Run:
-
-```bash
-python main.py --all --config-dir configs/smoke
-```
-
-Outputs land in `data/smoke_*`, `results/smoke`, `logs/smoke` (so they
-do not collide with a real run). Delete those directories to repeat
-from scratch.
-
-`--config-dir` is the canonical way to switch config bundles without
-touching `configs/default.yaml`. Useful for ablation profiles, CI smoke
-jobs, or experiment-specific configs.
-
----
-
-## 0b. "Match the sampled-evaluation protocol used by prior work"
+## 0. "Match the sampled-evaluation protocol used by prior work"
 
 Some recsys baselines (NCF-style papers, early DVBPR variants)
 report metrics over a small pool of negative samples instead of a
@@ -105,8 +80,8 @@ What happens:
   fusion, condition, metric, k) cell.
 
 Cost scales linearly with the number of seeds.  Estimate the single-
-seed cost first (see ``configs/smoke/`` for a quick check), then
-multiply.  Three seeds on the full DVBPR pipeline ≈ 3× the wall-clock
+seed cost first (a ``--config-dir`` validation profile on one dataset,
+e.g. ``configs/validation``), then multiply.  Three seeds on the full DVBPR pipeline ≈ 3× the wall-clock
 and 3× the EC2 cost — budget accordingly.
 
 The seed configured in each iteration also drives every cell-level

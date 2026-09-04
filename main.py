@@ -354,6 +354,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     selection.add_argument(
+        "--folds",
+        action="store_true",
+        help=(
+            "Run the user-level K-fold cross-validation (configs/default.yaml "
+            "-> folds:) over every battery cell with frozen hyperparameters: "
+            "train on K-1 folds, fold the held-out users in, evaluate them on "
+            "their single target, concatenate the K per-user artifacts."
+        ),
+    )
+    selection.add_argument(
         "--battery-status",
         action="store_true",
         help="Print the battery manifest state counts + remaining-cost projection.",
@@ -408,14 +418,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Alternative directory of YAML config files (e.g. configs/smoke "
-            "for the bundled smoke profile).  Defaults to 'configs/'."
+            "Alternative directory of YAML config files (e.g. "
+            "configs/validation for the pre-battery validation profile).  "
+            "Defaults to 'configs/'."
         ),
     )
 
     parser.add_argument(
         "--hp-search",
-        choices=["grid", "optuna"],
+        choices=["grid", "optuna", "fixed"],
         default=None,
         help=(
             "Override the hyperparameter-search strategy "
@@ -721,6 +732,12 @@ def main(argv: list[str] | None = None) -> None:
 
         cfg = load_config()
         battery_status(cfg["paths"]["results"])
+        return
+    if args.folds:
+        from src.folds.runner import run_folds
+
+        cfg = load_config()
+        run_folds(cfg, cfg["paths"]["results"])
         return
     if args.battery:
         from src.battery.execute import execute_cell

@@ -263,7 +263,7 @@ class HpSearchConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    strategy: Literal["grid", "optuna"] = "grid"
+    strategy: Literal["grid", "optuna", "fixed"] = "grid"
     #: Training worker processes. 0 = auto-detect from VRAM (capped at
     #: 3); 1 = fully sequential in the parent process — no spawn, no
     #: per-process VRAM caps, the whole GPU and host RAM budget for one
@@ -371,6 +371,40 @@ class CommonTrainingConfig(BaseModel):
     eval_sample_size: int | None = Field(None, ge=1)
 
 
+class FoldInConfigSchema(BaseModel):
+    """Fold-in of held-out users (``folds.fold_in``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    epochs: int = Field(5, ge=1)
+    #: ``None`` = the cell's own learning_rate / batch_size.
+    learning_rate: float | None = Field(None, gt=0)
+    batch_size: int | None = Field(None, ge=1)
+
+
+class FoldsConfig(BaseModel):
+    """User-level K-fold cross-validation (``folds:`` block).
+
+    Users are partitioned into ``k`` mutually exclusive folds; in fold i
+    the fold's users leave the training set, the model is trained on the
+    other folds with frozen hyperparameters, the held-out users are
+    folded in from their profile and evaluated on their single target
+    item.  Follows Rendle et al. (2009, §6.2): repeated splits with the
+    hyperparameter search done once and frozen.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    k: int = Field(5, ge=2)
+    #: Partition seed; fold i trains and evaluates under ``seed + i``.
+    seed: int = Field(42, ge=0)
+    #: Users whose profile (train ∪ val) is smaller are excluded from
+    #: evaluation (counted in the manifest).
+    min_profile: int = Field(2, ge=1)
+    fold_in: FoldInConfigSchema = Field(default_factory=FoldInConfigSchema)
+
+
 class FrameworkConfig(BaseModel):
     """Top-level merged config exposed to every step.
 
@@ -406,6 +440,7 @@ class FrameworkConfig(BaseModel):
         ),
     )
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+    folds: FoldsConfig = Field(default_factory=FoldsConfig)
     dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
 

@@ -82,14 +82,24 @@ Faithful:
 
 Declared divergences:
 
-* **Regularisation is NOT BPR-Opt.**  Every other recommender in this
-  framework penalises only the embedding rows gathered by the batch
-  (BPR-Opt).  Here ``_L2_USER_TABLES = _L2_ITEM_TABLES = ()`` so the base
-  class penalises ``W_u``, ``W_i``, ``W_i'`` and ``W_v`` IN FULL every
-  step under the single ``l2_reg`` weight, as the paper's objective
-  states.  ``dense`` is excluded via ``_L2_UNREGULARIZED``.  A learned
-  online-fusion module, when present, is a framework-level component
-  and keeps the framework's default (penalised in the shared term).
+* **Regularisation IS BPR-Opt, not the paper's whole matrices.**  The
+  paper adds ``λ(‖W_u‖² + ‖W_i‖² + ‖W_i'‖² + ‖W_v‖²)`` to every step.
+  Reproduced literally under Adam (validation profile, 2026-09-04) that
+  term trained the three collaborative tables to row norms of EXACTLY
+  0.0 in every cell: Adam normalises the gradient magnitude, so a row
+  that only receives the L2 gradient moves ≈ lr towards zero each step
+  regardless of ``λ`` and is dead within the first epoch; only ``W_v``,
+  fed a dense gradient by the image feature, survived, leaving a
+  visual-only ``ReLU(v_h·f_i + b)``.  VNPR therefore penalises the rows
+  gathered by the batch like every other recommender: ``W_u`` / ``W_v``
+  by the users, ``W_i`` by the positives, ``W_i'`` by the negatives
+  (see :meth:`VNPR._l2_gathered_terms`), all under the single
+  ``l2_reg`` weight.  ``dense`` stays unpenalised via
+  ``_L2_UNREGULARIZED``, as in the paper.  Full account in
+  ``docs/protocol.md`` ("VNPR regularisation"); guarded by
+  ``tests/recommenders/test_vnpr_paper.py``.  A learned online-fusion
+  module, when present, is a framework-level component and keeps the
+  framework's default (penalised in the shared term).
 * **No learning-rate decay and no per-model patience.**  The paper
   decays the learning rate and stops after 3 epochs without
   improvement.  The early-stopping budget of this framework is shared
@@ -132,11 +142,17 @@ class VNPR(BaseRecommender):
         ``latent_dim`` (required), ``dropout`` and ``l2_reg`` (optional).
     """
 
-    # Paper regularisation: whole embedding matrices under ``l2_reg``
-    # (shared term), nothing gathered per batch, dense layer free.
-    _L2_USER_TABLES: tuple[str, ...] = ()
-    _L2_ITEM_TABLES: tuple[str, ...] = ()
+    # BPR-Opt regularisation (declared divergence, see the module
+    # docstring): user rows of both user tables, positive rows of
+    # ``W_i``, negative rows of ``W_i'`` — the latter split is done in
+    # :meth:`_l2_gathered_terms`; listing both item tables here keeps
+    # them out of the shared (whole-matrix) term.  Dense layer free.
+    _L2_USER_TABLES: tuple[str, ...] = ("user_embedding", "visual_user_embedding")
+    _L2_ITEM_TABLES: tuple[str, ...] = ("item_embedding", "item_embedding_neg")
     _L2_UNREGULARIZED: tuple[str, ...] = ("dense",)
+    #: Fold-in: the user-indexed tables are ``W_u`` (``p_h``) and ``W_v``
+    #: (``v_h``).
+    _USER_TABLES: tuple[str, ...] = ("user_embedding", "visual_user_embedding")
 
     def __init__(
         self,
@@ -179,6 +195,31 @@ class VNPR(BaseRecommender):
     def train(self, mode: bool = True) -> VNPR:
         self._catalogue_visual_cache = None
         return super().train(mode)
+
+    def _l2_gathered_terms(
+        self,
+        user_ids: torch.Tensor,
+        pos_item_ids: torch.Tensor,
+        neg_item_ids: torch.Tensor,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """BPR-Opt rows of the mirrored branches.
+
+        ``W_i`` only ever scores the positive branch and ``W_i'`` the
+        negative one, so each table is gathered by its own side of the
+        triple instead of the base class's pos+neg rows for every table.
+        """
+        return [
+            (self._l2_lambda_key("user_embedding", "user"), self.user_embedding(user_ids)),
+            (
+                self._l2_lambda_key("visual_user_embedding", "user"),
+                self.visual_user_embedding(user_ids),
+            ),
+            (self._l2_lambda_key("item_embedding", "pos"), self.item_embedding(pos_item_ids)),
+            (
+                self._l2_lambda_key("item_embedding_neg", "neg"),
+                self.item_embedding_neg(neg_item_ids),
+            ),
+        ]
 
     # ------------------------------------------------------------------
     # Scoring

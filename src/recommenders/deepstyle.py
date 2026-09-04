@@ -80,6 +80,8 @@ class DeepStyle(LinearVisualScoreMixin, BaseRecommender):
     #: ``l2_reg`` — no per-group ``λ``.
     _L2_USER_TABLES = ("user_embedding",)
     _L2_EXTRA_GATHERED_TABLES = ("category_embedding",)
+    #: Fold-in: ``p_u`` is the single user-indexed table (base default).
+    _USER_TABLES = ("user_embedding",)
 
     def __init__(
         self,
