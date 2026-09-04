@@ -28,7 +28,7 @@ from src.utils.artifact_names import (
     parse_checkpoint_stem,
 )
 from src.utils.config import load_config
-from src.utils.device import resolve_device
+from src.utils.device import cap_process_vram, resolve_device
 from src.utils.logging import get_logger
 from src.utils.splits import assert_holdout_disjoint
 from src.utils.timing import note_skipped_cell, time_cell
@@ -376,6 +376,12 @@ def run(condition: str = "frozen") -> None:
 
     config = load_config()
     device = resolve_device(config["device"])
+    # Final evaluation is the heaviest ranking in the pipeline (every
+    # test user against the whole catalogue), and it runs in its own
+    # process -- the training workers' cap does not reach it.  Without
+    # this, ``default_ranking_budget`` sizes the user-batch off the whole
+    # card and the desktop freezes for the duration of the step.
+    cap_process_vram()
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
     datasets = config.get("datasets", [])

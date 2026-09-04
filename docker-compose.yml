@@ -68,13 +68,23 @@ services:
     # sizing heuristics (src/utils/memory.py, src/utils/dataloader.py)
     # read a real budget rather than the host's total RAM.
     #
-    # Default 24g suits a 32 GB workstation (8 GB left for the host).
-    # Override per host, e.g. on a 128 GB lab server:
+    # Default 16g on a 32 GB workstation.  It was 24g, which is a cap
+    # for the RUN, not for the WORKSTATION: it left ~8 GB for the
+    # desktop, the host started swapping, and the machine became
+    # unusable while a battery ran.  A single training worker peaks at
+    # roughly one embedding matrix (<= 4 GB) plus one dataset's
+    # interaction index, so 16g is ample and the other 16 GB stay with
+    # the researcher.  Override per host, e.g. on a 128 GB lab server:
     #   PRISM_MEM_LIMIT=112g docker compose up -d
     # memswap_limit equal to mem_limit disables swap for the container,
     # so hitting the cap kills one worker instead of thrashing the disk.
-    mem_limit: ${PRISM_MEM_LIMIT:-24g}
-    memswap_limit: ${PRISM_MEM_LIMIT:-24g}
+    mem_limit: ${PRISM_MEM_LIMIT:-16g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-16g}
+    # Same reasoning for the CPU: uncapped, the sampler and the
+    # dataloader workers take all 16 cores and the desktop starves.
+    # Leaving cores unclaimed is what keeps the machine interactive; the
+    # run gets the rest.  PRISM_CPUS overrides per host.
+    cpus: ${PRISM_CPUS:-12}
     # Allocate a pseudo-TTY so tqdm renders live in-place progress bars
     # (download, image extraction, feature extraction, evaluation,
     # training). Follow them with a raw stream — ``docker logs -f
@@ -127,8 +137,9 @@ services:
         trap 'rm -f "$$OVERRIDE"' EXIT
         python main.py --from download --to preprocess
     shm_size: "2g"
-    mem_limit: ${PRISM_MEM_LIMIT:-24g}
-    memswap_limit: ${PRISM_MEM_LIMIT:-24g}
+    mem_limit: ${PRISM_MEM_LIMIT:-16g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-16g}
+    cpus: ${PRISM_CPUS:-12}
 
   shell:
     build: .
@@ -178,5 +189,6 @@ services:
     stdin_open: true
     tty: true
     shm_size: "4g"
-    mem_limit: ${PRISM_MEM_LIMIT:-24g}
-    memswap_limit: ${PRISM_MEM_LIMIT:-24g}
+    mem_limit: ${PRISM_MEM_LIMIT:-16g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-16g}
+    cpus: ${PRISM_CPUS:-12}
