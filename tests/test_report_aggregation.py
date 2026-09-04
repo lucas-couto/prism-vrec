@@ -125,12 +125,13 @@ class TestFrozenVsFinetunedPairing:
 class TestPairedCliffsDelta:
     def test_bernoulli_anomaly_is_resolved(self) -> None:
         # S2's demonstrable anomaly: A~Bern(0.10) vs B~Bern(0.05) —
-        # the between-groups delta reads ~0.05 ("negligible") despite a
-        # 2x hit rate.  The paired form scores the discordant users.
+        # the between-groups delta reads ~0.05 (below every conventional
+        # cut-off) despite a 2x hit rate.  The paired form scores the
+        # discordant users, and the win/loss/tie triplet says so directly.
         from src.evaluation.statistical import (
             cliffs_delta,
-            cliffs_delta_magnitude,
             paired_cliffs_delta,
+            paired_outcomes,
         )
 
         rng = np.random.default_rng(0)
@@ -140,9 +141,11 @@ class TestPairedCliffsDelta:
 
         unpaired = cliffs_delta(a, b)
         paired = paired_cliffs_delta(a, b)
+        outcomes = paired_outcomes(a, b)
 
-        assert cliffs_delta_magnitude(unpaired) == "negligible"  # the anomaly
+        assert abs(unpaired) < 0.147  # the anomaly: "negligible" by any cut-off
         assert abs(paired) > abs(unpaired) * 0.9  # paired at least as informative
+        assert outcomes.n_wins > 1.5 * outcomes.n_losses  # A wins most discordant users
         # Direction and construction: (wins - losses) / n.
         expected = (np.sum((a - b) > 0) - np.sum((a - b) < 0)) / n
         assert paired == expected

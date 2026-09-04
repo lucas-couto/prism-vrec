@@ -84,6 +84,6 @@ For installation-validation scenarios (CI, post-install smoke check,
 ``SyntheticDatasetProvider`` (``src/data/synthetic.py``) that
 generates a tiny deterministic dataset entirely in-process — no
 download, no external files.  It is auto-registered under the name
-``synthetic`` and powers the bundled smoke profile
-(``python main.py --all --config-dir configs/smoke``, see
-[the README](../../README.md#12-smoke-profile-installation-validation)).
+``synthetic`` and backs the framework's unit tests
+(``tests/test_synthetic_dataset.py``); point ``datasets: ["synthetic"]``
+at it from any ``--config-dir`` profile for a plumbing check.

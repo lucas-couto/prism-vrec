@@ -43,6 +43,19 @@ class CellMetadata:
     Evaluate fills the identity + protocol fields; the runner (Task I)
     fills ``git_sha`` / ``git_dirty`` / ``env`` / ``gpu`` / ``durations``
     / ``config_hash`` (left at defaults here).
+
+    ``fold`` records the K-fold provenance of the artifact and is ``None``
+    for leave-one-out cells (every ``.meta.json`` written before the field
+    existed reads back as ``None``).  Two shapes are used:
+
+    * partial artifact of one fold (``folds/fold<i>/...``)::
+
+          {"index": i, "k": K, "seed": <fold seed>, "n_users": n_i}
+
+    * concatenated cell artifact (canonical location, no ``index``)::
+
+          {"k": K, "seeds": [seed_0, ..., seed_{K-1}],
+           "n_users_per_fold": [n_0, ..., n_{K-1}]}
     """
 
     dataset: str
@@ -62,6 +75,8 @@ class CellMetadata:
     durations: dict = field(default_factory=dict)
     env: dict = field(default_factory=dict)
     gpu: str | None = None
+    # K-fold provenance (see class docstring); None for leave-one-out cells.
+    fold: dict | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -237,6 +237,12 @@ class TestTradesyDegeneration:
                 rank_v = torch.sort(vbpr.predict(user, items), descending=True, stable=True).indices
                 rank_d = torch.sort(ds.predict(user, items), descending=True, stable=True).indices
                 assert torch.equal(rank_v, rank_d)
+            batch_v = vbpr.predict_batch(torch.arange(N_USERS), items)
+            batch_d = ds.predict_batch(torch.arange(N_USERS), items)
+        assert torch.equal(
+            torch.argsort(batch_v, dim=1, descending=True, stable=True),
+            torch.argsort(batch_d, dim=1, descending=True, stable=True),
+        )
 
 
 class TestCostParity:
@@ -247,3 +253,198 @@ class TestCostParity:
         e_params = sum(p.numel() for p in ds.visual_projection.parameters())
 
         assert e_params == RAW_DIM * K  # single linear, no hidden layer
+
+
+# ---------------------------------------------------------------- training
+class _RestrictedVBPR(VBPR):
+    """The RESTRICTED VBPR of the module docstring, kept restricted under training.
+
+    Exactly the restrictions the degeneration is stated against, and
+    nothing else: one user table (``θ_u ≡ γ_u``, so the gathered L2 sees
+    ``γ_u`` once, as DeepStyle sees ``p_u``), ``β_i ≡ 0`` and ``β' ≡ 0``
+    frozen.  Scoring, loss and every other parameter are VBPR's own.
+    """
+
+    _L2_USER_TABLES = ("user_embedding",)
+
+    def _visual_user_table(self) -> nn.Embedding:
+        return self.user_embedding
+
+
+def _synthetic_interactions(seed: int = 5) -> dict[int, set[int]]:
+    rng = np.random.default_rng(seed)
+    return {u: set(rng.choice(N_ITEMS, size=6, replace=False).tolist()) for u in range(N_USERS)}
+
+
+def _trained_pair(l2_reg: float, steps: int = 30) -> tuple[_RestrictedVBPR, DeepStyle]:
+    """Same init, same batches, same optimiser: ``steps`` real BPR steps each."""
+    from src.utils.amp_compat import get_grad_scaler
+    from src.utils.training import BPRBatchSampler, bpr_step
+
+    ds = _deepstyle(None, {"latent_dim": K, "l2_reg": l2_reg})
+    torch.manual_seed(3)
+    vbpr = _RestrictedVBPR(
+        N_USERS,
+        N_ITEMS,
+        visual_embeddings=_visual(),
+        # DeepStyle puts E under its single λ (Eq. 6); VBPR's λ_E defaults to 0.
+        config={"latent_dim": K, "visual_dim": K, "l2_reg": l2_reg, "l2_reg_projection": l2_reg},
+    )
+    with torch.no_grad():
+        vbpr.user_embedding.weight.copy_(ds.user_embedding.weight)
+        vbpr.item_embedding.weight.copy_(ds.item_embedding.weight)
+        vbpr.visual_projection.weight.copy_(ds.visual_projection.weight)
+        vbpr.visual_user_embedding.weight.zero_()  # unreachable under the tie
+        vbpr.item_bias.weight.zero_()
+        vbpr.visual_bias.zero_()
+    for frozen in (vbpr.visual_user_embedding.weight, vbpr.item_bias.weight, vbpr.visual_bias):
+        frozen.requires_grad_(False)
+    # float64 so the only tolerance left is the analytic cancellation itself.
+    vbpr.double().train()
+    ds.double().train()
+
+    sampler = BPRBatchSampler(_synthetic_interactions(), N_ITEMS, batch_size=8, seed=11)
+    batches = [batch for epoch in range(steps) for batch in sampler.epoch(epoch)][:steps]
+    assert len(batches) == steps
+    optimisers = (
+        torch.optim.SGD([p for p in vbpr.parameters() if p.requires_grad], lr=0.1),
+        torch.optim.SGD([p for p in ds.parameters() if p.requires_grad], lr=0.1),
+    )
+    scaler = get_grad_scaler(enabled=False)
+    for users, pos, neg in batches:
+        for model, optimiser in zip((vbpr, ds), optimisers, strict=True):
+            bpr_step(model, optimiser, scaler, users, pos, neg, device="cpu", use_cuda=False)
+    return vbpr.eval(), ds.eval()
+
+
+@pytest.mark.parametrize("l2_reg", [0.0, 1e-3], ids=["no_l2", "l2"])
+class TestTradesyDegenerationAfterTraining:
+    """The degeneration is a property of the OBJECTIVE, so it survives training.
+
+    ``∂(ŷ_ui − ŷ_uj)/∂l = −p_u + p_u = 0`` and ``l`` cancels in the
+    gradients of ``p_u``, ``q_i`` and ``E``: the shared parameters of
+    the two models follow the same trajectory and only ``l`` drifts
+    (under L2).  Neither the pairwise scores nor the per-user rankings
+    can therefore diverge.
+    """
+
+    def test_training_actually_moves_the_shared_parameters(self, l2_reg: float) -> None:
+        vbpr, ds = _trained_pair(l2_reg)
+        fresh = _deepstyle(None, {"latent_dim": K, "l2_reg": l2_reg}).double()
+
+        assert not torch.allclose(ds.user_embedding.weight, fresh.user_embedding.weight)
+        assert not torch.allclose(ds.item_embedding.weight, fresh.item_embedding.weight)
+        assert not torch.allclose(vbpr.visual_projection.weight, fresh.visual_projection.weight)
+
+    def test_shared_parameters_follow_the_same_trajectory(self, l2_reg: float) -> None:
+        vbpr, ds = _trained_pair(l2_reg)
+
+        torch.testing.assert_close(vbpr.user_embedding.weight, ds.user_embedding.weight)
+        torch.testing.assert_close(vbpr.item_embedding.weight, ds.item_embedding.weight)
+        torch.testing.assert_close(vbpr.visual_projection.weight, ds.visual_projection.weight)
+        assert torch.all(vbpr.item_bias.weight == 0) and torch.all(vbpr.visual_bias == 0)
+
+    def test_pairwise_differences_match_after_training(self, l2_reg: float) -> None:
+        vbpr, ds = _trained_pair(l2_reg)
+        users, pos, neg = (
+            torch.tensor([0, 1, 2, 5]),
+            torch.tensor([1, 5, 9, 2]),
+            torch.tensor([3, 7, 11, 30]),
+        )
+
+        with torch.no_grad():
+            v_pos, v_neg = vbpr(users, pos, neg)
+            d_pos, d_neg = ds(users, pos, neg)
+
+        torch.testing.assert_close(v_pos - v_neg, d_pos - d_neg, rtol=0, atol=1e-9)
+
+    def test_rankings_match_after_training_in_predict_and_predict_batch(
+        self, l2_reg: float
+    ) -> None:
+        vbpr, ds = _trained_pair(l2_reg)
+        items, users = torch.arange(N_ITEMS), torch.arange(N_USERS)
+
+        with torch.no_grad():
+            batch_v = vbpr.predict_batch(users, items)
+            batch_d = ds.predict_batch(users, items)
+            for user in range(N_USERS):
+                rank_v = torch.argsort(vbpr.predict(user, items), descending=True, stable=True)
+                rank_d = torch.argsort(ds.predict(user, items), descending=True, stable=True)
+                assert torch.equal(rank_v, rank_d), f"user {user}"
+        assert torch.equal(
+            torch.argsort(batch_v, dim=1, descending=True, stable=True),
+            torch.argsort(batch_d, dim=1, descending=True, stable=True),
+        )
+
+    def test_absolute_scores_differ_by_the_per_user_constant_p_u_dot_l(self, l2_reg: float) -> None:
+        vbpr, ds = _trained_pair(l2_reg)
+        items, users = torch.arange(N_ITEMS), torch.arange(N_USERS)
+
+        with torch.no_grad():
+            offset = ds.predict_batch(users, items) - vbpr.predict_batch(users, items)
+            expected = -(ds.user_embedding.weight @ ds.category_embedding.weight[0])
+
+        assert not torch.allclose(offset, torch.zeros_like(offset))  # l ≠ 0: scores differ
+        torch.testing.assert_close(offset, expected.unsqueeze(1).expand_as(offset))
+
+
+# ------------------------------------------------------ category cancellation
+class TestNullCategoryCancellation:
+    """Perturbing the single ``l`` moves absolute scores, never pairs or rankings."""
+
+    def _scores(self, ds: DeepStyle) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        users, pos, neg = torch.tensor([0, 1, 2]), torch.tensor([1, 5, 9]), torch.tensor([3, 7, 11])
+        with torch.no_grad():
+            s_pos, s_neg = ds(users, pos, neg)
+            batch = ds.predict_batch(torch.arange(N_USERS), torch.arange(N_ITEMS))
+            single = torch.stack([ds.predict(u, torch.arange(N_ITEMS)) for u in range(N_USERS)])
+        return s_pos - s_neg, batch, single
+
+    def _perturbed(self) -> tuple[DeepStyle, torch.Tensor]:
+        ds = _deepstyle(None).eval()
+        torch.manual_seed(9)
+        delta = torch.randn(K)
+        with torch.no_grad():
+            ds.category_embedding.weight[0] += delta
+        ds.train().eval()  # drop the full-catalogue style cache
+        return ds, delta
+
+    def test_pairwise_difference_and_rankings_are_invariant(self) -> None:
+        before = self._scores(_deepstyle(None).eval())
+        ds, _ = self._perturbed()
+
+        after = self._scores(ds)
+
+        torch.testing.assert_close(after[0], before[0])
+        for name, b, a in (
+            ("predict_batch", before[1], after[1]),
+            ("predict", before[2], after[2]),
+        ):
+            assert torch.equal(
+                torch.argsort(b, dim=1, descending=True, stable=True),
+                torch.argsort(a, dim=1, descending=True, stable=True),
+            ), name
+
+    def test_absolute_scores_shift_by_minus_p_u_dot_delta(self) -> None:
+        before = self._scores(_deepstyle(None).eval())
+        ds, delta = self._perturbed()
+
+        after = self._scores(ds)
+        shift = -(ds.user_embedding.weight @ delta).unsqueeze(1)
+
+        assert not torch.allclose(after[1], before[1])
+        torch.testing.assert_close(after[1] - before[1], shift.expand_as(before[1]))
+        torch.testing.assert_close(after[2] - before[2], shift.expand_as(before[2]))
+
+    def test_with_real_categories_the_cancellation_does_not_hold(self) -> None:
+        """Negative control: the cancellation is a single-category property."""
+        ds = _deepstyle(_categories()).eval()
+        before = self._scores(ds)[0]
+        with torch.no_grad():
+            ds.category_embedding.weight[0] += 1.0  # pos item 1 (cat 1) vs neg item 3 (cat 3)
+            ds.category_embedding.weight[1] += 1.0  # cat(1)=1 shifts, cat(3)=3 does not
+        ds.train().eval()
+
+        after = self._scores(ds)[0]
+
+        assert not torch.allclose(after, before)

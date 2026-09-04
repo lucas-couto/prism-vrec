@@ -18,11 +18,36 @@ from src.evaluation.beyond_accuracy import (
     category_entropy_at_k,
     compute_user_beyond_accuracy,
     efd_at_k,
+    efd_excluded_frac_at_k,
     ild_at_k,
 )
 
 # pop = [1/2, 1/4, 1/8, 0]: self-information 1, 2, 3 bits (item 3 unseen).
 _POP = np.array([0.5, 0.25, 0.125, 0.0])
+
+
+class TestEfdExcludedFrac:
+    def test_should_report_the_share_of_zero_popularity_items_in_the_top_k(self) -> None:
+        # Item 3 is unseen in train: 1 of the 3 top slots is excluded from EFD.
+        assert efd_excluded_frac_at_k([0, 3, 1], _POP, 3) == pytest.approx(1 / 3)
+
+    def test_should_be_zero_when_every_item_has_train_popularity(self) -> None:
+        assert efd_excluded_frac_at_k([0, 1, 2], _POP, 3) == 0.0
+
+    def test_should_be_one_when_every_item_is_cold(self) -> None:
+        assert efd_excluded_frac_at_k([3, 3], _POP, 2) == 1.0
+        assert math.isnan(efd_at_k([3, 3], _POP, 2))
+
+    def test_should_be_nan_for_an_empty_list(self) -> None:
+        assert math.isnan(efd_excluded_frac_at_k([], _POP, 5))
+
+    def test_should_be_emitted_next_to_efd_per_user(self) -> None:
+        embeddings = np.eye(4, dtype=np.float32)
+
+        out = compute_user_beyond_accuracy([0, 3, 1], _POP, embeddings, None, [3])
+
+        assert out["efd_excluded_frac@3"] == pytest.approx(1 / 3)
+        assert out["efd@3"] == pytest.approx(1.5)
 
 
 class TestEfdAtK:
@@ -135,10 +160,19 @@ class TestComputeUserBeyondAccuracy:
         emb = np.eye(4)
         cats = np.array([0, 0, 1, 1])
         out = compute_user_beyond_accuracy([0, 1, 2], _POP, emb, cats, [2, 3])
-        assert set(out) == {"efd@2", "ild@2", "cat_entropy@2", "efd@3", "ild@3", "cat_entropy@3"}
+        assert set(out) == {
+            "efd@2",
+            "efd_excluded_frac@2",
+            "ild@2",
+            "cat_entropy@2",
+            "efd@3",
+            "efd_excluded_frac@3",
+            "ild@3",
+            "cat_entropy@3",
+        }
 
     def test_no_cat_entropy_key_without_categories(self) -> None:
         # N/A stays N/A: the key is absent, not NaN and not 0.
         emb = np.eye(4)
         out = compute_user_beyond_accuracy([0, 1, 2], _POP, emb, None, [3])
-        assert set(out) == {"efd@3", "ild@3"}
+        assert set(out) == {"efd@3", "efd_excluded_frac@3", "ild@3"}

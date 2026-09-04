@@ -15,12 +15,14 @@ from pathlib import Path
 
 import pytest
 
+import src.folds.foldin as foldin_mod
+import src.folds.partition as partition_mod
 import src.steps.train as train_mod
 import src.utils.parallel as parallel_mod
 import src.utils.training as training_mod
 from src.evaluation.protocol import Evaluator
 
-_TRAINING_MODULES = [train_mod, training_mod, parallel_mod]
+_TRAINING_MODULES = [train_mod, training_mod, parallel_mod, foldin_mod, partition_mod]
 
 
 class TestNoTestCsvInSelectionPaths:

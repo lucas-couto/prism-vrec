@@ -138,9 +138,10 @@ items unseen by the user. **Every recorded result row carries a
 `protocol` column**; train-time BPR negative sampling is a different
 thing entirely and is not configurable here.
 
-**Model selection on validation.** Early stopping and the Optuna
-objective (`ndcg@10`) score the **validation** held-outs, never the
-test set: the training path loads `val.csv` and masks each user's train
+**Model selection on validation.** Early stopping and the search
+objective (`ndcg@10`; exhaustive grid over `learning_rate × total_dim`
+since validation Phase D, `results/validation/phase_d_search_cost.md`)
+score the **validation** held-outs, never the test set: the training path loads `val.csv` and masks each user's train
 items (`src/steps/train.py`, `src/utils/parallel.py`;
 `src/utils/training.py` builds the selection `Evaluator`). The test set
 is read only by the final evaluate step (`src/steps/evaluate.py`), so
@@ -181,6 +182,47 @@ user's own val/test positives are eligible to be drawn as negatives
 (`src/utils/training.py` excludes only the user's train items) — the
 standard protocol, with negligible metric deflation given catalogue
 sizes.
+
+## 3b. User-level K-fold cross-validation (`python main.py --folds`)
+
+Precedent: Rendle et al. (UAI 2009, §6.2) evaluate BPR with
+leave-one-out, repeat the experiment 10 times over freshly drawn splits,
+and run the hyperparameter grid search **once, on the first round**,
+keeping the winners constant afterwards. Section 2 of the same paper
+notes that the fold-in strategy known for MF applies to BPR. The
+`folds:` block of `configs/default.yaml` reproduces that procedure with
+users as the partition unit:
+
+- Users are split into `k` mutually exclusive, balanced folds
+  (`src/folds/partition.py`, seeded). A user is eligible when it has
+  exactly one `test.csv` item (the target) and a profile
+  `train ∪ val` of at least `min_profile` items; ineligible users are
+  counted in the manifest (`no_target`, `profile_too_small`) and stay in
+  the training pool.
+- In fold *i* the fold's users leave the training set. The model trains
+  on the other folds (history `train` only, early stopping on `val`; no
+  user's `test.csv` item ever enters training, as in the sequential
+  protocol)
+  with the cell's **frozen** hyperparameters — the prior search's winner
+  from `results/best_hyperparams.json`, or the fixed values of the config
+  under `hp_search.strategy: fixed` (`src/recommenders/hp_source.py`
+  records which). Fold *i* runs under seed `folds.seed + i`.
+- The held-out users are **folded in** (`src/folds/foldin.py`): their
+  rows in every user table are re-initialised, every other parameter is
+  frozen, and only those rows are optimised with the same BPR loss and
+  negative sampler over the profile alone. History-consuming models
+  rebuild the user's non-parametric state from the profile.
+- Each held-out user is then ranked on its single target with the
+  profile masked, which keeps `_require_leave_one_out` satisfied and the
+  per-user artifact identical in format to a normal cell.
+- The `k` partial artifacts are **concatenated** (`src/folds/aggregate.py`)
+  into the cell's canonical artifact with `n` = every evaluated user, so
+  Wilcoxon, Holm and Cliff's δ stay paired by user without change.
+  Between-fold mean and standard deviation are recorded in the manifest
+  as descriptive variability only.
+- Folds and seeds are distinct variance sources: the manifest states that
+  the reported between-fold variability is combined (partition +
+  optimisation). The multi-seed robustness experiment stays separate.
 
 ## 4. Deterministic tie-breaking
 
@@ -250,13 +292,24 @@ size, so the real exact-tie frequency is measured during the battery.
   FWER), percentile bootstrap CIs.
 - **Effect size: PAIRED Cliff's delta is primary** — ``(wins −
   losses) / n`` over per-user differences, the same pairing the
-  Wilcoxon uses (thresholds 0.147/0.33/0.474; ties count in the
-  denominator, consistent with ``pratt``). The between-groups form
-  collapses to ``p_a − p_b`` on the 0/1-heavy LOO metrics and reads
-  "negligible" even when one method wins every discordant pair, so it
-  is not reported. Cohen's d is parametric and inflates on such
-  vectors (the std shrinks); it is off by default and available for
-  diagnostics only.
+  Wilcoxon uses (ties count in the denominator, consistent with
+  ``pratt``), reported **together with the win / loss / tie triplet**
+  (`n_wins`, `n_losses`, `n_ties`, `pct_wins`, `pct_losses`,
+  `pct_ties`). **No magnitude label is attached**: the Romano et al.
+  (2006) cut-offs 0.147 / 0.33 / 0.474 were calibrated for the
+  between-groups delta against Cohen's d; the paired delta is a
+  different quantity, and under leave-one-out the ties that dominate
+  the denominator (both models miss the single held-out for most
+  users) bound it to tiny values, so every comparison would read
+  "negligible" — including consistent ones. The net delta is also
+  ambiguous on its own (1% wins / 0% losses / 99% ties and 50.5% /
+  49.5% / 0% both give δ = 0.01), which is why the triplet is the
+  reported interpretation: "A beats B in X% of users, loses in Y%,
+  ties in Z%, δ = X − Y", read alongside `diff_mean` and its CI. The
+  between-groups form collapses to ``p_a − p_b`` on the 0/1-heavy LOO
+  metrics and is not reported. Cohen's d is parametric and inflates on
+  such vectors (the std shrinks); it is off by default and available
+  for diagnostics only.
 - **Paired-difference bootstrap CI** on every pairwise row
   (`diff_mean`, `diff_ci_lower/upper`, resampling USERS): a RAW 95% CI
   whose agreement is with the raw Wilcoxon p-value at alpha, NOT with
@@ -321,9 +374,35 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   bias, single `λ` (Eq. 6). ACF: Eq. 6 score (no visual term, no item
   bias), attention nets and projections unpenalised (Eq. 5). VNPR:
   Hadamard merge + single-neuron ReLU dense, mirrored item tables,
-  ½-averaged branches at inference, L2 over the whole embedding
-  matrices. The BPR-Opt gathered-row reading of the L2 term stays the
-  framework default for the MF family; the constants are per group.
+  ½-averaged branches at inference; its L2 is the BPR-Opt gathered-row
+  reading, NOT the paper's whole matrices (declared divergence, see the
+  next item). The BPR-Opt gathered-row reading of the L2 term is the
+  framework default for every built-in; the constants are per group.
+- **VNPR regularisation: whole-matrix L2 under Adam collapses the
+  model (found 2026-09-04, validation profile).** Reproducing the
+  paper's objective literally — `λ(‖W_u‖² + ‖W_i‖² + ‖W_i'‖² + ‖W_v‖²)`
+  added to every step — trained the three collaborative tables to
+  row norms of EXACTLY 0.0 in every VNPR cell (Amazon Men, lr 1e-3,
+  λ 1e-4, batch 4096), while VBPR/DeepStyle/BPR under BPR-Opt kept
+  norms 0.4–1.9. Mechanism: Adam normalises gradient magnitude, so a
+  row that receives only the L2 gradient moves ≈ lr towards zero at
+  every step regardless of λ; with 46 steps per epoch a Xavier row
+  (~0.05) is dead within the first epoch, and only `W_v`, which gets a
+  dense gradient from the image feature every step, survives. The
+  model degenerates to `ReLU(v_h·f_i + b)`, a visual-only scorer. On
+  the learned-fusion input (`hybrid_mean_learned_D128`, ‖f‖ ≈ 1 vs
+  10.7 for ResNet-50 and 31.9 for ViT) even that term is flat (per-user
+  score spread over items 0.024 vs 0.38/0.58): val metric 0.0002,
+  recall@10 0.0007, reproduced across three trainings. Workaround
+  adopted: VNPR regularises the rows gathered by the batch like every
+  other recommender (`W_i` by the positives, `W_i'` by the negatives,
+  `W_u`/`W_v` by the users; dense layer unpenalised as in the paper).
+  Comparability across recommenders is preferred over this fidelity
+  detail; the paper does not state an optimiser that would make the
+  literal objective usable. Guarded by
+  `tests/recommenders/test_vnpr_paper.py::test_adam_training_keeps_rows_outside_the_batch_at_their_initial_norm`.
+  Every VNPR checkpoint trained before this change is visual-only and
+  must be discarded.
 - **DeepStyle (paper formulation)**: the item style term is
   `s_i = E·f_i − l_cat(i)` — a linear projection `E` (`D_backbone → d`)
   minus a **learned category embedding** subtracted in the style space,
@@ -402,6 +481,40 @@ entre as normas médias das fontes medida é de ~16× nas features brutas e
 norma dominaria as fusões aditivas, tornando a comparação entre
 estratégias um artefato de escala.
 
+O ponto em que a normalização é aplicada depende do caminho (auditoria
+de fusão, 2026-09-04):
+
+| Caminho | Estratégias | Onde normaliza |
+|---|---|---|
+| Offline nativo | `concat`, `pca`, `pca_per_model` | nas features nativas, antes da operação; a matriz de fit da PCA conjunta também é normalizada |
+| Online aprendido (`alignment.method: learned`) | família equal-dim | depois do `Linear(D_i → dim)` por fonte, antes da operação |
+| Alinhamento por PCA (`alignment.method: pca`) | família equal-dim | a PCA por fonte é ajustada nas features brutas; a normalização é aplicada às fontes já reduzidas |
+
+Consequências declaradas:
+
+- **`sum` = 2 × `mean`**, exatamente, nos dois caminhos: as fontes são
+  unitárias antes da operação e nada normaliza o vetor fundido depois.
+  O fator é absorvido pela projeção linear do recomendador (`E`), de modo
+  que a diferença residual entre as duas células é apenas a penalidade L2
+  sobre `E` (treinar com `sum` equivale a treinar `mean` com `l2_reg`
+  quatro vezes menor) e a trajetória de otimização. `sum` permanece na
+  bateria como controle de sensibilidade à escala, não como mecanismo de
+  fusão distinto.
+- **`mean`, `sigmoid_gated`, `weighted_mean` e `softmax_weighted`** são a
+  mesma combinação convexa `w·e_cnn + (1−w)·e_vit` com `w` fixo
+  (0.500, 0.594, 0.300/0.700 e 0.731 respectivamente). O que distingue
+  os três membros ponderados é como `w` é derivado do valor configurado
+  (direto, sigmoides normalizadas, softmax), conforme a Seção 3.4 da
+  qualificação. `weighted_mean` cobre os dois lados (`w_cnn` 0.3 e 0.7)
+  para que a varredura não fique restrita ao semiplano CNN-dominante.
+- **`concat`** opera em 2816 dimensões nativas, contra 128 da família
+  equal-dim. A capacidade da camada visual aprendida é comparável: a
+  família equal-dim aprende `Linear(2048→128)` + `Linear(768→128)` mais
+  `E(128→k_v)`, e `concat` aprende `E(2816→k_v)`; com `k_v = 128` os
+  totais coincidem. A diferença estrutural é profundidade e a
+  normalização intermediária, não contagem de parâmetros, e deve ser
+  reportada junto do resultado de `concat`.
+
 ### 10.4. Desempate no ranking
 
 Empates exatos de score são resolvidos por uma permutação aleatória fixa
@@ -433,3 +546,26 @@ ativa por seed. A avaliação final de cada célula consome o checkpoint do
 melhor trial (cujo early stopping já rodou em validação) — não há
 re-treino pós-busca, e o procedimento é idêntico para todos os modelos.
 O conjunto de teste permanece intocado até a avaliação final.
+
+### 10.7. Validação cruzada K-fold por usuário
+
+Seguindo Rendle et al. (2009, §6.2), que repetem o experimento de
+leave-one-out dez vezes sobre novas partições e otimizam os
+hiperparâmetros por busca em grade apenas na primeira rodada, mantendo-os
+constantes nas demais, a validação cruzada particiona **usuários** em K
+folds mutuamente exclusivos. No fold *i*, os usuários do fold saem do
+treino; o modelo é treinado nos demais folds — apenas com o histórico de
+treino desses usuários (o item de teste fica fora do treino para todos os
+usuários, como no protocolo sequencial) — com os hiperparâmetros
+**congelados** da busca prévia (ou fixados na configuração), sob a seed
+`seed + i`; os usuários retidos são incorporados por *fold-in* — apenas
+as linhas de usuário são otimizadas, com todos os demais parâmetros
+congelados, a partir do perfil (train ∪ val) — estratégia que o próprio
+paper do BPR (§2) indica como aplicável ao método; e cada um é avaliado
+no seu único item-alvo (o held-out de teste). Como cada usuário é
+avaliado exatamente uma vez ao longo dos K folds, os registros por usuário
+são concatenados num único conjunto por célula, preservando o usuário como
+unidade dos testes pareados; a média e o desvio-padrão entre folds são
+reportados apenas como variabilidade descritiva, combinada (partição e
+otimização). A busca de hiperparâmetros não é aninhada nos folds, por
+reprodução do procedimento original.

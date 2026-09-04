@@ -142,6 +142,34 @@ class ACF(BaseRecommender):
         self.register_buffer("history_items", items, persistent=False)
         self.register_buffer("history_mask", mask, persistent=False)
 
+    def rebuild_user_state(self, interactions: dict[int, set[int]]) -> None:
+        """Rewrite the history rows of the users in ``interactions`` only.
+
+        Fold-in hook: ``R(u)`` is non-parametric state, so a folded-in
+        user's profile must be written into the existing
+        ``history_items`` / ``history_mask`` buffers in place (the
+        horizon ``H`` is fixed at construction; a profile longer than
+        ``H`` is sub-sampled by the same seeded rule as
+        :meth:`_select_history`).  Rows of every other user are left
+        untouched.  Users outside ``[0, n_users)`` are ignored, as in
+        :meth:`_build_history`; a user with an empty set gets an empty
+        history.  Invalidates the eval-mode component cache.
+        """
+        horizon = int(self.history_items.shape[1])
+        device = self.history_items.device
+        for user, item_set in interactions.items():
+            if not 0 <= user < self.n_users:
+                continue
+            chosen = self._select_history(user, sorted(item_set), horizon)
+            self.history_items[user] = 0
+            self.history_mask[user] = False
+            if chosen:
+                self.history_items[user, : len(chosen)] = torch.tensor(
+                    chosen, dtype=torch.long, device=device
+                )
+                self.history_mask[user, : len(chosen)] = True
+        self._comp_cache = None
+
     def _select_history(self, user: int, pool: list[int], horizon: int) -> list[int]:
         """Uniform sample without replacement of ``horizon`` items when needed.
 

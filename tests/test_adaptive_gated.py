@@ -149,11 +149,11 @@ def test_factory_rejects_unknown_strategy() -> None:
 
 
 def test_learned_alignment_logit_ops_use_fixed_buffers() -> None:
-    """Thesis spec: attention_weighted / gated logits are FIXED config
+    """Thesis spec: softmax_weighted / sigmoid_gated logits are FIXED config
     values, never trainable — only adaptive_gated is a learned fusion."""
     from src.fusions.online import LearnedAlignmentFusion
 
-    for strategy in ("attention_weighted", "gated"):
+    for strategy in ("softmax_weighted", "sigmoid_gated"):
         module = LearnedAlignmentFusion([6, 4], dim=8, strategy=strategy, logits=[1.0, 0.0])
 
         torch.testing.assert_close(module.fixed_logits, torch.tensor([1.0, 0.0]))
@@ -165,7 +165,7 @@ def test_learned_alignment_logit_ops_reject_wrong_length() -> None:
     from src.fusions.online import LearnedAlignmentFusion
 
     with pytest.raises(ValueError, match="logits"):
-        LearnedAlignmentFusion([6, 4], dim=8, strategy="gated", logits=[1.0, 0.0, -1.0])
+        LearnedAlignmentFusion([6, 4], dim=8, strategy="sigmoid_gated", logits=[1.0, 0.0, -1.0])
 
 
 def test_adaptive_gated_is_the_only_learned_fusion_op() -> None:
@@ -173,7 +173,7 @@ def test_adaptive_gated_is_the_only_learned_fusion_op() -> None:
     mirroring op; adaptive_gated alone adds trainable gate parameters."""
     from src.fusions.online import LearnedAlignmentFusion
 
-    for strategy in ("mean", "weighted_mean", "attention_weighted", "gated"):
+    for strategy in ("mean", "weighted_mean", "softmax_weighted", "sigmoid_gated"):
         kwargs = {"weights": [0.7, 0.3]} if strategy == "weighted_mean" else {}
         module = LearnedAlignmentFusion([6, 4], dim=8, strategy=strategy, **kwargs)
         non_projection = [

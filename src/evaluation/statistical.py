@@ -61,6 +61,7 @@ exposes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import combinations
 
 import numpy as np
@@ -178,9 +179,9 @@ def cohens_d_paired(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
 def cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
     """Cliff's delta non-parametric effect size in ``[-1, 1]``.
 
-    ``δ = P(A > B) - P(A < B)``.  Conventional thresholds (Romano et
-    al. 2006): ``|δ| < 0.147`` negligible, ``< 0.33`` small, ``< 0.474``
-    medium, ``≥ 0.474`` large.
+    ``δ = P(A > B) - P(A < B)`` over the cross product of the two
+    samples.  Kept for reference only: the pairwise report uses the
+    within-pair form (:func:`paired_cliffs_delta`).
 
     Implemented in O(n log n) via merge-sort rank counting so it scales
     to large per-user score arrays without a quadratic blow-up.
@@ -201,6 +202,55 @@ def cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
     return float(delta)
 
 
+@dataclass(frozen=True)
+class PairedOutcomes:
+    """Per-user win / loss / tie counts of A against B (same pairing as Wilcoxon).
+
+    The within-pair Cliff's delta ``(n_wins - n_losses) / n`` is a net
+    quantity and hides which of two very different situations produced
+    it — 1% wins / 0% losses / 99% ties (A never loses) reads exactly
+    like 50.5% / 49.5% / 0% (noise).  The triplet is the sufficient
+    statistic of the sign test and is what the report interprets.
+    """
+
+    n_wins: int
+    n_losses: int
+    n_ties: int
+
+    @property
+    def n(self) -> int:
+        return self.n_wins + self.n_losses + self.n_ties
+
+    @property
+    def pct_wins(self) -> float:
+        return self.n_wins / self.n if self.n else 0.0
+
+    @property
+    def pct_losses(self) -> float:
+        return self.n_losses / self.n if self.n else 0.0
+
+    @property
+    def pct_ties(self) -> float:
+        return self.n_ties / self.n if self.n else 0.0
+
+    @property
+    def delta(self) -> float:
+        """Within-pair Cliff's delta ``(wins - losses) / n``; ties in the denominator."""
+        return (self.n_wins - self.n_losses) / self.n if self.n else 0.0
+
+
+def paired_outcomes(scores_a: np.ndarray, scores_b: np.ndarray) -> PairedOutcomes:
+    """Count, per user, whether A beats, loses to or ties with B."""
+    a = np.asarray(scores_a, dtype=float)
+    b = np.asarray(scores_b, dtype=float)
+    if len(a) == 0 or len(a) != len(b):
+        return PairedOutcomes(0, 0, 0)
+    diffs = a - b
+    wins = int(np.sum(diffs > 0))
+    losses = int(np.sum(diffs < 0))
+    return PairedOutcomes(wins, losses, int(len(diffs) - wins - losses))
+
+
 def paired_cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
     """Within-pair Cliff's delta: ``(wins - losses) / n`` over paired diffs.
 
@@ -213,25 +263,16 @@ def paired_cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
     pairing the Wilcoxon test uses — so it answers "in what fraction of
     users does A beat B, net of losses".  Ties count in the denominator
     (consistent with Wilcoxon ``pratt``).
+
+    No magnitude label is attached: the Romano et al. (2006) cut-offs
+    (0.147 / 0.33 / 0.474) were calibrated for the between-groups delta
+    against Cohen's d, and under leave-one-out the ties that dominate
+    the denominator bound this quantity to tiny values, so every
+    comparison would read "negligible".  Read the effect through
+    :func:`paired_outcomes` (wins / losses / ties) and the paired
+    ``diff_mean`` with its CI instead.
     """
-    a = np.asarray(scores_a, dtype=float)
-    b = np.asarray(scores_b, dtype=float)
-    if len(a) == 0 or len(a) != len(b):
-        return 0.0
-    diffs = a - b
-    return float((np.sum(diffs > 0) - np.sum(diffs < 0)) / len(diffs))
-
-
-def cliffs_delta_magnitude(delta: float) -> str:
-    """Map ``cliffs_delta`` to a textual magnitude (negligible/small/medium/large)."""
-    abs_d = abs(delta)
-    if abs_d < 0.147:
-        return "negligible"
-    if abs_d < 0.33:
-        return "small"
-    if abs_d < 0.474:
-        return "medium"
-    return "large"
+    return paired_outcomes(scores_a, scores_b).delta
 
 
 def bootstrap_ci(
@@ -549,11 +590,17 @@ def pairwise_significance(
         if include_effect_size:
             # Paired form: matches the Wilcoxon's pairing (S2) — the
             # between-groups form is uninformative on 0/1-heavy LOO
-            # metrics.  Column names unchanged; the definition is
-            # declared in docs/protocol.md.
-            delta = paired_cliffs_delta(scores_a, scores_b)
-            row["cliffs_delta"] = delta
-            row["cliffs_magnitude"] = cliffs_delta_magnitude(delta)
+            # metrics.  Reported as the win/loss/tie triplet plus the net
+            # delta; no magnitude label (Romano cut-offs do not apply to
+            # the paired form — docs/protocol.md §5).
+            outcomes = paired_outcomes(scores_a, scores_b)
+            row["cliffs_delta"] = outcomes.delta
+            row["n_wins"] = outcomes.n_wins
+            row["n_losses"] = outcomes.n_losses
+            row["n_ties"] = outcomes.n_ties
+            row["pct_wins"] = outcomes.pct_wins
+            row["pct_losses"] = outcomes.pct_losses
+            row["pct_ties"] = outcomes.pct_ties
             if include_cohens_d:
                 row["cohens_d"] = cohens_d_paired(scores_a, scores_b)
         rows.append(row)

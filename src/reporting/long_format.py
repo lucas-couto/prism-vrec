@@ -306,7 +306,12 @@ def pairwise_to_long(
         "diff_ci_upper",
         "cohens_d",
         "cliffs_delta",
-        "cliffs_magnitude",
+        "n_wins",
+        "n_losses",
+        "n_ties",
+        "pct_wins",
+        "pct_losses",
+        "pct_ties",
     ]
     return out.loc[:, [c for c in keep if c in out.columns]]
 

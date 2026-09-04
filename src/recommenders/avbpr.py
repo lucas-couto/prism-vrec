@@ -60,6 +60,9 @@ class AVBPR(LinearVisualScoreMixin, BaseRecommender):
     #: dense ``W_vis``, ``beta'`` and attention MLP stay in the shared
     #: term (every triple touches them).
     _L2_USER_TABLES = ("user_embedding", "visual_user_embedding")
+    #: Fold-in: both user-indexed tables (``gamma_u`` and ``alpha_u``)
+    #: are re-initialised and optimised for a folded-in user.
+    _USER_TABLES = ("user_embedding", "visual_user_embedding")
     _L2_LAMBDA_KEYS = {
         ("visual_projection", "shared"): "l2_reg_projection",
         ("visual_bias", "shared"): "l2_reg_visual_bias",

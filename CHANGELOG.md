@@ -8,6 +8,142 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-09-04
+
+### Added
+
+- **Fold-tagged training logs under `--folds`.** `train_single_run`
+  accepts a keyword-only `log_context` appended to every per-epoch
+  `timing` line (`... eval_s=0.36 fold=2/5`), and the K-fold runner
+  logs a `Fold i/k of <cell>: training on N users, folding in M
+  held-out users` header before each fold. Other callers are unchanged.
+- **User-level K-fold cross-validation** (`python main.py --folds`,
+  `configs/default.yaml -> folds:`; off by default). Users are
+  partitioned into `k` seeded, balanced folds (`src/folds/partition.py`;
+  ineligible users counted as `no_target` / `profile_too_small`). Per
+  cell and fold the model trains on the other folds with the cell's
+  frozen hyperparameters under seed `folds.seed + i`, the held-out users
+  are folded in (`src/folds/foldin.py`: only their rows in
+  `_USER_TABLES` are optimised, everything else frozen, same BPR loss
+  and sampler over the profile; `rebuild_user_state` for
+  history-consuming models) and ranked on their single target; the `k`
+  partial per-user artifacts are concatenated into the canonical cell
+  artifact (`src/folds/aggregate.py`) so the paired statistics keep the
+  user as the unit, with between-fold mean/std as descriptive
+  variability. Manifest at `results/folds/manifest.json` (resumable)
+  records the hyperparameter origin, the partition summary, per-fold
+  seeds and the combined-variability note. Precedent: Rendle et al.
+  (2009, §6.2, §2). Docs: `docs/protocol.md` §3b / §10.7.
+- `hp_search.strategy: fixed` — no search: every hyperparameter must be
+  a scalar (or one-element list); each cell trains once, no Optuna study
+  is created or read; a multi-valued list fails loud
+  (`FixedHyperparamsError`). Applies to the battery and to the folds.
+- `src/recommenders/hp_source.py::resolve_cell_hyperparams` — one
+  resolver for the two hyperparameter origins (prior search via
+  `results/best_hyperparams.json`, generated on demand from the
+  `_best.pt` checkpoints; or fixed config values), recorded per cell.
+- `BaseRecommender._USER_TABLES` (fold-in surface, distinct from the
+  regularisation tables) and `rebuild_user_state`; `bpr_step` extracted
+  from the training loop.
+- Tests: `tests/test_fold_partition.py`, `tests/test_fold_in.py`,
+  `tests/test_fold_aggregate.py`, `tests/test_fixed_strategy.py`,
+  `tests/test_hp_source.py`, `tests/test_folds_runner.py`;
+  `src.folds.foldin` joins the no-`test.csv` structural guard.
+
+### Changed
+
+- **Hyperparameter search is an exhaustive grid over `learning_rate ×
+  total_dim` (4 points per cell); `l2_reg` pinned to 1e-4;
+  `hp_search.strategy: grid`.** Validation Phase D
+  (`results/validation/phase_d_search_cost.md`): of the 182 Optuna
+  studies of the 2026-08 battery only lr (0.001 in 153) and total_dim
+  (128 in 138) carried signal, l2_reg and every per-model axis split
+  ~50/50, and TPE re-sampled winners on the 16-point categorical space
+  (median 17 trials, 6 distinct combos). Estimated search cost drops from
+  ≈ 80 h to ≈ 19 h; the K-fold run then trains the per-cell winners
+  (`best_hyperparams.json`, `hp_source` = search) under frozen values.
+- **Paired effect size reported as the win / loss / tie triplet**
+  (metrics audit #1, #2). `pairwise_significance` adds `n_wins`,
+  `n_losses`, `n_ties`, `pct_wins`, `pct_losses`, `pct_ties` next to
+  `cliffs_delta` and DROPS `cliffs_magnitude`: the Romano et al. cut-offs
+  were calibrated for the between-groups delta, and under leave-one-out
+  the ties that dominate the denominator would label every comparison
+  "negligible". `paired_outcomes` / `PairedOutcomes` expose the counts;
+  `cliffs_delta_magnitude` is removed. No metric value changes.
+- **EFD exclusion share is instrumented** (metrics audit #5):
+  `efd_excluded_frac@k` per user (share of the top-k with zero train
+  popularity, hence excluded from the EFD mean) and
+  `efd_excluded_frac_mean` per cell in the coverage table, with the EFD
+  docstring stating the `1/|valid|` denominator.
+- `assert_dimension_parity` ignores `latent_dim` / `visual_dim` keys the
+  config schema materialises as `None` (found by the pre-battery validation run).
+- K-fold training users keep `train` only (no user's `test.csv` item
+  enters training); the split reader lives in `src/folds/splits_io.py`
+  and `src/folds/partition.py` is under the no-`test.csv` guard.
+- `CellMetadata.fold` carries the fold provenance (partial:
+  `{index, k, seed, n_users}`; concatenated: `{k, seeds, n_users_per_fold}`);
+  the `.fold.json` sidecar is gone.
+- **Weighted-family strategies renamed to say what they compute**
+  (fusion audit #1): `gated` -> `sigmoid_gated`, `attention_weighted` ->
+  `softmax_weighted`, matching the qualification's "combinações
+  ponderadas" (fixed weights / softmax over configurable values summing
+  to one / independent sigmoids then normalised). Mechanism, canonical
+  values and the FIXED-weight contract are unchanged; only the registry
+  keys, `fuse_*` function names, config keys and artifact stems
+  (`hybrid_sigmoid_gated_*`, `hybrid_softmax_weighted_*`) change. No
+  artifact with the old stems exists on disk. `sum` is kept: with
+  pre-fusion L2 and no post-fusion normalisation it equals `2 x mean`
+  and is absorbed by the recommender's projection up to L2
+  regularisation, which `docs/protocol.md` §10.3 now states.
+- **`weighted_mean` sweeps both sides of the convex family** (fusion
+  audit #3). `configs/fusion.yaml` sets `w_cnn: [0.3, 0.7]` (was
+  `[0.7]`): every canonical point of the fixed-weight family (mean 0.50,
+  sigmoid_gated 0.59, weighted_mean 0.70, softmax_weighted 0.73) sat in the
+  CNN-dominant half, so the sweep could not tell an optimum near 0.7
+  from a monotone "more CNN is better" curve whose end point is plain
+  ResNet-50. One extra cell per dataset per recommender
+  (`hybrid_weighted_mean_w0.3_learned_D128`). Requires re-running the
+  `fuse` step to write the new sidecar; existing checkpoints are
+  unaffected.
+
+### Removed
+
+- **`configs/smoke/` and its README/recipes sections.** The synthetic
+  end-to-end profile no longer ships; the `synthetic` dataset provider
+  stays (it backs the unit tests) and `--config-dir` is documented
+  through the validation profiles instead.
+- **Dead `metrics:` list in `configs/evaluation.yaml`.** No step read it
+  (the top-level schema is `extra="allow"` for plugin blocks, so the
+  key passed silently); the set of metrics each step writes is fixed
+  and now documented in place, and `statistical.primary_metrics`
+  remains the only selector. Step labels "06/06b/07" in the comments
+  replaced by the real step names (`evaluate`, `beyond_accuracy`,
+  `statistical`).
+
+### Fixed
+
+- **VNPR trained to a visual-only model: whole-matrix L2 under Adam
+  zeroed its collaborative tables.** The paper-faithful regulariser
+  (`_L2_USER_TABLES = _L2_ITEM_TABLES = ()`, whole `W_u`/`W_i`/`W_i'`/`W_v`
+  penalised every step) drove every rarely-gathered row to exactly 0.0
+  under Adam (validation profile, all three VNPR cells), and on the
+  unit-norm learned-fusion input the surviving visual term was flat
+  (val 0.0002). VNPR now uses the BPR-Opt gathered rows like every other
+  recommender (`W_i` by positives, `W_i'` by negatives, `W_u`/`W_v` by
+  users; `dense` still unpenalised). Declared divergence in
+  `src/recommenders/vnpr.py` and `docs/protocol.md` ("VNPR
+  regularisation"); regression test in `tests/recommenders/test_vnpr_paper.py`.
+  VNPR checkpoints trained before this change are invalid.
+- **`--folds` no longer skips cells whose leave-one-out artifact already
+  exists.** The concatenated fold artifact is written to the cell's
+  canonical `per_user/` path on purpose (the paired loader consumes it
+  unchanged), so `_cell_done` in `src/folds/runner.py` could not tell it
+  from the artifact the `evaluate` step writes under the same seed and
+  marked every cell "fold artifact already present" without training a
+  single fold. It now requires the concatenated K-fold provenance
+  (`fold = {"k", "seeds", "n_users_per_fold"}`) in the `.meta.json`.
+  Regression test in `tests/test_folds_runner.py`.
+
 ## [2.10.0] - 2026-09-02
 
 Every built-in recommender now reproduces its paper's score and
@@ -293,6 +429,49 @@ comparable with runs after this release; the battery must be retrained.
   (one mean row per config plus `n_users`) alongside the per-user
   table.
 
+## [2.8.3] - 2026-08-24
+
+### Fixed
+
+- **The config is the source of truth everywhere** (b92cf2c). `evaluate`
+  only runs `*_best.pt` checkpoints whose model / backbone / strategy /
+  variant is enabled in the CURRENT config (stale cells accumulated in
+  the models dir were being evaluated into the tables); the
+  `validate_features` gate scans only artifacts the current config
+  trains (shared predicates in `src/utils/variant_filters.py`); dead
+  keys `preprocessing.n_min` and `paths.logs` removed;
+  `extractors.<name>.weights` promoted to a validated contract.
+
+## [2.8.2] - 2026-08-24
+
+### Fixed
+
+- **Audit code block** (#28): report aggregation (A1/S8), paired Cliff's
+  delta (S2), log-sigmoid BPR loss (F9), early-stopping patience and
+  warm start (F10/F11), config-driven fusion + extractor cell filters,
+  `hp_search.workers` honoured.
+
+## [2.8.1] - 2026-08-24
+
+### Fixed
+
+- **Runtime hardening after the first 2.8.0 runs** (#27): worker VRAM
+  caps sum below the card with allowance-aware budgets (VNPR eval
+  chunk, ranking budget), OOM retry per Optuna cell, parent-side sqlite
+  schema init, fp16 streaming component extraction with resume, float32
+  fusion outputs, `pca_whitened` fit set, per-cell ETA logging.
+
+## [2.8.0] - 2026-08-24
+
+### Changed
+
+- **2026-08-22 adversarial methodology audit cycle** (#26): BPR L2
+  semantics (BPR-Opt gathered rows), the `adaptive_gated` architecture
+  and the weighted-fusion canonical values (w_cnn 0.7, fixed logits)
+  changed. Results and checkpoints from <= 2.7.0 are NOT comparable
+  with 2.8.0. Shipped in the same PR as 2.7.0 (fixed-dim projection),
+  tagged separately (v2.7.0 at fc3a54c, v2.8.0 at 27a344f).
+
 ## [2.7.0] - 2026-08-22
 
 ### Added
@@ -478,6 +657,8 @@ comparable with runs after this release; the battery must be retrained.
 
 ## [2.6.2] - 2026-08-21
 
+_No separate git tag: shipped inside `v2.6.3` (2026-08-21)._
+
 ### Changed
 
 - **Chunked, memory-mapped execution of the offline fusion strategies**
@@ -530,6 +711,8 @@ comparable with runs after this release; the battery must be retrained.
   do not match their filename and must be re-fused.
 
 ## [2.6.1] - 2026-08-21
+
+_No separate git tag: shipped inside `v2.6.3` (2026-08-21)._
 
 ### Fixed
 
@@ -1531,7 +1714,40 @@ This version covers the contracts the framework exposes to outside users
   `src/utils/manifest.py` replaced with the `datetime.UTC` alias
   (Python 3.11+), addressing ruff `UP017`.
 
-[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v2.11.0...HEAD
+[2.11.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.10.0...v2.11.0
+[2.10.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.3...v2.10.0
+[2.9.3]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.2...v2.9.3
+[2.9.2]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.1...v2.9.2
+[2.9.1]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.0...v2.9.1
+[2.9.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.8.3...v2.9.0
+[2.8.3]: https://github.com/lucas-couto/prism-vrec/compare/v2.8.2...v2.8.3
+[2.8.2]: https://github.com/lucas-couto/prism-vrec/compare/v2.8.1...v2.8.2
+[2.8.1]: https://github.com/lucas-couto/prism-vrec/compare/v2.8.0...v2.8.1
+[2.8.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.7.0...v2.8.0
+[2.7.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.6.4...v2.7.0
+[2.6.4]: https://github.com/lucas-couto/prism-vrec/compare/v2.6.3...v2.6.4
+[2.6.3]: https://github.com/lucas-couto/prism-vrec/compare/v2.6.0...v2.6.3
+[2.6.2]: https://github.com/lucas-couto/prism-vrec/releases/tag/v2.6.3
+[2.6.1]: https://github.com/lucas-couto/prism-vrec/releases/tag/v2.6.3
+[2.6.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.5.0...v2.6.0
+[2.5.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.4.4...v2.5.0
+[2.4.4]: https://github.com/lucas-couto/prism-vrec/compare/v2.4.3...v2.4.4
+[2.4.3]: https://github.com/lucas-couto/prism-vrec/compare/v2.4.2...v2.4.3
+[2.4.2]: https://github.com/lucas-couto/prism-vrec/compare/v2.4.1...v2.4.2
+[2.4.1]: https://github.com/lucas-couto/prism-vrec/compare/v2.4.0...v2.4.1
+[2.4.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.3.0...v2.4.0
+[2.3.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.7...v2.3.0
+[2.2.7]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.6...v2.2.7
+[2.2.6]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.5...v2.2.6
+[2.2.5]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.4...v2.2.5
+[2.2.4]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.3...v2.2.4
+[2.2.3]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.2...v2.2.3
+[2.2.2]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.1...v2.2.2
+[2.2.1]: https://github.com/lucas-couto/prism-vrec/compare/v2.2.0...v2.2.1
+[2.2.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.0.1...v2.1.0
+[2.0.1]: https://github.com/lucas-couto/prism-vrec/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.2...v2.0.0
 [1.1.2]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/lucas-couto/prism-vrec/compare/v1.1.0...v1.1.1

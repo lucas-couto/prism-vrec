@@ -49,11 +49,12 @@ def test_all_offline_strategies_emit_float32() -> None:
         == np.float32
     )
     assert (
-        get_fusion_strategy("attention_weighted", logits=[1.0, 0.0])(sources, normalize=True).dtype
+        get_fusion_strategy("softmax_weighted", logits=[1.0, 0.0])(sources, normalize=True).dtype
         == np.float32
     )
     assert (
-        get_fusion_strategy("gated", logits=[1.0, 0.0])(sources, normalize=True).dtype == np.float32
+        get_fusion_strategy("sigmoid_gated", logits=[1.0, 0.0])(sources, normalize=True).dtype
+        == np.float32
     )
 
 
@@ -197,10 +198,10 @@ def test_pca_grid_emits_the_kwarg_the_function_consumes() -> None:
 
 
 def test_logit_strategies_grid_emits_the_kwarg_the_functions_consume() -> None:
-    """``attention_weighted`` and ``gated`` expose their fixed logits
+    """``softmax_weighted`` and ``sigmoid_gated`` expose their fixed logits
     through ``expand_grid`` so configured values reach the fusion fn
     (and the learned-alignment sidecar) instead of the uniform default."""
-    for name in ("attention_weighted", "gated"):
+    for name in ("softmax_weighted", "sigmoid_gated"):
         spec = get_fusion_spec(name)
 
         grid = spec.expand_grid({"logits": [[1.0, 0.0]]})
@@ -209,7 +210,7 @@ def test_logit_strategies_grid_emits_the_kwarg_the_functions_consume() -> None:
 
 
 def test_logit_strategies_grid_defaults_to_uniform() -> None:
-    for name in ("attention_weighted", "gated"):
+    for name in ("softmax_weighted", "sigmoid_gated"):
         spec = get_fusion_spec(name)
 
         grid = spec.expand_grid({})
@@ -237,10 +238,10 @@ def test_canonical_config_keeps_weighted_family_distinct() -> None:
     ]
 
     fused = {"mean": fuse_mean(sources, normalize=True)}
-    for name in ("weighted_mean", "attention_weighted", "gated"):
+    for name in ("weighted_mean", "softmax_weighted", "sigmoid_gated"):
         spec = get_fusion_spec(name)
-        [(_suffix, kwargs)] = spec.expand_grid(strategies_cfg.get(name, {}))
-        fused[name] = spec.fn(sources, normalize=True, **kwargs)
+        for suffix, kwargs in spec.expand_grid(strategies_cfg.get(name, {})):
+            fused[f"{name}{suffix}"] = spec.fn(sources, normalize=True, **kwargs)
 
     names = list(fused)
     for i, a in enumerate(names):

@@ -354,6 +354,43 @@ def _account_flops(model, users, pos_items, neg_items) -> None:
     telemetry.add_items(n)
 
 
+def bpr_step(
+    model,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    users: torch.Tensor,
+    pos: torch.Tensor,
+    neg: torch.Tensor,
+    *,
+    device: str,
+    use_cuda: bool,
+) -> torch.Tensor:
+    """One BPR optimisation step on a ``(users, pos, neg)`` triple batch.
+
+    The body of the training loop's inner step, shared with the fold-in
+    routine (:mod:`src.folds.foldin`): move the indices to ``device``
+    (a no-op when already there), forward + :meth:`bpr_loss` under the
+    CUDA autocast context, then ``zero_grad`` / scaled backward /
+    ``scaler.step`` / ``scaler.update``.
+
+    Returns the DETACHED loss (still on ``device``), so callers can
+    accumulate it without a per-batch GPU↔CPU sync.
+    """
+    users = users.to(device, non_blocking=True)
+    pos = pos.to(device, non_blocking=True)
+    neg = neg.to(device, non_blocking=True)
+
+    with cuda_autocast(enabled=use_cuda):
+        score_pos, score_neg = model(users, pos, neg)
+        loss = model.bpr_loss(score_pos, score_neg)
+
+    optimizer.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    return loss.detach()
+
+
 def train_single_run(
     model_cls,
     model_name: str,
@@ -371,6 +408,8 @@ def train_single_run(
     optuna_trial=None,
     item_categories=None,
     ranking_budget_bytes: int | None = None,
+    *,
+    log_context: str = "",
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -378,6 +417,11 @@ def train_single_run(
 
     Parameters
     ----------
+    log_context:
+        Free-form tag appended to every per-epoch ``timing`` log line
+        (e.g. ``"fold=2/5"`` from the K-fold runner) so a run that
+        trains the same cell several times stays readable in the log.
+        Empty by default: the line is unchanged for every other caller.
     optuna_trial:
         Optional ``optuna.Trial``.  When supplied, the validation
         metric is reported every ``eval_every_epochs`` and the loop
@@ -534,17 +578,24 @@ def train_single_run(
                 pos_items = pos_items.to(device, non_blocking=True)
                 neg_items = neg_items.to(device, non_blocking=True)
 
-                with cuda_autocast(enabled=use_cuda):
-                    score_pos, score_neg = model(users, pos_items, neg_items)
-                    loss = model.bpr_loss(score_pos, score_neg)
+                loss = bpr_step(
+                    model,
+                    optimizer,
+                    scaler,
+                    users,
+                    pos_items,
+                    neg_items,
+                    device=device,
+                    use_cuda=use_cuda,
+                )
+                # Telemetry stays outside the step: the fold-in routine
+                # reuses ``bpr_step`` and must not be attributed to the
+                # run's training FLOP counters.  Calibration is a one-off
+                # eval-mode probe and ``record`` is a counter, so running
+                # it after the optimiser step is equivalent to before.
                 _account_flops(model, users, pos_items, neg_items)
 
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                total_loss += loss.detach()
+                total_loss += loss
                 n_batches += 1
 
             avg_loss = (total_loss / max(n_batches, 1)).item()
@@ -558,13 +609,14 @@ def train_single_run(
                 # Train-vs-eval split per model: the number the efficiency
                 # audit could not answer without instrumentation.
                 logger.info(
-                    "timing dataset=%s model=%s embedding=%s epoch=%d train_s=%.2f eval_s=%.2f",
+                    "timing dataset=%s model=%s embedding=%s epoch=%d train_s=%.2f eval_s=%.2f%s",
                     dataset_name,
                     model_name,
                     embedding_name,
                     epoch,
                     train_seconds,
                     eval_seconds,
+                    f" {log_context}" if log_context else "",
                 )
                 current_metric = metrics.get(es_metric, 0.0)
 

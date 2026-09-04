@@ -158,7 +158,7 @@ class TestFusionFilterHonoursConfig:
             "hybrid_pca_nc128_p128",
             "hybrid_pca_per_model_nc64_p128",
             "hybrid_adaptive_gated_p128",
-            "hybrid_gated_l1_0_p128",
+            "hybrid_sigmoid_gated_l1_0_p128",
         ]
 
     def test_empty_list_keeps_no_fusion_cells(self) -> None:
@@ -172,13 +172,13 @@ class TestFusionFilterHonoursConfig:
         from src.steps.train import filter_by_enabled_fusions
 
         kept = filter_by_enabled_fusions(
-            self._names(), {"fusion_strategies_enabled": ["mean", "gated"]}
+            self._names(), {"fusion_strategies_enabled": ["mean", "sigmoid_gated"]}
         )
 
-        assert kept == ["vit_b16_D128", "hybrid_mean_p128", "hybrid_gated_l1_0_p128"]
+        assert kept == ["vit_b16_D128", "hybrid_mean_p128", "hybrid_sigmoid_gated_l1_0_p128"]
 
     def test_prefix_collisions_resolve_by_longest_match(self) -> None:
-        # pca enabled must NOT drag pca_per_model along, nor gated drag
+        # pca enabled must NOT drag pca_per_model along, nor sigmoid_gated drag
         # adaptive_gated.
         from src.steps.train import filter_by_enabled_fusions
 

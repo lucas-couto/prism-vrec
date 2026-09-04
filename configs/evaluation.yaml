@@ -2,7 +2,7 @@
 # Evaluation and statistical reporting
 # =============================================================================
 
-# Ranking protocol used by step 06 (evaluate.py).
+# Ranking protocol used by the `evaluate` step (src/steps/evaluate.py).
 #
 # "full_ranking" (default, recommended) scores every item in the
 # catalogue for every test user.  This is the thesis-grade primary
@@ -23,15 +23,19 @@ evaluation:
 # Cut-off positions for the ranking metrics.
 k_values: [5, 10, 20]
 
-# Metrics computed per (user, model) pair by step 06 (evaluate.py).
-metrics:
-  - "precision"
-  - "recall"
-  - "f1"
-  - "map"
-  - "ndcg"
+# Which metrics exist is NOT configurable (there is no `metrics:` list;
+# one used to sit here and was read by nothing).  Per (user, model) pair:
+#   evaluate         always writes precision, recall, f1, map, ndcg @k
+#                    (src/evaluation/metrics.py); under leave-one-out
+#                    recall = HitRate and precision / map are derived
+#                    from it (see statistical.primary_metrics below).
+#   beyond_accuracy  adds efd, efd_excluded_frac, ild, cat_entropy @k and
+#                    the aggregate icov when `beyond_accuracy.enabled`.
+# What enters the inferential tables is chosen by
+# `statistical.primary_metrics` / `include_derived_metrics`.
 
-# Step 06b (beyond_accuracy.py) — POST-HOC beyond-accuracy metrics.
+# `beyond_accuracy` step (src/steps/beyond_accuracy.py) — POST-HOC
+# beyond-accuracy metrics.
 # Consumes the per-user top-20 artifacts persisted at final evaluation
 # (results/per_user/) — it never re-ranks and never touches the
 # Evaluator hot path — and merges efd@k / ild@k / cat_entropy@k into
@@ -51,8 +55,8 @@ metrics:
 #                 one value per cell, replicated across its per-user
 #                 rows and also written to
 #                 {dataset}_beyond_accuracy_coverage.csv.  It has no
-#                 per-user distribution — step 07 refuses to include
-#                 it in the per-user Wilcoxon/Friedman families.
+#                 per-user distribution — the `statistical` step refuses
+#                 to include it in the per-user Wilcoxon/Friedman families.
 #
 # To run inference on the new metrics, add "efd" / "ild" /
 # "cat_entropy" to statistical.primary_metrics below (they then flow
@@ -75,8 +79,9 @@ beyond_accuracy:
   # al. (2021).
   use_rank_relevance: false
 
-# Step 07 (statistical.py) consumes the per-user metrics produced by
-# step 06 and writes one CSV per analysis under results/tables/.
+# `statistical` step (src/steps/statistical.py) consumes the per-user
+# metrics produced by `evaluate` / `beyond_accuracy` and writes one CSV
+# per analysis under results/tables/.
 statistical:
   # Family-wise significance level shared by every test below.
   alpha: 0.05
@@ -112,7 +117,7 @@ statistical:
     - frozen_vs_finetuned
     - vs_baseline
 
-  # Metric families analysed by step 07. Under leave-one-out there are
+  # Metric families analysed by the `statistical` step. Under leave-one-out there are
   # only two independent signals per user — hit-or-not (recall@k, i.e.
   # HitRate@k) and hit rank (ndcg@k) — so these two are the primary
   # evidence. precision@k (= recall@k / k) and map@k (= 1/rank with a

@@ -13,8 +13,8 @@ Eleven strategies are provided (ten offline plus the learned
 *   **prod** -- Hadamard product (equal dims required)
 *   **max_pool** -- element-wise max (equal dims required)
 *   **weighted_mean** -- fixed configurable per-source weights (equal dims)
-*   **attention_weighted** -- softmax over fixed configurable logits (equal dims)
-*   **gated** -- normalised sigmoids over fixed configurable logits (equal dims)
+*   **softmax_weighted** -- softmax over fixed configurable logits (equal dims)
+*   **sigmoid_gated** -- normalised sigmoids over fixed configurable logits (equal dims)
 *   **concat** -- concatenation along the feature axis (any dims)
 *   **pca** -- PCA on the concatenation (any dims)
 *   **pca_per_model** -- separate PCA per source, then concatenate (any dims)
@@ -265,7 +265,7 @@ def fuse_weighted_mean(
     return result.astype(np.float32, copy=False)
 
 
-def fuse_attention_weighted(
+def fuse_softmax_weighted(
     embeddings: list[np.ndarray],
     normalize: bool = True,
     *,
@@ -293,7 +293,7 @@ def fuse_attention_weighted(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
-    _warn_ignored_kwargs("attention_weighted", kwargs)
+    _warn_ignored_kwargs("softmax_weighted", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -319,7 +319,7 @@ def fuse_attention_weighted(
     return result.astype(np.float32, copy=False)
 
 
-def fuse_gated(
+def fuse_sigmoid_gated(
     embeddings: list[np.ndarray],
     normalize: bool = True,
     *,
@@ -348,7 +348,7 @@ def fuse_gated(
     np.ndarray
         Fused matrix of shape ``(N, d)``.
     """
-    _warn_ignored_kwargs("gated", kwargs)
+    _warn_ignored_kwargs("sigmoid_gated", kwargs)
     _validate_embeddings(embeddings)
     _validate_equal_dims(embeddings)
     embeddings = _maybe_normalize(embeddings, normalize)
@@ -704,14 +704,14 @@ register_fusion_strategy(
     expand_grid=_expand_weighted_mean,
 )
 register_fusion_strategy(
-    "attention_weighted",
-    fuse_attention_weighted,
+    "softmax_weighted",
+    fuse_softmax_weighted,
     equal_dim_required=True,
     expand_grid=_expand_fixed_logits,
 )
 register_fusion_strategy(
-    "gated",
-    fuse_gated,
+    "sigmoid_gated",
+    fuse_sigmoid_gated,
     equal_dim_required=True,
     expand_grid=_expand_fixed_logits,
 )
@@ -758,8 +758,8 @@ __all__ = [
     "fuse_prod",
     "fuse_max_pool",
     "fuse_weighted_mean",
-    "fuse_attention_weighted",
-    "fuse_gated",
+    "fuse_softmax_weighted",
+    "fuse_sigmoid_gated",
     "fuse_concat",
     "fuse_pca",
     "fuse_pca_per_model",

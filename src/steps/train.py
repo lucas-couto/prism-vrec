@@ -1,6 +1,6 @@
 """Step 05, Recommender hyperparameter search.
 
-Two strategies are supported, selected by
+Three strategies are supported, selected by
 ``configs/recommenders.yaml -> hp_search.strategy``:
 
 * ``grid`` (default), Cartesian product over the lists declared
@@ -13,7 +13,13 @@ Two strategies are supported, selected by
   sequential so the TPE sampler always conditions on every previous
   trial of its own study.
 
-Both backends share the same per-trial entry point, so the actual
+* ``fixed``, no search: every hyperparameter is pinned to a single
+  value in the YAML and each cell is trained exactly once through
+  :func:`train_replay` (no Optuna study, no storage).  This is the
+  K-fold cross-validation path, where the configuration was chosen
+  beforehand.
+
+All backends share the same per-trial entry point, so the actual
 training loop in :mod:`src.utils.training` is unchanged.
 """
 
@@ -36,6 +42,7 @@ from src.recommenders.hp_search import (
     CellKey,
     assert_dimension_parity,
     create_study,
+    get_fixed_hyperparams,
     get_hyperparam_grid,
     get_strategy,
     sample_hyperparams,
@@ -492,8 +499,71 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     effective_workers = workers or int(config.get("hp_search", {}).get("workers", 0))
     if strategy == "optuna":
         _run_optuna(condition, config, workers=effective_workers, sequential=sequential)
+    elif strategy == "fixed":
+        _run_fixed(condition, config, workers=effective_workers, sequential=sequential)
     else:
         _run_grid(condition, config, workers=effective_workers, sequential=sequential)
+
+
+def _run_fixed(
+    condition: str,
+    config: dict,
+    *,
+    workers: int,
+    sequential: bool,
+) -> None:
+    """Train every cell exactly once with the pinned hyperparameters.
+
+    ``hp_search.strategy: fixed`` performs no search: each
+    ``(dataset, model, embedding)`` cell is trained a single time via
+    :func:`train_replay` with :func:`get_fixed_hyperparams`, so no
+    Optuna study is created or read and the ``battery.db`` storage is
+    never opened.  The pinned configuration is resolved for every
+    enabled recommender *before* any training starts, so a multi-valued
+    key fails loud up front instead of after hours of work.
+
+    NOTE: cells run sequentially in the calling process.  ``workers``
+    and ``sequential`` are accepted for signature parity with the other
+    backends but do not enable a worker pool yet; with one cell per
+    configuration the pool would buy little, and a single process keeps
+    the GPU budget identical to the pinned ``hp_search.workers: 1``.
+    """
+    device = resolve_device(config["device"])
+    processed_dir = config["paths"]["data_processed"]
+    embeddings_dir = config["paths"]["embeddings"]
+
+    # Fail loud before enumerating anything: every enabled recommender
+    # must resolve to exactly one configuration under ``fixed``.
+    pinned = {name: get_fixed_hyperparams(name, config) for name in _resolve_model_names(config)}
+
+    cells = _list_cells(condition, config, processed_dir, embeddings_dir)
+    if workers > 1 and not sequential:
+        logger.info("fixed strategy runs cells sequentially; workers=%d ignored.", workers)
+    logger.info("Fixed-hyperparameter cells to train: %d (one run each)", len(cells))
+
+    # D5: an enabled recommender with zero cells must fail, not vanish.
+    counts = {name: 0 for name in pinned}
+    for cell_key, _n_users, _n_items, _emb_path in cells:
+        counts[cell_key.model_name] += 1
+    assert_enabled_recommenders_have_cells(counts, condition)
+
+    for cell, n_users, n_items, emb_path in tqdm(
+        cells, desc="Training (fixed cells)", unit="cell", disable=None
+    ):
+        logger.info(
+            "=== Fixed cell: %s  hyperparams=%s ===", cell.study_name(), pinned[cell.model_name]
+        )
+        metric = train_replay(
+            cell=cell,
+            hyperparams=pinned[cell.model_name],
+            n_users=n_users,
+            n_items=n_items,
+            embeddings_path=emb_path,
+            processed_dir=processed_dir,
+            device=device,
+            config=config,
+        )
+        logger.info("  cell %s: val metric=%.4f", cell.study_name(), metric)
 
 
 def _run_grid(

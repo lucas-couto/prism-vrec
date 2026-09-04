@@ -102,8 +102,8 @@ class LearnedAlignmentFusion(nn.Module):
 
     Supported ops mirror the offline equal-dim family: ``mean``,
     ``sum``, ``prod``, ``max_pool``, ``weighted_mean`` (fixed weights
-    from config), ``attention_weighted`` (softmax over fixed
-    configurable logits), ``gated`` (normalised sigmoids over fixed
+    from config), ``softmax_weighted`` (softmax over fixed
+    configurable logits), ``sigmoid_gated`` (normalised sigmoids over fixed
     configurable logits) and ``adaptive_gated`` (per-item gate MLP;
     2 sources only).  Per the thesis spec, the whole weighted-
     combination family uses FIXED convex weights — only the
@@ -116,7 +116,7 @@ class LearnedAlignmentFusion(nn.Module):
     # and it is built once, in ``build_projections``, for every strategy
     # this class supports.  ``dim`` comes from the single
     # ``alignment.dim`` config key, so mean/sum/prod/max_pool/
-    # weighted_mean/attention_weighted/gated/adaptive_gated all get
+    # weighted_mean/softmax_weighted/sigmoid_gated/adaptive_gated all get
     # projections of exactly the same architecture and capacity.  Each
     # trained model learns its own weights (unavoidable and intended),
     # but when two fusions are compared the fusion *operation* is the
@@ -125,7 +125,7 @@ class LearnedAlignmentFusion(nn.Module):
     # branches that change the projection (extra layers, different
     # dims, dropout) without revisiting this guarantee.
     _SIMPLE_OPS = ("mean", "sum", "prod", "max_pool")
-    _LOGIT_OPS = ("attention_weighted", "gated")
+    _LOGIT_OPS = ("softmax_weighted", "sigmoid_gated")
 
     def __init__(
         self,
@@ -206,10 +206,10 @@ class LearnedAlignmentFusion(nn.Module):
         if self.strategy == "weighted_mean":
             w = self.fixed_weights.view(-1, 1, 1)
             return (stacked * w).sum(dim=0)
-        if self.strategy == "attention_weighted":
+        if self.strategy == "softmax_weighted":
             alphas = torch.softmax(self.fixed_logits, dim=0).view(-1, 1, 1)
             return (stacked * alphas).sum(dim=0)
-        if self.strategy == "gated":
+        if self.strategy == "sigmoid_gated":
             gates = torch.sigmoid(self.fixed_logits)
             gates = (gates / gates.sum()).view(-1, 1, 1)
             return (stacked * gates).sum(dim=0)
@@ -217,7 +217,7 @@ class LearnedAlignmentFusion(nn.Module):
 
 
 class AdaptiveGatedFusion(nn.Module):
-    """Per-item per-dimension gated fusion of two equal-dim embeddings.
+    """Per-item per-dimension sigmoid_gated fusion of two equal-dim embeddings.
 
     Following the formal specification of the
     ``adaptive_gated`` strategy in the qualification document:
@@ -373,9 +373,9 @@ def load_embedding(path: str | Path):
                 f"online sidecar {p} lists no components; cannot stack.",
             )
         if len(components) == 1:
-            # Degenerate but well-defined: a single-source fusion (e.g. the
-            # smoke profile) reduces to one learned projection / an M=1
-            # stack. Real grids always fuse >= 2 sources.
+            # Degenerate but well-defined: a single-source fusion (a
+            # one-extractor profile) reduces to one learned projection /
+            # an M=1 stack. Real grids always fuse >= 2 sources.
             from src.utils.logging import get_logger
 
             get_logger(__name__).warning(

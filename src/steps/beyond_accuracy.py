@@ -189,8 +189,13 @@ def _cell_frames(
             )
             user_rows.append(row)
 
+        cell_rows = user_rows[-len(top_lists) :]
         for k in k_values:
             icov = catalog_coverage_at_k(top_lists, n_catalog_items, k)
+            # Share of top-k slots excluded from EFD (zero train
+            # popularity), averaged over the cell's users: EFD values of
+            # two cells are only comparable when this share is similar.
+            excluded = float(np.nanmean([r[f"efd_excluded_frac@{k}"] for r in cell_rows]))
             coverage_rows.append(
                 {
                     "model_name": recommender,
@@ -198,11 +203,22 @@ def _cell_frames(
                     "k": k,
                     "icov": icov,
                     "n_catalog_items": n_catalog_items,
+                    "efd_excluded_frac_mean": excluded,
                 }
             )
+            if excluded > 0.0:
+                logger.warning(
+                    "    %s/%s k=%d: %.2f%% of top-%d slots excluded from EFD "
+                    "(zero TRAIN popularity); EFD is averaged over the rest.",
+                    recommender,
+                    visual_config,
+                    k,
+                    100.0 * excluded,
+                    k,
+                )
             # Replicated onto the per-user rows for the shared tables;
             # AGGREGATE — never a per-user signal (see module docstring).
-            for row in user_rows[-len(top_lists) :]:
+            for row in cell_rows:
                 row[f"icov@{k}"] = icov
 
     return pd.DataFrame(user_rows), pd.DataFrame(coverage_rows)

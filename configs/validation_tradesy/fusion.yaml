@@ -1,0 +1,94 @@
+# Fusion strategy configuration.
+#
+# `fusion_strategies_enabled` controls which strategies run in this
+# experiment. An empty or absent list = no fusion runs. To disable a
+# strategy just remove it from this list (its definition under
+# `strategies:` stays as a catalogue). Valid names: mean, sum, prod,
+# max_pool, weighted_mean, softmax_weighted, sigmoid_gated, concat, pca,
+# pca_per_model, adaptive_gated.
+fusion_strategies_enabled: []
+
+# L2-normalise before fusion
+normalize_before_fusion: true
+
+# Alignment for the equal-dim strategy family (mean/sum/prod/max_pool/
+# weighted_mean/softmax_weighted/sigmoid_gated/adaptive_gated). The fusion
+# sources keep their NATIVE dims (resnet50=2048, vit_b16=768), so these
+# strategies need the sources brought to a common dimension first. The
+# alignment method is itself an experimental variable:
+#   learned - per-source Linear(D_i -> dim) co-trained with the
+#             recommender via BPR (analogous to the projection E).
+#   pca     - per-source PCA to dim, fit ONLY on train items.
+# The concatenation family (concat/pca/pca_per_model) ignores this
+# block and operates on native dims.
+# `dim` is the SINGLE common dimension d shared by every equal-dim
+# strategy. It is deliberately not configurable per strategy: when two
+# fusions (e.g. mean vs prod) are compared, the projection Linear(D_i -> d)
+# must have the same architecture and capacity in both models so the
+# fusion operation is the only thing that differs. See
+# src/fusions/online.py::LearnedAlignmentFusion.
+alignment:
+  method: learned
+  dim: 128
+
+# Which artifact family the fusion sources come from. `fusion_extractors`
+# (extractors.yaml) keeps the logical names; this decides the variant.
+#   native    - the backbones' own widths; the `alignment:` block above
+#               brings them to a common dim (the v2 default)
+#   projected - the <extractor>_p<dim> artifacts written by `projection:`
+#               in extractors.yaml. They ALREADY share a width, so the
+#               `alignment:` block is bypassed entirely: nothing is
+#               learned online and no PCA is fit inside the fuse step
+#   both      - one pass each; outputs are distinguished by the same
+#               _p<dim> token (hybrid_mean vs hybrid_mean_p128)
+# `projected` requires every name in fusion_extractors to have a
+# projection configured, all to the SAME dim — otherwise the sources
+# would not share a space and the run fails loudly.
+extractor_variants: native
+
+strategies:
+  # Strategies that require equal dims
+  mean: {}
+  sum: {}
+  prod: {}
+  max_pool: {}
+
+  # Single-variant protocol (decided 2026-05-15): one canonical value
+  # per parameterised strategy.  Canonical values revised 2026-08-22:
+  # the previous 0.5 / zero-logit canon made weighted_mean,
+  # softmax_weighted and sigmoid_gated numerically identical to plain mean
+  # (all collapsed to the uniform convex combination).  The thesis
+  # defines this family as FIXED configurable weights, so each member
+  # gets a distinct canonical value away from 0.5/uniform:
+  #   weighted_mean       w_cnn=0.7          -> weights (0.700, 0.300)
+  #   softmax_weighted    logits [1.0, 0.0]  -> softmax (0.731, 0.269)
+  #   sigmoid_gated       logits [1.0, 0.0]  -> normalised sigmoids
+  #                                             (0.594, 0.406)
+  # Note: sigmoid_gated logits [1.0, -1.0] would reproduce attention's
+  # (0.731, 0.269) exactly (sigmoid(x) + sigmoid(-x) = 1), so sigmoid_gated
+  # uses [1.0, 0.0], where the sigmoid's shape actually differs.
+  weighted_mean:
+    w_cnn: [0.7] # w_vit = 1 - w_cnn
+
+  softmax_weighted:
+    logits: [[1.0, 0.0]] # one logit per source (cnn, vit)
+
+  sigmoid_gated:
+    logits: [[1.0, 0.0]] # one logit per source (cnn, vit)
+
+  # Strategies that accept differing dims
+  concat: {}
+
+  pca:
+    n_components: [128]
+
+  pca_per_model:
+    n_components_per_model: [64]
+
+  # Online (learned) fusion: per-item per-dim gate from a small MLP,
+  # trained jointly with the recommender.  No offline .npy is produced;
+  # the fuse step writes a JSON sidecar listing the component
+  # embeddings (resnet50 + vit_b16 by default), and the recommender
+  # instantiates the gate module at construction time.  See
+  # docs/learned_fusion.md.
+  adaptive_gated: {}

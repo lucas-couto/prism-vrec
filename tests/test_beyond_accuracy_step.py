@@ -152,6 +152,11 @@ class TestBeyondAccuracyStep:
         expected = len({i for top in tops for i in top[:2]}) / 10  # 10 train items
         bpr_row = coverage[(coverage["model_name"] == "bpr") & (coverage["k"] == 2)]
         assert bpr_row["icov"].iloc[0] == pytest.approx(expected)
+        # EFD exclusion share travels with the aggregate table (audit #5):
+        # bpr's top-2 never reaches the cold items 10/11 -> 0.0.
+        assert "efd_excluded_frac_mean" in coverage.columns
+        assert bpr_row["efd_excluded_frac_mean"].iloc[0] == 0.0
+        assert "efd_excluded_frac@2" in table.columns
 
     def test_no_cat_entropy_for_contractless_dataset(self, workspace, monkeypatch) -> None:
         # expects_categories: false (Tradesy-style) -> explicit N/A.

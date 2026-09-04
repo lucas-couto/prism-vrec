@@ -71,7 +71,7 @@ class TestPcaTrainOnlyFit:
 class TestLearnedAlignmentFusion:
     @pytest.mark.parametrize(
         "strategy",
-        ["mean", "sum", "prod", "max_pool", "attention_weighted", "gated", "adaptive_gated"],
+        ["mean", "sum", "prod", "max_pool", "softmax_weighted", "sigmoid_gated", "adaptive_gated"],
     )
     def test_ops_produce_aligned_dim_and_backprop(self, strategy: str) -> None:
         torch.manual_seed(0)
@@ -126,7 +126,7 @@ class TestLoadEmbeddingSidecars:
         assert arr.strategy == "mean"
 
     def test_single_component_sidecar_degenerates_to_passthrough(self, tmp_path) -> None:
-        # The smoke profile fuses a single extractor by design; the loader
+        # A one-extractor profile yields a single-source sidecar; the loader
         # must accept the M=1 sidecar (warning, not error).
         sources = _sources()
         np.save(tmp_path / "resnet50.npy", sources[0])

@@ -1,6 +1,6 @@
-"""Hyperparameter-search dispatcher: grid vs Optuna.
+"""Hyperparameter-search dispatcher: grid vs Optuna vs fixed.
 
-Two strategies are supported, selected by
+Three strategies are supported, selected by
 ``configs/recommenders.yaml -> hp_search.strategy``:
 
 1. ``grid`` (default) — Cartesian product over the lists declared
@@ -11,8 +11,13 @@ Two strategies are supported, selected by
    ranges (``int``, ``float`` with optional ``log``, or
    ``categorical``); the dispatcher creates an Optuna study per
    ``(dataset, model, embedding)`` cell and runs ``n_trials`` per cell.
+3. ``fixed`` — no search at all. Every hyperparameter must be a single
+   scalar (or a one-element list) in the YAML; each cell is trained
+   exactly once with that configuration and never touches Optuna
+   (no study, no storage). This is the K-fold cross-validation path,
+   where the hyperparameters were chosen beforehand.
 
-The two backends share the same per-trial entry point so the
+The backends share the same per-trial entry point so the
 training loop is agnostic to which strategy chose the
 hyperparameters.
 
@@ -51,9 +56,28 @@ class CellKey:
         return f"{self.dataset_name}__{self.model_name}__{self.embedding_name}"
 
 
+#: Accepted values of ``hp_search.strategy``.
+STRATEGIES = ("grid", "optuna", "fixed")
+
+
 def get_strategy(config: dict) -> str:
-    """Return the configured search strategy (``grid`` or ``optuna``)."""
-    return config.get("hp_search", {}).get("strategy", "grid")
+    """Return the configured search strategy (``grid``, ``optuna`` or ``fixed``).
+
+    Raises
+    ------
+    ValueError
+        When ``hp_search.strategy`` holds a value outside :data:`STRATEGIES`.
+    """
+    strategy = config.get("hp_search", {}).get("strategy", "grid")
+    if strategy not in STRATEGIES:
+        raise ValueError(
+            f"Unknown hp_search.strategy: {strategy!r}; expected one of {list(STRATEGIES)}."
+        )
+    return strategy
+
+
+class FixedHyperparamsError(RuntimeError):
+    """Raised when ``hp_search.strategy: fixed`` meets a multi-valued hyperparameter."""
 
 
 def has_hp_space(config: dict, model_name: str) -> bool:
@@ -109,7 +133,9 @@ def assert_dimension_parity(config: dict) -> None:
             "(BPR latent_dim = T; VBPR/AVBPR latent_dim + visual_dim = T; ...). "
             "Replace common.latent_dim / common.visual_dim by common.total_dim."
         )
-    direct = [k for k in _DIRECT_DIM_KEYS if k in common]
+    # The config schema materialises every known key, so an unset legacy
+    # key arrives as ``None``: only a real value is a direct declaration.
+    direct = [k for k in _DIRECT_DIM_KEYS if common.get(k) is not None]
     if direct:
         raise DimensionParityError(
             f"common declares {direct} alongside total_dim; the per-model dimensions "
@@ -119,7 +145,7 @@ def assert_dimension_parity(config: dict) -> None:
         block = config.get(model, {})
         if not isinstance(block, dict):
             continue
-        offending = [k for k in _DIRECT_DIM_KEYS if k in block]
+        offending = [k for k in _DIRECT_DIM_KEYS if block.get(k) is not None]
         space = block.get("hp_space")
         if isinstance(space, dict):
             offending += [f"hp_space.{k}" for k in _DIRECT_DIM_KEYS if k in space]
@@ -147,6 +173,20 @@ def get_hyperparam_grid(model_name: str, config: dict) -> list[dict]:
     :func:`resolve_dimensions`; the legacy ``common.latent_dim`` /
     ``common.visual_dim`` lists are honoured only when no budget is set.
     """
+    params = _declared_hyperparams(model_name, config)
+    keys = list(params.keys())
+    values = [_as_list(params[k]) for k in keys]
+    grid = [dict(zip(keys, combo, strict=False)) for combo in product(*values)]
+    return [_expand_total_dim(model_name, hp) for hp in grid]
+
+
+def _declared_hyperparams(model_name: str, config: dict) -> dict:
+    """Raw hyperparameter declarations (scalar or list) for one recommender.
+
+    Shared by the grid and fixed strategies: ``common:`` supplies the
+    dimension budget / learning rate / L2, the model block supplies the
+    keys named in :attr:`RecommenderSpec.extra_hyperparam_keys`.
+    """
     spec = get_recommender_spec(model_name)
     common = config.get("common", {})
     model_specific = config.get(model_name, {})
@@ -164,11 +204,38 @@ def get_hyperparam_grid(model_name: str, config: dict) -> list[dict]:
     for key in spec.extra_hyperparam_keys:
         if key in model_specific:
             params[key] = model_specific[key]
+    return params
 
-    keys = list(params.keys())
-    values = [_as_list(params[k]) for k in keys]
-    grid = [dict(zip(keys, combo, strict=False)) for combo in product(*values)]
-    return [_expand_total_dim(model_name, hp) for hp in grid]
+
+def get_fixed_hyperparams(model_name: str, config: dict) -> dict:
+    """The single hyperparameter configuration of ``hp_search.strategy: fixed``.
+
+    Reads the same declarations as :func:`get_hyperparam_grid` but
+    demands that every key resolves to exactly one value: scalars and
+    one-element lists are accepted, anything longer is refused.  Nothing
+    is ever picked silently (no "first value", no fallback to the grid):
+    a multi-valued key under ``fixed`` is a configuration error, because
+    the strategy exists precisely so that no selection happens.
+
+    A ``total_dim`` budget is expanded into the model's own dimensions
+    via :func:`resolve_dimensions`.
+
+    Raises
+    ------
+    FixedHyperparamsError
+        Listing every key that still declares more than one value.
+    """
+    params = _declared_hyperparams(model_name, config)
+    offending = sorted(k for k, v in params.items() if len(_as_list(v)) != 1)
+    if offending:
+        raise FixedHyperparamsError(
+            f"hp_search.strategy is 'fixed' but recommender {model_name!r} declares "
+            f"more than one value for {offending}; a fixed run needs exactly one value "
+            "per hyperparameter (scalar or one-element list). Pin the values or switch "
+            "to strategy 'grid'/'optuna' to search over them."
+        )
+    single = {k: _as_list(v)[0] for k, v in params.items()}
+    return _expand_total_dim(model_name, single)
 
 
 def _expand_total_dim(model_name: str, hp: dict) -> dict:
@@ -352,8 +419,8 @@ def iter_cells(
         Callable invoked once per concrete hyperparameter setting.
         Receives ``(cell, hyperparams, optuna_trial_or_None)`` and
         returns the validation metric.  Receives ``None`` for the
-        trial argument in grid mode; receives the live ``Trial``
-        object in optuna mode so the training loop can call
+        trial argument in grid and fixed mode; receives the live
+        ``Trial`` object in optuna mode so the training loop can call
         ``trial.report`` / ``trial.should_prune``.
 
     Yields
@@ -366,7 +433,9 @@ def iter_cells(
         yield from _iter_cells_grid(cells, config, objective)
     elif strategy == "optuna":
         yield from _iter_cells_optuna(cells, config, objective)
-    else:
+    elif strategy == "fixed":
+        yield from _iter_cells_fixed(cells, config, objective)
+    else:  # pragma: no cover - get_strategy already validates
         raise ValueError(f"Unknown hp_search.strategy: {strategy!r}")
 
 
@@ -379,6 +448,18 @@ def _iter_cells_grid(
         for hp in get_hyperparam_grid(cell.model_name, config):
             metric = objective(cell, hp, None)
             yield cell, hp, metric
+
+
+def _iter_cells_fixed(
+    cells: list[CellKey],
+    config: dict,
+    objective: Callable[[CellKey, dict, Any], float],
+) -> Iterator[tuple[CellKey, dict, float]]:
+    """One objective call per cell with the pinned configuration; no Optuna."""
+    for cell in cells:
+        hp = get_fixed_hyperparams(cell.model_name, config)
+        metric = objective(cell, hp, None)
+        yield cell, hp, metric
 
 
 def _iter_cells_optuna(
@@ -418,13 +499,16 @@ def _iter_cells_optuna(
 
 
 __all__ = [
+    "STRATEGIES",
     "CellKey",
     "DimensionParityError",
+    "FixedHyperparamsError",
     "assert_dimension_parity",
     "resolve_dimensions",
     "build_pruner",
     "build_sampler",
     "create_study",
+    "get_fixed_hyperparams",
     "get_hyperparam_grid",
     "get_strategy",
     "has_hp_space",
