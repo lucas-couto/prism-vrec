@@ -8,6 +8,7 @@ import torch.nn as nn
 from torchvision import transforms
 from tqdm import tqdm
 
+from src.extractors.components import pool_components
 from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast
 from src.utils.atomic_io import atomic_np_save, atomic_write
@@ -190,6 +191,11 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
     #: :meth:`_forward_components` set this to ``True``; the pooled output
     #: path is unaffected.
     supports_components: bool = False
+    #: Optional ``g``: pool the native ``√M × √M`` region map to ``g × g``
+    #: before saving components (see :mod:`src.extractors.components`).
+    #: Set by the extract step from ``component_grid`` in the config;
+    #: ``None`` keeps the native regions.
+    component_grid: int | None = None
 
     #: Backbone :class:`nn.Module` class instantiated by the default
     #: :meth:`_build_model` as ``backbone_cls()``.  The backbone's last
@@ -454,6 +460,8 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
             "Extracting components",
         )
         for batch_idx, comp, ids in gen:
+            if self.component_grid is not None:
+                comp = pool_components(torch.from_numpy(comp), self.component_grid).numpy()
             yield batch_idx, comp.astype(np.float16), ids
 
     @staticmethod

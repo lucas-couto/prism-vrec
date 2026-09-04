@@ -207,6 +207,7 @@ def _extract_for_config(
     extract_components: bool = False,
     projection: ProjectionConfig | None = None,
     train_items: list[int] | None = None,
+    component_grid: int | None = None,
 ) -> bool:
     """Extract native-dim embeddings for a single ``(extractor, dataset)`` cell.
 
@@ -252,6 +253,7 @@ def _extract_for_config(
 
     logger.info("  Extracting %s (native dim)...", extractor_name)
     extractor = extractor_cls(device=device)
+    extractor.component_grid = component_grid
     _validate_native_dim(extractor, extractor_name, config)
     _validate_weights_id(extractor, extractor_name, config)
 
@@ -306,7 +308,12 @@ def _extract_for_config(
             extractor,
             extractor_name,
             comp_path,
-            {"kind": "components", "n_components": int(components.shape[1])},
+            {
+                "kind": "components",
+                "n_components": int(components.shape[1]),
+                "component_grid": component_grid,
+                "pooling": "adaptive_avg" if component_grid is not None else None,
+            },
         )
         logger.info(
             "  %s: native components saved to %s (%s)",
@@ -365,6 +372,14 @@ def run() -> None:
     checkpoint_every = config.get("checkpoint_every", 500)
     datasets = config.get("datasets", [])
     extract_components = _components_needed(config)
+    component_grid = config.get("component_grid")
+    if extract_components:
+        logger.info(
+            "component extraction: %s",
+            f"pooled to a {component_grid}x{component_grid} grid (component_grid)"
+            if component_grid
+            else "native region map (component_grid unset)",
+        )
 
     # Instantiating the manager guarantees the on-disk directories exist.
     CheckpointManager()
@@ -428,6 +443,7 @@ def run() -> None:
                     extract_components=extract_components,
                     projection=projection,
                     train_items=train_items,
+                    component_grid=component_grid,
                 )
                 if not did_work:
                     cell.skip("embeddings already on disk")

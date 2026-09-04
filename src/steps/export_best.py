@@ -115,7 +115,7 @@ def run(output: str | None = None) -> None:
     Reads ``<paths.results>/models/`` and writes
     ``<paths.results>/best_hyperparams.json`` (or the explicit
     ``output`` path when supplied).  Honours the configured results
-    root so swapped config profiles (e.g. ``configs/validation/``) land
+    root so swapped ``--config-dir`` profiles land
     their summary in the expected place.
     """
     config = load_config()

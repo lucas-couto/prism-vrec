@@ -8,6 +8,42 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-09-04
+
+### Added
+
+- **`component_grid` (configs/extractors.yaml): ACF component maps are
+  pooled to a `g × g` grid at extraction.** `src/extractors/components.py`
+  adaptive-average-pools each backbone's native `√M × √M` region map
+  before the fp16 `*_comp.npy` is written (streaming and in-memory
+  paths); the default `2` keeps four quadrant descriptors per item
+  (ResNet-50 on Amazon Women: 5.7 GB instead of ≈ 70 GB; ≈ 20 GB for the
+  whole battery instead of ≈ 1.1 TB). Recorded in the artifact
+  `.meta.json` (`component_grid`, `pooling`); declared divergence from
+  the paper's 49 regions in `docs/protocol.md` §7. Unset = native
+  regions.
+
+### Changed
+
+- **Component artifacts are memmapped and kept in fp16 inside the
+  model.** `load_embedding` opens `*_comp.npy` with `mmap_mode="r"`,
+  `BaseRecommender` keeps the on-disk dtype for raw component buffers
+  (fp32 upcast remains for every other path), and ACF casts the gathered
+  rows on use and builds its eval-mode catalogue projection in chunks of
+  16 384 items. Together with the grid this is what let ACF back into the
+  validation profile after the 24 GB OOM (Phase C).
+
+### Removed
+
+- **`configs/validation/` and `configs/validation_tradesy/`.** The
+  pre-battery validation profiles (Phases A–D, 2026-09-03/04) served
+  their purpose — K-fold machinery verified, VNPR regulariser and the
+  `--folds` skip bug found and fixed in 2.11.0, search grid decided —
+  and were removed together with every run output when the user
+  restarted the pipeline from scratch (`data/raw` and the download
+  timings in `results/pre_training_costs.*` kept). Their reports are
+  summarised in 2.11.0's entries and in `docs/protocol.md`.
+
 ## [2.11.0] - 2026-09-04
 
 ### Added
@@ -1714,7 +1750,8 @@ This version covers the contracts the framework exposes to outside users
   `src/utils/manifest.py` replaced with the `datetime.UTC` alias
   (Python 3.11+), addressing ruff `UP017`.
 
-[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v2.11.0...HEAD
+[Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v2.12.0...HEAD
+[2.12.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.11.0...v2.12.0
 [2.11.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.10.0...v2.11.0
 [2.10.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.3...v2.10.0
 [2.9.3]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.2...v2.9.3

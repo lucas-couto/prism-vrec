@@ -457,6 +457,15 @@ class FrameworkConfig(BaseModel):
     fusion_extractors: list[str] = Field(default_factory=list)
     batch_size: int = Field(256, ge=1)
     checkpoint_every: int = Field(500, ge=1)
+    component_grid: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Pool each backbone's native sqrt(M) x sqrt(M) region map to a "
+            "g x g grid before saving *_comp.npy (ACF components); None "
+            "keeps the native regions (49/196/256).  2 = four quadrants."
+        ),
+    )
 
     @field_validator("seeds")
     @classmethod

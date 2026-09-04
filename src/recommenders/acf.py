@@ -210,10 +210,24 @@ class ACF(BaseRecommender):
         lookups only index it.
         """
         if self.training:
-            return self.comp_projection(self.visual_features[item_ids])
+            return self.comp_projection(self.visual_features[item_ids].float())
         if self._comp_cache is None:
-            self._comp_cache = self.comp_projection(self.visual_features)
+            self._comp_cache = self._project_catalogue()
         return self._comp_cache[item_ids]
+
+    #: Items projected per chunk when the eval cache is built; bounds the
+    #: transient fp32 view of the fp16 component buffer.
+    _CACHE_CHUNK_ITEMS = 16384
+
+    def _project_catalogue(self) -> torch.Tensor:
+        """``W_c f`` for every item, built in chunks: ``(n_items, M, kv)``."""
+        chunks = [
+            self.comp_projection(
+                self.visual_features[start : start + self._CACHE_CHUNK_ITEMS].float()
+            )
+            for start in range(0, self.n_items, self._CACHE_CHUNK_ITEMS)
+        ]
+        return torch.cat(chunks, dim=0)
 
     def _augmented_user(self, user_ids: torch.Tensor, gamma_u: torch.Tensor) -> torch.Tensor:
         """Eq. 6 profile ``p̂_u = u + Σ_{l∈R(u)} α(u,l) p_l``: ``(B, k)``."""

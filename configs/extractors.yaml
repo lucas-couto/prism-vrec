@@ -122,3 +122,15 @@ batch_size: 256
 
 # Checkpoint every N batches
 checkpoint_every: 500
+
+# Spatial grid of the ACF component artifacts (``<extractor>_comp.npy``).
+# Backbones expose a sqrt(M) x sqrt(M) region map (ResNet-50 7x7 = 49,
+# ViT-B/16 14x14 = 196, DINOv2 16x16 = 256); saving it natively costs
+# 50-500x the pooled features (~1.1 TB for the battery) and a single
+# artifact exceeded the container's RAM cap (validation Phase C,
+# 2026-09-04).  ``component_grid: 2`` adaptive-average-pools the map to
+# 2x2 = four quadrant descriptors per item (ResNet-50 on Amazon Women:
+# 5.7 GB instead of ~70 GB), keeping ACF's per-region attention at a
+# fraction of the size.  Declared divergence from the paper's 49 regions
+# (docs/protocol.md section 7).  Unset = native regions.
+component_grid: 2

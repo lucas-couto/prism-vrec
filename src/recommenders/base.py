@@ -151,18 +151,23 @@ class BaseRecommender(nn.Module, abc.ABC):
                 **visual_embeddings.fusion_kwargs,
             )
         elif visual_embeddings is not None:
-            arr = torch.FloatTensor(visual_embeddings)
+            raw = np.asarray(visual_embeddings)
+            if raw.ndim == 3 and self.consumes_raw_components:
+                # Raw component buffer (n_items, M, D): the consuming model
+                # (e.g. ACF) applies its own component attention; no online
+                # fusion module is created.  The on-disk dtype (fp16 for
+                # every extracted ``*_comp.npy``) is KEPT — the consumer
+                # casts the gathered rows — so the catalogue costs half the
+                # VRAM of an fp32 copy; ``np.array`` materialises a memmap.
+                arr = torch.from_numpy(np.array(raw))
+            else:
+                arr = torch.FloatTensor(raw)
             if arr.dim() == 3 and not self.consumes_raw_components:
                 self.register_buffer("visual_features", arr, persistent=False)
                 self.visual_dim_raw = int(arr.shape[-1])
                 self._init_online_fusion(int(arr.shape[1]), self.visual_dim_raw, config)
-            elif arr.dim() == 3:
-                # Raw component buffer (n_items, M, D): the consuming model
-                # (e.g. ACF) applies its own component attention; no online
-                # fusion module is created.
-                self.register_buffer("visual_features", arr, persistent=False)
-                self.visual_dim_raw = int(arr.shape[-1])
-            elif arr.dim() == 2:
+            elif arr.dim() in (2, 3):
+                # 2-D pooled features, or the raw component buffer above.
                 self.register_buffer("visual_features", arr, persistent=False)
                 self.visual_dim_raw = int(arr.shape[-1])
             else:

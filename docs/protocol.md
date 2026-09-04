@@ -354,9 +354,28 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
 ## 7. Model-specific declarations
 
 - **ACF is NOT degenerate**: it consumes `(n_items, M, D_native)`
-  component artifacts (`*_comp.npy`; M = 49–256 depending on the
-  backbone), so component-level attention has real components to
-  attend. Its user-history side is built from train interactions only.
+  component artifacts (`*_comp.npy`), so component-level attention has
+  real components to attend. Its user-history side is built from train
+  interactions only.
+- **ACF components are pooled to a 2×2 grid (`component_grid: 2`,
+  `configs/extractors.yaml`; declared divergence).** The paper attends
+  over the 7×7 = 49 regions of a ResNet-152 map. Saving the native
+  region maps (49 for ResNet-50 / ConvNeXt / CoAtNet / CLIP, 196 for
+  ViT-B/16, 256 for DINOv2) costs 50–500× the pooled features — ≈ 1.1 TB
+  for the four datasets and eight backbones, and one artifact alone
+  (ResNet-50 on Amazon Men, 22 GB fp16 → 44 GB fp32) exceeded the
+  container's RAM cap during validation Phase C (2026-09-04). The extract
+  step therefore adaptive-average-pools each `√M × √M` map to `2 × 2`
+  before saving (`src/extractors/components.py`): four quadrant
+  descriptors per item, M = 4 for every backbone, ≈ 20 GB in total. The
+  mechanism — one attention weight per spatial region, Eq. 10–12 — is
+  unchanged; the spatial granularity is coarser, which must be stated
+  next to any ACF result. The artifacts stay fp16 on disk and in the
+  model buffer (`BaseRecommender` keeps the on-disk dtype for raw
+  components; ACF casts the gathered rows and builds its eval cache in
+  chunks), so the catalogue costs half the VRAM of an fp32 copy. The
+  grid is configurable (`3` = nine regions) and recorded in the
+  artifact's `.meta.json` (`component_grid`, `pooling`).
 - **Dimension parity**: every recommender draws its dimensions from one
   budget `common.total_dim` (`RecommenderSpec.dim_split`): BPR-MF
   `latent_dim = T`, VBPR/AVBPR `latent_dim = visual_dim = T/2` (the

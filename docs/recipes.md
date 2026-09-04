@@ -80,8 +80,8 @@ What happens:
   fusion, condition, metric, k) cell.
 
 Cost scales linearly with the number of seeds.  Estimate the single-
-seed cost first (a ``--config-dir`` validation profile on one dataset,
-e.g. ``configs/validation``), then multiply.  Three seeds on the full DVBPR pipeline ≈ 3× the wall-clock
+seed cost first (a ``--config-dir`` profile restricted to one dataset
+and a few cells), then multiply.  Three seeds on the full DVBPR pipeline ≈ 3× the wall-clock
 and 3× the EC2 cost — budget accordingly.
 
 The seed configured in each iteration also drives every cell-level
