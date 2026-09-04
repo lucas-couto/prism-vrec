@@ -418,9 +418,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Alternative directory of YAML config files (e.g. "
-            "configs/validation for the pre-battery validation profile).  "
-            "Defaults to 'configs/'."
+            "Alternative directory of YAML config files (an ablation or "
+            "validation profile that overrides configs/).  Defaults to 'configs/'."
         ),
     )
 

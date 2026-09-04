@@ -240,6 +240,7 @@ extractors:
 fusion_extractors: ["resnet50", "vit_b16"] # primary pair sent into fusion
 batch_size: 256 # extraction batch size
 checkpoint_every: 500 # save partial extraction every N batches
+component_grid: 2 # ACF components: pool each region map to 2x2 (4 quadrants); unset = native regions
 ```
 
 Extraction is **native-dim** (v2 protocol): each extractor saves the backbone's own pooled feature. `raw_dim` is a declaration validated against a probe forward through the real model — a mismatch fails extraction loudly. The learned projection `E` inside each recommender maps the native feature to the model's visual dim, derived from the shared dimension budget (`common.total_dim` in `recommenders.yaml`).
@@ -893,7 +894,7 @@ If you use this framework in your work, please cite the software:
   title   = {prism-vrec: A reproducible framework for evaluating visual feature extractors in recommender systems},
   author  = {Couto, Lucas Silva and Domingues, Marcos Aurelio},
   year    = {2026},
-  version = {2.11.0},
+  version = {2.12.0},
   doi     = {10.5281/zenodo.20357510},
   url     = {https://doi.org/10.5281/zenodo.20357510}
 }

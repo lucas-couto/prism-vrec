@@ -41,6 +41,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.utils.artifact_names import is_component_artifact
+
 
 class RaggedSources(np.ndarray):
     """Concatenated native sources ``(n_items, sum(D_i))`` + metadata.
@@ -421,7 +423,10 @@ def load_embedding(path: str | Path):
                 )
         return np.stack(loaded, axis=1)  # (n_items, M, D)
 
-    arr = np.load(p)
+    # Component artifacts (``<extractor>_comp.npy``, fp16, 3-D) are read
+    # through a memmap: the consumer keeps them in fp16 and materialises
+    # only what it needs, instead of a full fp32 copy in host RAM.
+    arr = np.load(p, mmap_mode="r") if is_component_artifact(p.stem) else np.load(p)
     _validate_against_meta(p, arr)
     return arr
 

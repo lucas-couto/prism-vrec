@@ -416,3 +416,33 @@ def test_unfrozen_energy_head_breaks_uniformity_under_training() -> None:
     assert not torch.all(model.item_attention.score.bias == 0) or not torch.all(
         model.item_attention.score.weight == 0
     )
+
+
+def test_acf_consumes_fp16_components_and_projects_in_float32() -> None:
+    """Pooled ``*_comp.npy`` are fp16; ACF must gather, cast and score them."""
+    import numpy as np
+
+    from src.recommenders.acf import ACF
+
+    n_users, n_items = 6, 40
+    visual = np.random.default_rng(1).standard_normal((n_items, 4, 6)).astype(np.float16)
+    interactions = {u: {u, u + 1, u + 2} for u in range(n_users)}
+    model = ACF(
+        n_users,
+        n_items,
+        visual,
+        {"latent_dim": 8, "att_hidden": 4, "max_history": 3, "history_seed": 0},
+        train_interactions=interactions,
+    )
+    model._CACHE_CHUNK_ITEMS = 7  # exercise the chunked catalogue projection
+
+    assert model.visual_features.dtype == torch.float16
+    users = torch.arange(n_users)
+    r_pos, r_neg = model(users, torch.arange(n_users), torch.arange(10, 10 + n_users))
+    assert torch.isfinite(r_pos).all() and torch.isfinite(r_neg).all()
+    assert model._projected_components(torch.tensor([0, 1])).dtype == torch.float32
+
+    model.eval()
+    scores = model.predict(0, torch.arange(n_items))
+    assert scores.shape == (n_items,) and torch.isfinite(scores).all()
+    assert model._comp_cache.shape[0] == n_items and model._comp_cache.dtype == torch.float32

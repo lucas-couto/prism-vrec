@@ -78,3 +78,22 @@ def test_train_interactions_is_stored_when_provided() -> None:
     model = _Dummy(5, 10, None, {}, train_interactions=history)
 
     assert model.train_interactions is history
+
+
+def test_raw_components_keep_their_on_disk_dtype() -> None:
+    """fp16 ``*_comp.npy`` stays fp16 in the buffer (half the VRAM); the
+    consumer casts the gathered rows (see ACF)."""
+    components = np.zeros((10, 4, 8), dtype="float16")
+
+    model = _ComponentDummy(5, 10, components, {})
+
+    assert model.visual_features.dtype == torch.float16
+    assert model.visual_features.shape == (10, 4, 8)
+
+
+def test_online_fusion_path_still_upcasts_to_float32() -> None:
+    components = np.zeros((10, 2, 8), dtype="float16")
+
+    model = _Dummy(5, 10, components, {"visual_fusion_strategy": "adaptive_gated"})
+
+    assert model.visual_features.dtype == torch.float32
