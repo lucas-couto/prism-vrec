@@ -8,6 +8,57 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [2.12.1] - 2026-09-04
+
+### Fixed
+
+- **The training worker's embedding cache was unbounded and OOM-killed
+  the run.** `_worker_fn` (`src/utils/parallel.py`) cached every
+  `embeddings_path` it ever loaded in a plain dict, and the worker is
+  long-lived (1232 jobs in the frozen battery). Each entry is a whole
+  `(n_items, D)` float32 matrix — a learned-alignment sidecar for
+  amazon_fashion concatenates to `(166270, 2816)`, i.e. 1.9 GB — so the
+  process accumulated every fusion of every dataset until the container
+  cgroup killed it at 25 GB anon-rss, without a traceback, one dataset
+  into the battery. Both caches are now `SingleSlotCache`, which evicts
+  the previous value *before* the loader allocates the next: peak is one
+  entry, not two. Jobs are emitted dataset -> model -> embedding, so a
+  single slot still serves a cell's whole hyperparameter grid from
+  cache; the miss at a cell boundary costs one npy read.
+- **A solo CUDA process claimed the whole card, freezing the
+  workstation.** The GPU that trains is the same one that draws the
+  desktop. `set_per_process_memory_fraction` was called only when
+  `n_workers > 1`, so the single-worker battery (the pinned
+  configuration since 2026-08-29) ran uncapped, and `extract` and
+  `evaluate` — each its own process, the longest and the heaviest GPU
+  steps respectively — never capped at all. The cap now lives in one
+  place, `cap_process_vram` (`src/utils/device.py`, with
+  `SOLO_PROCESS_VRAM_FRACTION = 0.85` and `POOL_VRAM_FRACTION = 0.90`),
+  and every long-lived CUDA entry point calls it. A regression test
+  walks those entry points' ASTs, and a second fails if any module
+  outside `device.py` sets the fraction directly.
+
+### Changed
+
+- **`_RANKING_VRAM_SHARE` 0.5 -> 0.25** (`src/utils/parallel.py`). A
+  ranking batch sized to fill half of 16 GB issues kernels long enough
+  that the compositor never gets a slice; on 2026-09-01 that tripped the
+  display driver's watchdog. Combined with the 0.85 cap the validation
+  user-batch on amazon_women falls from ~822 users to ~373, which also
+  puts VNPR's eval back inside the card: it allocates four `(B, N)`
+  buffers in `predict_batch`, against the model-agnostic 28 B/element
+  the budget assumes. Metrics are unaffected — `plan_ranking_batch`
+  documents batching as a pure execution detail, every row is scored,
+  masked and sorted independently.
+- **Container limits sized for the workstation, not for the run**
+  (`docker-compose.yml`, all three services). `mem_limit` /
+  `memswap_limit` 24g -> 16g and a new `cpus: 12`, both overridable
+  (`PRISM_MEM_LIMIT`, `PRISM_CPUS`). At 24g of 32 GB the host was left
+  with ~8 GB and swapped; uncapped, the sampler and dataloader workers
+  took all 16 cores. With the cache fixed, a worker peaks at roughly one
+  embedding matrix plus one dataset's interaction index, so 16g is
+  ample.
+
 ## [2.12.0] - 2026-09-04
 
 ### Added
@@ -1751,6 +1802,7 @@ This version covers the contracts the framework exposes to outside users
   (Python 3.11+), addressing ruff `UP017`.
 
 [Unreleased]: https://github.com/lucas-couto/prism-vrec/compare/v2.12.0...HEAD
+[2.12.1]: https://github.com/lucas-couto/prism-vrec/compare/v2.12.0...v2.12.1
 [2.12.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.11.0...v2.12.0
 [2.11.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.10.0...v2.11.0
 [2.10.0]: https://github.com/lucas-couto/prism-vrec/compare/v2.9.3...v2.10.0

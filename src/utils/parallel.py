@@ -28,7 +28,16 @@ logger = get_logger(__name__)
 #: Share of a worker's GPU allowance the validation ranking may hold.
 #: The remainder covers the model, its embedding tables, the optimiser
 #: state and the autograd graph.
-_RANKING_VRAM_SHARE = 0.5
+#:
+#: Lowered from 0.5 on 2026-09-04.  The card that trains is also the one
+#: that draws the researcher's desktop: a ranking batch sized to fill
+#: half of 16 GB issues kernels long enough that the compositor never
+#: gets a slice, which freezes the machine (and, on 2026-09-01, tripped
+#: the display driver's watchdog).  A quarter halves the user-batch, so
+#: the same work arrives as more, shorter kernels.  Cost: a few percent
+#: of validation time.  Metrics are unaffected -- the batch size is how
+#: the ranking is computed, not what it computes.
+_RANKING_VRAM_SHARE = 0.25
 
 #: Factor the ranking budget is multiplied by per OOM retry.  Halving
 #: halves the user-batch, which is what actually overflowed: the ranking
@@ -38,6 +47,46 @@ _OOM_SHRINK_PER_RETRY = 0.5
 #: Retries before a job is declared unrecoverable.  At the third attempt
 #: the budget is a quarter of the original.
 MAX_OOM_RETRIES = 2
+
+
+class SingleSlotCache:
+    """A cache that holds exactly one entry, evicting on every miss.
+
+    The training worker is long-lived (thousands of jobs) and each value
+    it caches is a whole dataset or a whole ``(n_items, D)`` float32
+    embedding matrix -- a learned-alignment sidecar for amazon_fashion
+    concatenates to ``(166270, 2816)``, i.e. 1.9 GB.  An unbounded dict
+    therefore accumulated every fusion of every dataset until the
+    container cgroup OOM-killed the worker mid-run.
+
+    Jobs are emitted dataset -> model -> embedding, so a single slot
+    still serves the whole hyperparameter grid of a cell from cache; a
+    miss on a cell boundary costs one npy read instead of a dead run.
+    The previous value is dropped *before* the new one is built, so the
+    peak is one entry, not two.
+    """
+
+    def __init__(self) -> None:
+        self._key: str | None = None
+        self._value: object | None = None
+
+    def get_or_load(self, key: str, loader):
+        """Return the cached value for *key*, calling *loader* on a miss.
+
+        @param key - Identity of the entry (dataset name or artefact path).
+        @param loader - Zero-argument callable building the value on a miss.
+        @returns The cached or freshly loaded value.
+        """
+        if self._key == key:
+            return self._value
+
+        self._key = None
+        self._value = None
+
+        value = loader()
+        self._key = key
+        self._value = value
+        return value
 
 
 try:
@@ -180,7 +229,6 @@ def _worker_fn(
 
     import json
 
-    import numpy as np
     import pandas as pd
 
     from src.recommenders import get_recommender_class
@@ -198,10 +246,11 @@ def _worker_fn(
     # ``get_device_properties``, so the number has to travel by hand.
     worker_vram = 0
     if torch.cuda.is_available():
-        # 0.90/n keeps the sum of caps below the card (see train.py).
-        fraction = 0.90 / n_workers if n_workers > 1 else 1.0
-        if n_workers > 1:
-            torch.cuda.set_per_process_memory_fraction(fraction)
+        # Capped in BOTH cases -- skipping the cap for n == 1 is what
+        # let a single worker claim all 16 GB of the display GPU.
+        from src.utils.device import cap_process_vram
+
+        fraction = cap_process_vram(n_workers)
         try:
             total = torch.cuda.get_device_properties(0).total_memory
             worker_vram = int(total * fraction)
@@ -211,12 +260,12 @@ def _worker_fn(
     checkpoint_mgr = CheckpointManager()
     config = load_config()
 
-    _data_cache: dict[str, tuple] = {}
-    _emb_cache: dict[str, np.ndarray] = {}
+    # One slot each: an unbounded cache here is what OOM-killed the
+    # worker mid-run.  See :class:`SingleSlotCache`.
+    _data_cache = SingleSlotCache()
+    _emb_cache = SingleSlotCache()
 
-    def _load_data(processed_dir: str, dataset_name: str):
-        if dataset_name in _data_cache:
-            return _data_cache[dataset_name]
+    def _read_data(processed_dir: str, dataset_name: str):
         base = Path(processed_dir) / dataset_name
         train_df = pd.read_csv(base / "train.csv")
         val_df = pd.read_csv(base / "val.csv")
@@ -240,9 +289,13 @@ def _worker_fn(
 
         item_cats = item_category_array(dataset_name, processed_dir)
 
-        result = (n_users, n_items, train_inter, val_inter, item_cats)
-        _data_cache[dataset_name] = result
-        return result
+        return (n_users, n_items, train_inter, val_inter, item_cats)
+
+    def _load_data(processed_dir: str, dataset_name: str):
+        return _data_cache.get_or_load(
+            dataset_name,
+            lambda: _read_data(processed_dir, dataset_name),
+        )
 
     while True:
         try:
@@ -278,9 +331,11 @@ def _worker_fn(
 
             visual_emb = None
             if job.embeddings_path is not None:
-                if job.embeddings_path not in _emb_cache:
-                    _emb_cache[job.embeddings_path] = load_embedding(job.embeddings_path)
-                visual_emb = _emb_cache[job.embeddings_path]
+                path = job.embeddings_path
+                visual_emb = _emb_cache.get_or_load(
+                    path,
+                    lambda p=path: load_embedding(p),
+                )
 
             # Each OOM retry halves the ranking budget, which halves the
             # user-batch the evaluator can afford.  Without this the job

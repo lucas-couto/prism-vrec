@@ -853,18 +853,15 @@ def _optuna_cell_worker(
     """
     from queue import Empty as _Empty
 
-    import torch as _torch
-
+    from src.utils.device import cap_process_vram
     from src.utils.logging import get_logger as _get_logger
 
     wlog = _get_logger(f"optuna_worker_{worker_id}")
 
-    if _torch.cuda.is_available() and n_workers > 1:
-        # 0.90/n so the SUM of the workers' caps stays below the card
-        # (the old 1/n + 0.05 oversubscribed: 3 workers claimed 115%
-        # and every CUDA context lives outside the cap on top of that).
-        fraction = 0.90 / n_workers
-        _torch.cuda.set_per_process_memory_fraction(fraction)
+    # Capped for any n: the sum of the pool's caps stays below the card
+    # (a CUDA context lives outside the cap, on top of it), and a lone
+    # worker still leaves the display its headroom.
+    cap_process_vram(n_workers)
 
     while True:
         try:

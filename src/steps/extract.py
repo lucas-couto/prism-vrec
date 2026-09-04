@@ -29,7 +29,7 @@ from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.dataloader import resolve_dataloader_settings
-from src.utils.device import resolve_device
+from src.utils.device import cap_process_vram, resolve_device
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
 from src.utils.splits import train_item_indices
@@ -366,6 +366,9 @@ def run() -> None:
     set_seed(config["seed"])
 
     device = resolve_device(config["device"])
+    # The longest GPU step of the pipeline (~5 h on the full battery),
+    # in its own process: cap it so the desktop stays usable throughout.
+    cap_process_vram()
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
     batch_size = config.get("batch_size", 64)

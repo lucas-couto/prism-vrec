@@ -52,6 +52,44 @@ def resolve_device(requested: str) -> str:
     return "cpu"
 
 
+#: VRAM cap for a process that has the card to itself, as a fraction
+#: of the card.  The 15% left over is not slack: it is what the display
+#: server and the compositor need to keep the workstation responsive
+#: while a battery runs.  The GPU that trains here is the same one that
+#: draws the desktop, so an uncapped process freezes the machine (and on
+#: 2026-09-01 tripped the display driver's watchdog).
+SOLO_PROCESS_VRAM_FRACTION = 0.85
+
+#: Total share of the card the training workers may claim between them.
+#: Below 1.0 because every CUDA context lives *outside* the per-process
+#: cap, on top of it.
+POOL_VRAM_FRACTION = 0.90
+
+
+def cap_process_vram(n_workers: int = 1) -> float:
+    """Cap this process's VRAM and return the fraction applied.
+
+    Sizing every budget off the whole card is what oversubscribes a
+    shared GPU; capping the process makes :func:`vram_allowance_bytes`
+    report the real allowance to every downstream budget.
+
+    :param n_workers: Processes sharing the card.  ``1`` (the default,
+        and the case for the single-worker battery and the ``evaluate``
+        step) still caps, leaving the display its headroom.
+    :returns: The fraction applied, or ``0.0`` when there is no CUDA
+        device to cap.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0.0
+    fraction = (
+        POOL_VRAM_FRACTION / n_workers if n_workers > 1 else SOLO_PROCESS_VRAM_FRACTION
+    )
+    torch.cuda.set_per_process_memory_fraction(fraction)
+    return fraction
+
+
 def vram_allowance_bytes(device=None) -> int:
     """Bytes of VRAM THIS process may use, honouring the per-process cap.
 
