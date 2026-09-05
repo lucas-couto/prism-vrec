@@ -62,6 +62,19 @@ class BaseRecommender(nn.Module, abc.ABC):
     #: models, so models that do not accept the keyword are untouched.
     wants_history: bool = False
 
+    #: Bytes held per ``(user, item)`` pair by :meth:`predict_batch`, on
+    #: top of the ``(B, N)`` score matrix it returns.  The evaluator
+    #: budgets its own buffers (the returned matrix, the tie-break
+    #: reordering and the sort workspace) and adds this, so a model that
+    #: keeps extra full-size intermediates alive gets a smaller user
+    #: batch instead of an OOM.
+    #:
+    #: ``0`` is right for any model whose ``predict_batch`` builds the
+    #: score matrix and nothing else of size ``(B, N)`` — the whole
+    #: linear visual-BPR family.  Count 4 bytes per extra fp32 buffer
+    #: live at the peak.
+    PREDICT_BATCH_BYTES_PER_ELEMENT: int = 0
+
     #: Embedding tables whose rows are gathered per batch for the
     #: BPR-Opt L2 penalty (see :meth:`l2_reg`).  ``_L2_USER_TABLES`` are
     #: indexed by the batch's user ids, ``_L2_ITEM_TABLES`` by both the

@@ -1,4 +1,4 @@
-"""Host-memory budget helpers for sizing process pools.
+"""Budget helpers for sizing process pools: memory AND cpu.
 
 Several steps fan work out across worker *processes* (fusion via
 ``ProcessPoolExecutor``, hyperparameter search via
@@ -62,6 +62,47 @@ def memory_budget_bytes() -> int:
         pass
 
     return int(_FALLBACK_MEMORY_GB * 1024**3)
+
+
+def available_cpus() -> int:
+    """CPU cores THIS process may actually use, honouring the cgroup quota.
+
+    ``os.cpu_count()`` reports the machine, not the allowance: a
+    container limited with ``cpus: 10.4`` still sees all 16 cores and
+    sizes its pools for 16, so the pool oversubscribes its own quota and
+    spends the difference on context switching.  This is the CPU twin of
+    :func:`memory_budget_bytes`.
+
+    Resolution order: cgroup v2 ``cpu.max`` -> cgroup v1
+    ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` -> ``os.cpu_count()``.
+    A fractional quota rounds DOWN (10.4 cores -> 10), so a pool never
+    asks for a core the scheduler will not give it, and the result is
+    never below 1.
+
+    :returns: Usable core count, at least 1.
+    """
+    quota = _read_cgroup_cpu_quota()
+    host = os.cpu_count() or 1
+    if quota is None:
+        return max(1, host)
+    return max(1, min(host, quota))
+
+
+def _read_cgroup_cpu_quota() -> int | None:
+    """Whole cores the cgroup allows, or ``None`` when unconstrained."""
+    v2 = Path("/sys/fs/cgroup/cpu.max")
+    try:
+        raw = v2.read_text(encoding="utf-8").split()
+        if raw and raw[0] != "max":
+            return int(int(raw[0]) // int(raw[1]))
+    except (OSError, ValueError, IndexError):
+        pass
+
+    period = _read_int_file(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
+    quota = _read_int_file(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"))
+    if period and quota and quota > 0:
+        return int(quota // period)
+    return None
 
 
 def plan_pool_workers(

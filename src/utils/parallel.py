@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -21,7 +20,7 @@ import torch.multiprocessing as mp
 
 from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
-from src.utils.memory import plan_pool_workers
+from src.utils.memory import available_cpus, plan_pool_workers
 
 logger = get_logger(__name__)
 
@@ -153,7 +152,7 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
     behaviour for callers that cannot estimate the footprint.
     """
     if device == "cpu" or not torch.cuda.is_available():
-        cpu_cap = max(1, (os.cpu_count() or 4) - 1)
+        cpu_cap = max(1, available_cpus() - 1)
         return plan_pool_workers(
             per_worker_bytes=per_worker_bytes,
             hard_cap=cpu_cap,
@@ -177,7 +176,7 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
     margin_mb = 1024
     available_mb = free_mb - margin_mb
     n_workers = max(1, int(available_mb / mb_per_worker))
-    n_workers = min(n_workers, max(1, (os.cpu_count() or 4) - 1))
+    n_workers = min(n_workers, max(1, available_cpus() - 1))
 
     logger.info(
         "VRAM: free=%.0f MB of %.0f MB, ~%d MB/worker, margin=%d MB → %d workers",

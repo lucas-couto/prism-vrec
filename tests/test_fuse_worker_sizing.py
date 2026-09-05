@@ -1,6 +1,6 @@
 """Tests for the memory-aware sizing of the fusion process pool.
 
-Sizing the pool at ``os.cpu_count()`` regardless of what each worker
+Sizing the pool at the CPU quota regardless of what each worker
 holds is what let the fusion step exhaust host memory.  The estimate is
 now regime-aware: sidecar tasks cost nothing, streamed tasks are bounded
 by the chunk size (plus the PCA fit matrix), and anything still running
@@ -80,7 +80,7 @@ class TestTaskPeakBytes:
 class TestPlanFusionWorkers:
     def test_streamed_tasks_keep_every_core(self, tmp_path, monkeypatch):
         """After streaming, a catalogue-sized concat no longer caps the pool."""
-        monkeypatch.setattr(fuse_mod.os, "cpu_count", lambda: 16)
+        monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 24 * GB)
         # ~4 GB of sources — the shape that used to force 1 worker.
         paths = [_npy(tmp_path, "a.npy", 2 * 1024 * 1024, 512)]
@@ -89,7 +89,7 @@ class TestPlanFusionWorkers:
         assert fuse_mod._plan_fusion_workers(pending) == 12
 
     def test_in_memory_tasks_are_still_capped(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(fuse_mod.os, "cpu_count", lambda: 16)
+        monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 24 * GB)
         paths = [_npy(tmp_path, "a.npy", 2 * 1024 * 1024, 512)]
         pending = [_task(paths, strategy="some_plugin") for _ in range(12)]
@@ -98,7 +98,7 @@ class TestPlanFusionWorkers:
 
     def test_the_heaviest_task_sets_the_pool_size(self, tmp_path, monkeypatch):
         """Homogeneous slots: one fat task must not be sized by the light ones."""
-        monkeypatch.setattr(fuse_mod.os, "cpu_count", lambda: 16)
+        monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 24 * GB)
         light = [_npy(tmp_path, "light.npy", 100, 32)]
         heavy = [_npy(tmp_path, "heavy.npy", 2 * 1024 * 1024, 512)]
@@ -108,7 +108,7 @@ class TestPlanFusionWorkers:
         assert fuse_mod._plan_fusion_workers(pending) == 1
 
     def test_never_more_workers_than_pending_tasks(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(fuse_mod.os, "cpu_count", lambda: 16)
+        monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 64 * GB)
         paths = [_npy(tmp_path, "a.npy", 100, 32)]
         pending = [_task(paths) for _ in range(3)]
@@ -116,14 +116,14 @@ class TestPlanFusionWorkers:
         assert fuse_mod._plan_fusion_workers(pending) == 3
 
     def test_sidecar_only_batch_is_not_memory_capped(self, monkeypatch):
-        monkeypatch.setattr(fuse_mod.os, "cpu_count", lambda: 4)
+        monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 4)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 5 * GB)
         pending = [_task([], sidecar={"components": []}) for _ in range(4)]
 
         assert fuse_mod._plan_fusion_workers(pending) == 4
 
     def test_always_at_least_one_worker(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(fuse_mod.os, "cpu_count", lambda: 16)
+        monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 5 * GB)
         paths = [_npy(tmp_path, "a.npy", 4 * 1024 * 1024, 512)]
         pending = [_task(paths, strategy="some_plugin") for _ in range(12)]

@@ -80,7 +80,25 @@ RANKING_BYTES_PER_ELEMENT = 28
 _DEFAULT_RANKING_VRAM_FRACTION = 0.35
 
 
-def plan_ranking_batch(requested: int, n_items: int, budget_bytes: int) -> int:
+def _release_cuda_cache(device: torch.device) -> None:
+    """Return this process's freed CUDA blocks to the driver.
+
+    Called only after an ``OutOfMemoryError``, before the batch is
+    retried smaller: the failed allocation leaves the caching allocator
+    holding blocks of the old, larger shape, which the smaller retry
+    cannot necessarily reuse.  A no-op off CUDA.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+
+
+def plan_ranking_batch(
+    requested: int,
+    n_items: int,
+    budget_bytes: int,
+    bytes_per_element: int = RANKING_BYTES_PER_ELEMENT,
+) -> int:
     """Clamp a user-batch size to what the ranking buffers can afford.
 
     Scoring ``B`` users against ``N`` items allocates ``B * N`` elements
@@ -96,12 +114,36 @@ def plan_ranking_batch(requested: int, n_items: int, budget_bytes: int) -> int:
     :param requested: The caller's batch size, treated as a maximum.
     :param n_items: Catalogue size ``N``.
     :param budget_bytes: GPU bytes the ranking buffers may occupy.
+    :param bytes_per_element: Peak bytes held per ``(user, item)`` pair.
+        Defaults to the evaluator's own buffers
+        (:data:`RANKING_BYTES_PER_ELEMENT`); callers scoring a model
+        whose ``predict_batch`` keeps extra ``(B, N)`` buffers alive add
+        that model's :attr:`~src.recommenders.base.BaseRecommender.PREDICT_BATCH_BYTES_PER_ELEMENT`
+        so the plan covers the true peak rather than the evaluator's
+        share of it.
     :returns: Batch size in ``[1, requested]``.
     """
-    if n_items <= 0 or budget_bytes <= 0:
+    if n_items <= 0 or budget_bytes <= 0 or bytes_per_element <= 0:
         return max(1, requested)
-    per_user = n_items * RANKING_BYTES_PER_ELEMENT
+    per_user = n_items * bytes_per_element
     return max(1, min(requested, int(budget_bytes // per_user)))
+
+
+def model_bytes_per_element(model: Any) -> int:
+    """Peak bytes per ``(user, item)`` pair when ranking with *model*.
+
+    The evaluator's own buffers plus whatever the model's
+    ``predict_batch`` holds live on top of the score matrix it returns.
+    Models that do not declare the attribute are assumed to allocate the
+    score matrix and nothing else — true of the linear visual-BPR family,
+    false of :class:`~src.recommenders.vnpr.VNPR`, whose two mirrored
+    branches share a third ``(B, N)`` term.
+    """
+    extra = getattr(model, "PREDICT_BATCH_BYTES_PER_ELEMENT", 0)
+    try:
+        return RANKING_BYTES_PER_ELEMENT + max(0, int(extra))
+    except (TypeError, ValueError):  # a model exposing a non-numeric attribute
+        return RANKING_BYTES_PER_ELEMENT
 
 
 def default_ranking_budget(device: torch.device) -> int:
@@ -434,19 +476,71 @@ class Evaluator:
         self,
         model: Any,
         all_items: torch.Tensor,
+        users: list[int] | None = None,
+        progress: bool = True,
     ) -> list[dict]:
-        """Fallback: score one user at a time."""
-        results: list[dict] = []
-        for user_id in tqdm(self.test_users, desc="Evaluating"):
-            scores = model.predict(user_id, all_items)
-            telemetry.add_items(1)
-            if isinstance(scores, torch.Tensor):
-                user_scores = scores.cpu().numpy()
-            else:
-                user_scores = np.asarray(scores)
+        """Fallback: score one user at a time.
 
+        :param users: Users to score; defaults to the whole test set.
+            The batched path passes a subset when a single-user batch
+            still ran out of memory, so the pass degrades to this floor
+            for those users only instead of failing.
+        :param progress: Whether to draw a progress bar -- off when the
+            batched path calls in, which already has one.
+        """
+        results: list[dict] = []
+        targets = self.test_users if users is None else users
+        for user_id in tqdm(targets, desc="Evaluating", disable=not progress):
+            user_scores = self._score_user_in_blocks(model, user_id, all_items)
             results.append(self._rank_and_score(user_id, user_scores))
+            telemetry.add_items(1)
         return results
+
+    @staticmethod
+    def _predict_item_block(model: Any, user_id: int, items: torch.Tensor) -> np.ndarray:
+        """Copy one block to host memory, without retaining device tensors."""
+        scores = model.predict(user_id, items)
+        if isinstance(scores, torch.Tensor):
+            return scores.detach().cpu().numpy().copy()
+        return np.asarray(scores).copy()
+
+    def _score_user_in_blocks(
+        self, model: Any, user_id: int, all_items: torch.Tensor
+    ) -> np.ndarray:
+        """Score EVERY item, shrinking device blocks on OOM; never sample.
+
+        Host scores and the subsequent CPU sort remain O(n_items). This
+        bounds scoring intermediates, not resident model/features or RAM.
+        A failure at one item propagates: even that allocation must fit.
+        """
+        block_size = min(1024, len(all_items))
+        scores = None
+        start = 0
+        while start < len(all_items):
+            stop = min(start + block_size, len(all_items))
+            block = None
+            try:
+                block = self._predict_item_block(model, user_id, all_items[start:stop])
+            except torch.cuda.OutOfMemoryError:
+                if stop - start == 1:
+                    raise
+            # Leave the except scope BEFORE retrying: its traceback owns
+            # the failed prediction's tensors until the handler exits.
+            if block is None:
+                _release_cuda_cache(all_items.device)
+                block_size = max(1, (stop - start) // 2)
+                logger.warning(
+                    "Ranking OOM for user %d; retrying item offset %d with block %d",
+                    user_id,
+                    start,
+                    block_size,
+                )
+                continue
+            if scores is None:
+                scores = np.empty(len(all_items), dtype=block.dtype)
+            scores[start:stop] = block
+            start = stop
+        return scores if scores is not None else np.empty(0, dtype=np.float32)
 
     def _evaluate_batched(
         self,
@@ -465,105 +559,159 @@ class Evaluator:
 
         *batch_size* is an upper bound, not the value used: ``B * N``
         elements are allocated several times over, so the real batch is
-        derived from the catalogue size and the process's GPU allowance
-        (see :func:`plan_ranking_batch`).  Every row is ranked and scored
-        independently, so this changes throughput and peak memory only —
-        never the metrics.
+        derived from the catalogue size, the process's GPU allowance and
+        the model's own declared peak (see :func:`plan_ranking_batch`
+        and :func:`model_bytes_per_element`).  Every row is ranked and
+        scored independently, so this changes throughput and peak memory
+        only — never the metrics.
+
+        The plan is an estimate, so it is also enforced reactively: an
+        ``OutOfMemoryError`` halves the batch and retries the SAME users,
+        and a batch of one that still overflows falls through to the
+        item-block path, with the complete ranking performed on CPU.
+        All candidates, masks and tie-break keys are preserved. Resident
+        model/features must still fit, as must one item's prediction;
+        host memory must hold one score vector and its sorting buffers.
         """
         device = all_items.device
         self._ensure_train_idx_cache(device)
 
         results: list[dict] = []
         n_users = len(self.test_users)
-        neg_inf = float("-inf")
 
         budget = self.ranking_budget_bytes
         if budget is None:
             budget = default_ranking_budget(device)
-        batch_size = plan_ranking_batch(batch_size, self.n_items, budget)
+        batch_size = plan_ranking_batch(
+            batch_size, self.n_items, budget, model_bytes_per_element(model)
+        )
 
-        for start in tqdm(range(0, n_users, batch_size), desc="Evaluating"):
-            batch_user_ids = self.test_users[start : start + batch_size]
-            user_ids_tensor = torch.tensor(batch_user_ids, dtype=torch.long, device=device)
+        start = 0
+        with tqdm(total=n_users, desc="Evaluating") as progress:
+            while start < n_users:
+                chunk = self.test_users[start : start + batch_size]
+                ranked = None
+                try:
+                    ranked = self._rank_user_chunk(model, all_items, chunk)
+                except torch.cuda.OutOfMemoryError:
+                    logger.debug("Ranking allocation failed; leaving handler before recovery")
+                if ranked is None:
+                    _release_cuda_cache(device)
+                    if len(chunk) > 1:
+                        batch_size = max(1, len(chunk) // 2)
+                        logger.warning(
+                            "Ranking OOM at batch %d; retrying the same users at %d",
+                            len(chunk),
+                            batch_size,
+                        )
+                        continue
+                    logger.warning(
+                        "Ranking OOM at a single user (%d); scoring the full "
+                        "catalogue in item blocks and ranking on CPU",
+                        chunk[0],
+                    )
+                    ranked = self._evaluate_single(model, all_items, users=chunk, progress=False)
+                results.extend(ranked)
+                start += len(chunk)
+                progress.update(len(chunk))
+        return results
 
-            batch_scores = model.predict_batch(user_ids_tensor, all_items)
-            # R3 guard: raw scores must be finite BEFORE the train-item
-            # mask goes in — the stable sort below ranks NaN at the top,
-            # so a NaN would silently inflate the metrics.
-            _assert_finite_scores(
-                torch.isfinite(batch_scores),
-                f"batched path, users {batch_user_ids[0]}..{batch_user_ids[-1]}",
+    def _rank_user_chunk(
+        self,
+        model: Any,
+        all_items: torch.Tensor,
+        batch_user_ids: list[int],
+    ) -> list[dict]:
+        """Rank one batch of users against the full catalogue.
+
+        Split out of :meth:`_evaluate_batched` so an OOM can be caught
+        around a whole batch and the batch retried smaller: every
+        ``(B, N)`` buffer this allocates dies with the failed call.
+        """
+        device = all_items.device
+        neg_inf = float("-inf")
+        results: list[dict] = []
+
+        user_ids_tensor = torch.tensor(batch_user_ids, dtype=torch.long, device=device)
+
+        batch_scores = model.predict_batch(user_ids_tensor, all_items)
+        # R3 guard: raw scores must be finite BEFORE the train-item
+        # mask goes in — the stable sort below ranks NaN at the top,
+        # so a NaN would silently inflate the metrics.
+        _assert_finite_scores(
+            torch.isfinite(batch_scores),
+            f"batched path, users {batch_user_ids[0]}..{batch_user_ids[-1]}",
+        )
+        # Inference throughput is measured in users ranked per second;
+        # see src.utils.flops on why scoring dispatches no counted FLOPs
+        # for factorisation models.
+
+        for i, user_id in enumerate(batch_user_ids):
+            idx = self._train_idx_gpu.get(user_id)
+            if idx is not None:
+                batch_scores[i].index_fill_(0, idx, neg_inf)
+
+        # Stable descending sort instead of topk: torch.topk's tie
+        # order is backend-dependent (CPU vs GPU can rank tied items
+        # differently), which breaks reproducibility across devices.
+        # Columns are first reordered by ``_tiebreak_order`` (ascending
+        # random key), so the stable sort breaks exact-score ties by
+        # that key rather than by item index — the unified rule shared
+        # with the single and sampled paths.
+        order = self._tiebreak_order_on(device)  # (n_items,)
+        reordered = batch_scores.index_select(1, order)
+        sorted_perm = torch.sort(
+            reordered, dim=1, descending=True, stable=True
+        ).indices  # (B, N) — full order (torch.sort already sorts the whole row)
+        del reordered
+
+        # Only the head of each ranking is ever read back.  Slicing
+        # the permutation BEFORE mapping it to item ids keeps the
+        # gather at (B, keep) instead of allocating a second (B, N)
+        # int64 — 1.4 GB per batch on amazon_women, for columns that
+        # are then thrown away.  The values are unchanged: taking the
+        # first `keep` columns commutes with the element-wise lookup.
+        keep = max(self.max_k, TOP_ITEMS_PERSISTED)
+        top_ranked = order[sorted_perm[:, :keep]]  # (B, keep) item ids
+        del sorted_perm
+
+        metrics_top_np = top_ranked[:, : self.max_k].cpu().numpy()
+        top20_np = top_ranked[:, :TOP_ITEMS_PERSISTED].cpu().numpy()  # persisted (D3)
+
+        # Per-user sufficient statistics + tie instrumentation, computed
+        # ONCE here and reused by the metric path (dropped) and the
+        # persistence writer (Task F). Single transfer per batch;
+        # assumes leave-one-out (one held item per user).
+        key = self._tiebreak_key_on(device)
+        held_ids = torch.tensor(
+            [next(iter(self.test_interactions[u])) for u in batch_user_ids],
+            dtype=torch.long,
+            device=device,
+        )
+        held_scores = batch_scores.gather(1, held_ids[:, None])  # (B,1)
+        tie_mask = batch_scores == held_scores
+        greater = (batch_scores > held_scores).sum(dim=1)
+        tied_lower = (tie_mask & (key[None, :] < key[held_ids][:, None])).sum(dim=1)
+        rank_np = (1 + greater + tied_lower).cpu().numpy()
+        n_cand_np = torch.isfinite(batch_scores).sum(dim=1).cpu().numpy()
+        tie_blocks_np = tie_mask.sum(dim=1).cpu().numpy()
+        # Everything below is numpy.  Release the (B, N) buffers now,
+        # so the next iteration's predict_batch does not allocate its
+        # scores while this one's are still resident.
+        del batch_scores, tie_mask, top_ranked
+
+        for i, user_id in enumerate(batch_user_ids):
+            ground_truth = self.test_interactions[user_id]
+            user_metrics = compute_all_metrics(
+                metrics_top_np[i].tolist(), ground_truth, self.k_values
             )
-            # Inference throughput is measured in users ranked per second;
-            # see src.utils.flops on why scoring dispatches no counted FLOPs
-            # for factorisation models.
-            telemetry.add_items(len(batch_user_ids))
-
-            for i, user_id in enumerate(batch_user_ids):
-                idx = self._train_idx_gpu.get(user_id)
-                if idx is not None:
-                    batch_scores[i].index_fill_(0, idx, neg_inf)
-
-            # Stable descending sort instead of topk: torch.topk's tie
-            # order is backend-dependent (CPU vs GPU can rank tied items
-            # differently), which breaks reproducibility across devices.
-            # Columns are first reordered by ``_tiebreak_order`` (ascending
-            # random key), so the stable sort breaks exact-score ties by
-            # that key rather than by item index — the unified rule shared
-            # with the single and sampled paths.
-            order = self._tiebreak_order_on(device)  # (n_items,)
-            reordered = batch_scores.index_select(1, order)
-            sorted_perm = torch.sort(
-                reordered, dim=1, descending=True, stable=True
-            ).indices  # (B, N) — full order (torch.sort already sorts the whole row)
-            del reordered
-
-            # Only the head of each ranking is ever read back.  Slicing
-            # the permutation BEFORE mapping it to item ids keeps the
-            # gather at (B, keep) instead of allocating a second (B, N)
-            # int64 — 1.4 GB per batch on amazon_women, for columns that
-            # are then thrown away.  The values are unchanged: taking the
-            # first `keep` columns commutes with the element-wise lookup.
-            keep = max(self.max_k, TOP_ITEMS_PERSISTED)
-            top_ranked = order[sorted_perm[:, :keep]]  # (B, keep) item ids
-            del sorted_perm
-
-            metrics_top_np = top_ranked[:, : self.max_k].cpu().numpy()
-            top20_np = top_ranked[:, :TOP_ITEMS_PERSISTED].cpu().numpy()  # persisted (D3)
-
-            # Per-user sufficient statistics + tie instrumentation, computed
-            # ONCE here and reused by the metric path (dropped) and the
-            # persistence writer (Task F). Single transfer per batch;
-            # assumes leave-one-out (one held item per user).
-            key = self._tiebreak_key_on(device)
-            held_ids = torch.tensor(
-                [next(iter(self.test_interactions[u])) for u in batch_user_ids],
-                dtype=torch.long,
-                device=device,
-            )
-            held_scores = batch_scores.gather(1, held_ids[:, None])  # (B,1)
-            tie_mask = batch_scores == held_scores
-            greater = (batch_scores > held_scores).sum(dim=1)
-            tied_lower = (tie_mask & (key[None, :] < key[held_ids][:, None])).sum(dim=1)
-            rank_np = (1 + greater + tied_lower).cpu().numpy()
-            n_cand_np = torch.isfinite(batch_scores).sum(dim=1).cpu().numpy()
-            tie_blocks_np = tie_mask.sum(dim=1).cpu().numpy()
-            # Everything below is numpy.  Release the (B, N) buffers now,
-            # so the next iteration's predict_batch does not allocate its
-            # scores while this one's are still resident.
-            del batch_scores, tie_mask, top_ranked
-
-            for i, user_id in enumerate(batch_user_ids):
-                ground_truth = self.test_interactions[user_id]
-                user_metrics = compute_all_metrics(
-                    metrics_top_np[i].tolist(), ground_truth, self.k_values
-                )
-                user_metrics["user_id"] = user_id
-                user_metrics["_rank"] = int(rank_np[i])
-                user_metrics["_n_candidates"] = int(n_cand_np[i])
-                user_metrics["_tie_block_size"] = int(tie_blocks_np[i])
-                user_metrics["_top_items"] = top20_np[i].tolist()
-                results.append(user_metrics)
+            user_metrics["user_id"] = user_id
+            user_metrics["_rank"] = int(rank_np[i])
+            user_metrics["_n_candidates"] = int(n_cand_np[i])
+            user_metrics["_tie_block_size"] = int(tie_blocks_np[i])
+            user_metrics["_top_items"] = top20_np[i].tolist()
+            results.append(user_metrics)
+        telemetry.add_items(len(batch_user_ids))
         return results
 
     def _tiebreak_order_on(self, device: torch.device) -> torch.Tensor:

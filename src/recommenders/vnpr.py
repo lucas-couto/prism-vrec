@@ -154,6 +154,11 @@ class VNPR(BaseRecommender):
     #: (``v_h``).
     _USER_TABLES: tuple[str, ...] = ("user_embedding", "visual_user_embedding")
 
+    #: Beyond the returned score matrix, :meth:`predict_batch` holds the
+    #: shared visual term and one branch's GEMM live -- two fp32
+    #: ``(B, N)`` buffers, 8 bytes per pair.
+    PREDICT_BATCH_BYTES_PER_ELEMENT: int = 8
+
     def __init__(
         self,
         n_users: int,
@@ -269,6 +274,15 @@ class VNPR(BaseRecommender):
         its own ``(B,k)@(k,N)`` item GEMM before the ReLU, and the two
         are averaged.  Mathematically identical to :meth:`predict`
         (float reductions are reordered, so not bit-identical).
+
+        Exactly three ``(B, N)`` buffers are live at the peak -- the
+        shared visual term, the accumulating result and one branch's
+        GEMM -- which is what
+        :attr:`PREDICT_BATCH_BYTES_PER_ELEMENT` declares to the
+        evaluator's batch planner.  The fused ``addmm`` / in-place ReLU
+        below is what keeps it at three: the naive expression form holds
+        five, and the planner sizing a VNPR batch as if it held one is
+        how a full-ranking pass over a 326K-item catalogue OOM-ed.
         """
         k = self.latent_dim
         w = self.dense.weight.squeeze(0)
@@ -277,11 +291,44 @@ class VNPR(BaseRecommender):
         p = self.user_embedding(user_ids) * w_q  # (B, k)
         v = self.visual_user_embedding(user_ids) * w_f  # (B, dv)
         f = self._catalogue_visual(item_ids)  # (N, dv)
+        full = self._is_full_catalogue(item_ids)
 
-        visual_term = v @ f.T + self.dense.bias  # (B, N)
-        r_pos = torch.relu(p @ self.item_embedding(item_ids).T + visual_term)
-        r_neg = torch.relu(p @ self.item_embedding_neg(item_ids).T + visual_term)
-        return 0.5 * (r_pos + r_neg)
+        # beta*input + mat1 @ mat2 in one kernel: the bias broadcasts
+        # over (B, N) instead of allocating a second matrix for the sum.
+        shared = torch.addmm(self.dense.bias, v, f.T)  # (B, N)
+
+        scores = torch.addmm(shared, p, self._branch_items(self.item_embedding, item_ids, full).T)
+        torch.relu_(scores)
+        other = torch.addmm(
+            shared, p, self._branch_items(self.item_embedding_neg, item_ids, full).T
+        )
+        torch.relu_(other)
+        scores.add_(other).mul_(0.5)
+        del other
+        return scores
+
+    def _is_full_catalogue(self, item_ids: torch.Tensor) -> bool:
+        """Whether ``item_ids`` is exactly ``arange(n_items)``."""
+        if item_ids.shape[0] != self.n_items:
+            return False
+        expected = torch.arange(self.n_items, device=item_ids.device)
+        return bool(torch.equal(item_ids, expected))
+
+    @staticmethod
+    def _branch_items(
+        table: nn.Embedding, item_ids: torch.Tensor, full_catalogue: bool
+    ) -> torch.Tensor:
+        """``q`` rows for *item_ids*, without copying the whole table.
+
+        Evaluation scores the full catalogue in order, and an
+        ``nn.Embedding`` lookup for ``arange(n_items)`` materialises a
+        second copy of the table -- 167 MB per branch at ``N`` = 326K,
+        ``k`` = 128, twice over.  ``weight`` carries the same values in
+        the same order, so the gather is pure waste there.
+        """
+        if full_catalogue:
+            return table.weight
+        return table(item_ids)
 
     def _catalogue_visual(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Image features of ``item_ids``, cached for the full catalogue.
@@ -291,10 +338,7 @@ class VNPR(BaseRecommender):
         ``item_ids`` is exactly ``arange(n_items)``.
         """
         cacheable = (
-            not self.training
-            and self._online_fusion is None
-            and item_ids.shape[0] == self.n_items
-            and bool(torch.equal(item_ids, torch.arange(self.n_items, device=item_ids.device)))
+            not self.training and self._online_fusion is None and self._is_full_catalogue(item_ids)
         )
         if cacheable and self._catalogue_visual_cache is not None:
             return self._catalogue_visual_cache

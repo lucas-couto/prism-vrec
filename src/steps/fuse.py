@@ -31,7 +31,6 @@ Two conditions are supported:
 from __future__ import annotations
 
 import json
-import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -53,7 +52,7 @@ from src.fusions.streaming import (
 from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
 from src.utils.logging import get_logger
-from src.utils.memory import plan_pool_workers
+from src.utils.memory import available_cpus, plan_pool_workers
 from src.utils.splits import train_item_indices
 
 logger = get_logger(__name__)
@@ -152,13 +151,13 @@ def _plan_fusion_workers(pending: list[dict]) -> int:
     """Size the fusion pool from the memory budget, not just the CPU count.
 
     A worker fusing two native matrices for a 350K-item catalogue peaks
-    at several GB.  Sizing the pool at ``os.cpu_count()`` therefore asks
+    at several GB.  Sizing the pool at the host's core count asks
     for tens of GB at once and, on a host whose container has no memory
     limit, triggers a *global* OOM that kills processes outside the
     container.  The CPU count stays the upper bound; the memory budget
     lowers it whenever the sources do not fit.
     """
-    cpu_cap = min(len(pending), os.cpu_count() or 4)
+    cpu_cap = min(len(pending), available_cpus())
     per_worker = max((_task_peak_bytes(t) for t in pending), default=0)
     return plan_pool_workers(
         per_worker_bytes=per_worker,

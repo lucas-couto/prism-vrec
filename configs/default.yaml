@@ -109,7 +109,7 @@ pipeline:
 # user as the unit.  Protocol precedent: Rendle et al. (2009, §6.2) —
 # repeated splits, hyperparameters searched once and kept constant.
 folds:
-  enabled: false
+  enabled: true
   k: 10
   seed: 42 # partition seed; fold i runs under seed + i
   min_profile: 2 # users with a smaller profile are excluded (counted)
