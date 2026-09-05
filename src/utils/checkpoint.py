@@ -444,6 +444,14 @@ def load_best_checkpoint(path: str | Path, *, map_location: str = "cpu") -> dict
         raise BestCheckpointError(f"best checkpoint {path} is unreadable: {exc!r}") from exc
     if not isinstance(payload, dict):
         raise BestCheckpointError(f"best checkpoint {path} is not a payload dict.")
+    if "model_state" not in payload and all(isinstance(v, torch.Tensor) for v in payload.values()):
+        # Identified explicitly, never guessed: a flat state_dict carries
+        # neither hyperparameters nor selection identity, so the model it
+        # belongs to cannot be reconstructed with any confidence.
+        raise BestCheckpointError(
+            f"best checkpoint {path} is a legacy flat state_dict without hyperparams "
+            "or selection identity; retrain the cell instead of guessing its dimensions."
+        )
     missing = [k for k in BEST_PAYLOAD_REQUIRED_KEYS if k not in payload]
     if missing:
         raise BestCheckpointError(f"best checkpoint {path} is missing {missing}.")
