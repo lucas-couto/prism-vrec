@@ -11,10 +11,17 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.finetuning.checkpoint import split_state_dict
+from src.finetuning.checkpoint import (
+    best_weights_path,
+    finetune_resume_identity,
+    load_best_weights,
+    load_resume_envelope,
+    save_best_weights,
+    save_resume_envelope,
+    split_state_dict,
+)
 from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
-from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import capture_rng_states, restore_rng_states
 from src.utils.logging import get_logger
 
@@ -221,40 +228,38 @@ class FineTuner:
         use_amp = self.device.type == "cuda"
         scaler = get_grad_scaler(enabled=use_amp)
 
+        identity = finetune_resume_identity(
+            extractor_name=self.extractor_name,
+            n_classes=self.n_classes,
+            in_features=self._proj_in_features,
+            unfreeze_prefixes=self.unfreeze_prefixes,
+            config=self.config,
+            use_amp=use_amp,
+        )
+
         best_acc = 0.0
-        best_state = None
+        best_state: dict | None = None
+        best_epoch: int | None = None
+        best_ref: dict | None = None
         epochs_no_improve = 0
         start_epoch = 0
         last_epoch = -1
         early_stopped = False
 
-        if checkpoint_path is not None:
-            ckpt_file = Path(checkpoint_path)
-            if ckpt_file.exists():
-                ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
-                self.model.load_state_dict(ckpt["model_state"])
-                optimizer.load_state_dict(ckpt["optimizer_state"])
-                scheduler.load_state_dict(ckpt["scheduler_state"])
-                start_epoch = ckpt["epoch"] + 1
-                best_acc = ckpt["best_acc"]
-                epochs_no_improve = ckpt.get("epochs_no_improve", 0)
-                if "scaler_state" in ckpt:
-                    scaler.load_state_dict(ckpt["scaler_state"])
-                # Restore RNG states so a resumed run draws the same
-                # augmentation / shuffle sequence as an uninterrupted one
-                # (bit-identical resume). Absent in pre-1.1.2 checkpoints.
-                if "rng_states" in ckpt:
-                    restore_rng_states(ckpt["rng_states"])
-                else:
-                    logger.warning(
-                        "  Resume checkpoint has no RNG states (pre-1.1.2 format); "
-                        "resumed run is not bit-identical to an uninterrupted one."
-                    )
-                logger.info(
-                    "  Resumed fine-tuning from epoch %d (best_acc=%.4f)",
-                    start_epoch,
-                    best_acc,
-                )
+        if checkpoint_path is not None and Path(checkpoint_path).exists():
+            resumed = self._load_resume(
+                Path(checkpoint_path),
+                identity=identity,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+            )
+            start_epoch = resumed["epoch"] + 1
+            best_acc = float(resumed["best_metric"])
+            best_epoch = resumed["best_epoch"]
+            best_ref = resumed["best_ref"]
+            best_state = resumed["best_state"]
+            epochs_no_improve = resumed["epochs_no_improve"]
 
         for epoch in range(start_epoch, epochs_max):
             self._set_train_mode()
@@ -299,25 +304,45 @@ class FineTuner:
             )
 
             last_epoch = epoch
-            if val_acc > best_acc:
+            # First observation wins (even 0.0 — Q06), strict improvement
+            # afterwards; a tie keeps the earlier best and counts against
+            # patience.
+            if best_state is None or val_acc > best_acc:
                 best_acc = val_acc
+                best_epoch = epoch
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
                 epochs_no_improve = 0
+                if checkpoint_path is not None:
+                    # Committed and digest-bound BEFORE the envelope below
+                    # references it.
+                    best_ref = save_best_weights(
+                        best_weights_path(checkpoint_path),
+                        best_state,
+                        identity=identity,
+                        epoch=epoch,
+                        val_acc=val_acc,
+                    )
             else:
                 epochs_no_improve += 1
 
             if checkpoint_path is not None:
-                payload = {
-                    "model_state": self.model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "scheduler_state": scheduler.state_dict(),
-                    "scaler_state": scaler.state_dict(),
-                    "rng_states": capture_rng_states(),
-                    "epoch": epoch,
-                    "best_acc": best_acc,
-                    "epochs_no_improve": epochs_no_improve,
-                }
-                atomic_write(lambda tmp, p=payload: torch.save(p, tmp), checkpoint_path)
+                save_resume_envelope(
+                    checkpoint_path,
+                    {
+                        "identity": identity,
+                        "model_state": self.model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "scaler_state": scaler.state_dict(),
+                        "rng_states": capture_rng_states(),
+                        "epoch": epoch,
+                        "has_valid_observation": best_state is not None,
+                        "best_metric": best_acc,
+                        "best_epoch": best_epoch,
+                        "best_ref": best_ref,
+                        "epochs_no_improve": epochs_no_improve,
+                    },
+                )
 
             if epochs_no_improve >= patience:
                 logger.info("  Early stopping at epoch %d", epoch + 1)
@@ -327,10 +352,13 @@ class FineTuner:
         if best_state is not None:
             self.model.load_state_dict(best_state)
 
-        # Clean up the resume checkpoint (the persistent fine-tuned weights
-        # are saved by the caller via ``src.finetuning.checkpoint``).
-        if checkpoint_path is not None and Path(checkpoint_path).exists():
-            Path(checkpoint_path).unlink()
+        # Clean up the resume checkpoint and its best-weights sibling (the
+        # persistent fine-tuned weights are saved by the caller via
+        # ``src.finetuning.checkpoint``).
+        if checkpoint_path is not None:
+            for stale in (Path(checkpoint_path), best_weights_path(checkpoint_path)):
+                if stale.exists():
+                    stale.unlink()
 
         backbone_state, head_state = split_state_dict(self.model.state_dict())
         epochs_trained = last_epoch + 1 if last_epoch >= 0 else 0
@@ -346,6 +374,45 @@ class FineTuner:
             epochs_trained=epochs_trained,
             early_stopped=early_stopped,
         )
+
+    def _load_resume(
+        self,
+        ckpt_file: Path,
+        *,
+        identity: str,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler,
+        scaler,
+    ) -> dict:
+        """Validate and load a v2 resume envelope into the live objects.
+
+        Envelope, identity and the referenced best-weights file are
+        checked BEFORE anything is mutated.  The historical best is
+        loaded into memory (CPU) so the end of training can return it
+        even when no later epoch improves; it is never restored into the
+        live model here — that would change the training trajectory.
+        """
+        ckpt = load_resume_envelope(ckpt_file, identity=identity)
+        best_state = None
+        if ckpt["has_valid_observation"]:
+            best_state = load_best_weights(
+                ckpt["best_ref"], identity=identity, source=f"resume {ckpt_file}"
+            )
+        self.model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        if scaler.is_enabled():
+            scaler.load_state_dict(ckpt["scaler_state"])
+        # Same augmentation / shuffle sequence as an uninterrupted run
+        # (bit-identical resume).
+        restore_rng_states(ckpt["rng_states"])
+        logger.info(
+            "  Resumed fine-tuning from epoch %d (best_acc=%.4f at epoch %s)",
+            ckpt["epoch"] + 1,
+            float(ckpt["best_metric"]),
+            ckpt["best_epoch"],
+        )
+        return {**ckpt, "best_state": best_state}
 
     def _validate(
         self,
