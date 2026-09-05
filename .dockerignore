@@ -12,3 +12,5 @@ checkpoints/
 results/
 .mypy_cache/
 .ruff_cache/
+.cache/
+.env
