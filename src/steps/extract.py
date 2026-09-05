@@ -30,6 +30,7 @@ from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import cap_process_vram, resolve_device
+from src.utils.item_order import item_order_metadata, load_item_order
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
 from src.utils.splits import train_item_indices
@@ -38,20 +39,30 @@ from src.utils.timing import time_cell
 logger = get_logger(__name__)
 
 
+class MissingImageError(RuntimeError):
+    """An item of the catalogue has no image on disk (feature identity, Q05)."""
+
+
 class ImageDataset(Dataset):
     """Loader for per-item JPEGs already extracted to disk.
 
-    Performs a single ``os.listdir()`` to filter items that have an
-    image on disk, distributed filesystems (NFS, MooseFS) make a naive
-    ``Path.exists()`` per item prohibitively slow.
+    Performs a single ``os.listdir()`` to resolve every item's image,
+    distributed filesystems (NFS, MooseFS) make a naive ``Path.exists()``
+    per item prohibitively slow.
+
+    The dataset yields items in exactly the order of *item_ids* and
+    refuses to build when any item has no image: a feature matrix is
+    positional (row ``i`` IS item ``i``), so silently skipping an item
+    would shift every later row onto the wrong item.
+
+    :raises MissingImageError: when an item of *item_ids* has no image
+        file, naming the missing items.
     """
 
     def __init__(self, image_dir: str, item_ids: list, transform=None) -> None:
         self.image_dir = Path(image_dir)
         self.item_ids = item_ids
         self.transform = transform
-        self.valid_items: list = []
-        self.valid_paths: list = []
 
         valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
         files_by_stem: dict[str, Path] = {}
@@ -67,11 +78,15 @@ class ImageDataset(Dataset):
                 exc,
             )
 
-        for item_id in item_ids:
-            path = files_by_stem.get(str(item_id))
-            if path is not None:
-                self.valid_items.append(item_id)
-                self.valid_paths.append(path)
+        missing = [str(item_id) for item_id in item_ids if str(item_id) not in files_by_stem]
+        if missing:
+            raise MissingImageError(
+                f"{len(missing)} of {len(item_ids)} items have no image under "
+                f"{self.image_dir} (e.g. {missing[:10]}). Rows cannot be skipped or "
+                "fabricated: row i must be item_idx i. Re-run the download step."
+            )
+        self.valid_items: list = list(item_ids)
+        self.valid_paths: list = [files_by_stem[str(item_id)] for item_id in item_ids]
 
     def __len__(self) -> int:
         return len(self.valid_items)
@@ -84,11 +99,27 @@ class ImageDataset(Dataset):
 
 
 def get_item_ids(processed_dir: str, dataset_name: str) -> list:
-    """Load the ordered item id list for a dataset from ``item2idx.json``."""
-    item2idx_path = Path(processed_dir) / dataset_name / "item2idx.json"
-    with open(item2idx_path) as f:
-        item2idx = json.load(f)
-    return list(item2idx.keys())
+    """Load the item ids of a dataset in canonical order (row ``i`` = ``item_idx`` ``i``).
+
+    The order is derived from the mapped *values* of ``item2idx.json``,
+    never from its key insertion order: ``{"b": 1, "a": 0}`` yields
+    ``["a", "b"]``.
+
+    :raises ItemOrderError: when the mapped indices are not exactly
+        ``0..N-1`` (holes, duplicates or non-integers).
+    """
+    return load_item_order(processed_dir, dataset_name)
+
+
+def _check_extracted_order(extracted_ids: list, item_ids: list, label: str) -> None:
+    """Fail when the rows written are not exactly the requested ids, in order."""
+    if [str(i) for i in extracted_ids] == [str(i) for i in item_ids]:
+        return
+    raise RuntimeError(
+        f"{label}: extracted {len(extracted_ids)} rows but the catalogue has "
+        f"{len(item_ids)} items or the order differs; the artifact would not "
+        "be positional (row i == item_idx i). Nothing was saved."
+    )
 
 
 def _write_meta(extractor, extractor_name: str, npy_path: Path, extra: dict | None = None) -> None:
@@ -97,7 +128,11 @@ def _write_meta(extractor, extractor_name: str, npy_path: Path, extra: dict | No
     The metadata is what makes the artifact reproducible and lets the
     loader know the input dimension without inferring it from the shape:
     backbone name, native dimensionality, extraction point, exact
-    pretrained-weights id, and the transform recipe.
+    pretrained-weights id, and the transform recipe.  The extract step
+    adds an ``item_order`` block (schema version, ``n_items`` and the
+    digest of the canonical id order) so ``validate_features`` can prove
+    row alignment; sidecars without it are legacy and report as
+    "alignment unverified".
     """
     meta = {"name": extractor_name, **extractor.metadata()}
     if extra:
@@ -280,14 +315,16 @@ def _extract_for_config(
     ckpt_base = f"{checkpoints_dir}/extraction/{dataset_name}_{extractor_name}"
     Path(ckpt_base).parent.mkdir(parents=True, exist_ok=True)
 
+    order_meta = {"item_order": item_order_metadata(item_ids)}
     if need_pooled:
         embeddings, extracted_ids = extractor.extract_batch(
             dataloader,
             checkpoint_path=ckpt_base,
             save_every=checkpoint_every,
         )
+        _check_extracted_order(extracted_ids, item_ids, f"{dataset_name}/{extractor_name}")
         extractor.save(embeddings, extracted_ids, str(pooled_path))
-        _write_meta(extractor, extractor_name, pooled_path, {"kind": "pooled"})
+        _write_meta(extractor, extractor_name, pooled_path, {"kind": "pooled", **order_meta})
         logger.info(
             "  %s: native pooled saved to %s (%s)", extractor_name, pooled_path, embeddings.shape
         )
@@ -303,6 +340,7 @@ def _extract_for_config(
             checkpoint_path=str(comp_path.with_suffix("")),
             save_every=checkpoint_every,
         )
+        _check_extracted_order(comp_ids, item_ids, f"{dataset_name}/{extractor_name}_comp")
         extractor.save_components(components, comp_ids, str(comp_path))
         _write_meta(
             extractor,
@@ -313,6 +351,7 @@ def _extract_for_config(
                 "n_components": int(components.shape[1]),
                 "component_grid": component_grid,
                 "pooling": "adaptive_avg" if component_grid is not None else None,
+                **order_meta,
             },
         )
         logger.info(

@@ -18,6 +18,12 @@ from pathlib import Path
 
 import numpy as np
 
+from src.utils.item_order import (
+    ITEM_ORDER_SCHEMA_VERSION,
+    ItemOrderError,
+    item_order_digest,
+    load_item_order,
+)
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -27,14 +33,68 @@ FEATURE_DTYPE = np.float32
 #: Rows with L2 norm below this are treated as empty (placeholder image).
 NORM_EPS = 1e-8
 
+#: ``stats["alignment"]`` values: the sidecar's ``item_order`` digest
+#: matched the current ``item2idx`` order, or the artifact carries no
+#: digest (legacy, row count only) and its alignment is NOT proven.
+ALIGNMENT_VERIFIED = "verified"
+ALIGNMENT_UNVERIFIED = "unverified"
+
 
 class FeatureValidationError(RuntimeError):
     """Raised when a feature matrix fails a sanity check."""
 
 
-def _n_items(processed_dir: str | Path, dataset: str) -> int:
-    with open(Path(processed_dir) / dataset / "item2idx.json", encoding="utf-8") as fh:
-        return len(json.load(fh))
+def _item_order(processed_dir: str | Path, dataset: str) -> list[str]:
+    """Canonical item order of *dataset*; a broken mapping is a validation failure."""
+    try:
+        return load_item_order(processed_dir, dataset)
+    except ItemOrderError as exc:
+        raise FeatureValidationError(f"{dataset}/item2idx.json: {exc}") from exc
+
+
+def _read_sidecar(npy_path: Path) -> dict | None:
+    meta_path = npy_path.with_suffix("").with_suffix(".meta.json")
+    if not meta_path.exists():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def verify_item_order(npy_path: str | Path, *, label: str, expected_ids: list[str]) -> str:
+    """Check the artifact's persisted ``item_order`` digest against *expected_ids*.
+
+    :returns: :data:`ALIGNMENT_VERIFIED` when the sidecar's digest equals
+        the digest of the canonical order, or :data:`ALIGNMENT_UNVERIFIED`
+        when the sidecar carries no ``item_order`` block (legacy artifact:
+        only its row count is checkable, alignment is unknown and is
+        never relabelled as valid).
+    :raises FeatureValidationError: when a digest is present and differs
+        (same-length reordered catalogue, permuted mapping), or when the
+        block is malformed / of an unknown schema version.
+    """
+    meta = _read_sidecar(Path(npy_path))
+    block = meta.get("item_order") if meta else None
+    if block is None:
+        logger.warning(
+            "%s: alignment unverified — no item_order digest in the sidecar "
+            "(legacy artifact; only the row count was checked). Re-extract to prove "
+            "row i == item_idx i.",
+            label,
+        )
+        return ALIGNMENT_UNVERIFIED
+    if not isinstance(block, dict) or block.get("schema_version") != ITEM_ORDER_SCHEMA_VERSION:
+        raise FeatureValidationError(
+            f"{label}: malformed or unsupported item_order block in the sidecar: {block!r}."
+        )
+    expected = item_order_digest(expected_ids)
+    if block.get("n_items") != len(expected_ids) or block.get("digest") != expected:
+        raise FeatureValidationError(
+            f"{label}: item order digest mismatch — the features were extracted for "
+            f"a different item order than the current item2idx.json "
+            f"(sidecar n_items={block.get('n_items')} digest={str(block.get('digest'))[:12]}…, "
+            f"current n_items={len(expected_ids)} digest={expected[:12]}…). "
+            "Row i is not item_idx i; re-extract."
+        )
+    return ALIGNMENT_VERIFIED
 
 
 def _raw_dim(backbone: str, config: dict) -> int | None:
@@ -53,8 +113,9 @@ def validate_matrix(
     """Validate one feature matrix, returning its stats or raising.
 
     Positional premise (audit 1): on-disk row ``i`` must be ``item_idx``
-    ``i``.  Only the row COUNT is verifiable here (asserted exactly); the
-    order is a documented invariant of the extraction step, logged below.
+    ``i``.  Only the row COUNT is verifiable from the matrix alone; the
+    order is proven separately by :func:`verify_item_order` against the
+    sidecar's ``item_order`` digest.
     """
     if matrix.ndim != 2:
         raise FeatureValidationError(f"{label}: expected a 2-D matrix, got shape {matrix.shape}.")
@@ -95,8 +156,7 @@ def validate_matrix(
         "norm_max": float(norms.max()),
     }
     logger.info(
-        "%s: OK (rows=%d, dim=%d, norm mean=%.4f std=%.4f min=%.4f max=%.4f) "
-        "[positional invariant: row i == item_idx i]",
+        "%s: OK (rows=%d, dim=%d, norm mean=%.4f std=%.4f min=%.4f max=%.4f)",
         label,
         stats["rows"],
         stats["dim"],
@@ -117,18 +177,25 @@ def validate_backbone_feature(
     processed_dir: str | Path,
     suffix: str = "",
 ) -> dict:
-    """Load and validate ``<dataset>/<backbone><suffix>.npy``."""
+    """Load and validate ``<dataset>/<backbone><suffix>.npy``.
+
+    The returned stats carry ``alignment`` (:data:`ALIGNMENT_VERIFIED` /
+    :data:`ALIGNMENT_UNVERIFIED`), see :func:`verify_item_order`.
+    """
     path = Path(embeddings_dir) / dataset / f"{backbone}{suffix}.npy"
     label = f"{dataset}/{backbone}{suffix}"
     if not path.exists():
         raise FeatureValidationError(f"{label}: feature file missing at {path}.")
+    item_ids = _item_order(processed_dir, dataset)
     matrix = np.load(path)
-    return validate_matrix(
+    stats = validate_matrix(
         matrix,
         label=label,
-        expected_rows=_n_items(processed_dir, dataset),
+        expected_rows=len(item_ids),
         expected_dim=_raw_dim(backbone, config),
     )
+    stats["alignment"] = verify_item_order(path, label=label, expected_ids=item_ids)
+    return stats
 
 
 def validate_fused_feature(
@@ -141,18 +208,23 @@ def validate_fused_feature(
 
     Fused dims depend on the strategy, so only the row count is checked
     against ``n_items``; NaN/Inf and zero-norm rows are still fatal.
+    Alignment is verified when the fusion wrote an ``item_order`` sidecar
+    block and reported unverified otherwise.
     """
     path = Path(path)
     label = f"{dataset}/{path.name}"
     if not path.exists():
         raise FeatureValidationError(f"{label}: fused feature missing at {path}.")
+    item_ids = _item_order(processed_dir, dataset)
     matrix = np.load(path)
-    return validate_matrix(
+    stats = validate_matrix(
         matrix,
         label=label,
-        expected_rows=_n_items(processed_dir, dataset),
+        expected_rows=len(item_ids),
         expected_dim=None,
     )
+    stats["alignment"] = verify_item_order(path, label=label, expected_ids=item_ids)
+    return stats
 
 
 def gate_backbone_features(
