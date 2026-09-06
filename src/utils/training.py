@@ -26,6 +26,7 @@ from src.utils.checkpoint import (
     validate_best_ref,
     validate_resume_envelope,
 )
+from src.utils.diagnostics import TrainingDiagnostics
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
 from src.utils.splits import assert_holdout_disjoint
@@ -592,6 +593,42 @@ def _restore_training_state(
     return state
 
 
+def _diagnostics_identity(
+    run_id: str,
+    dataset_name: str,
+    model_name: str,
+    embedding_name: str,
+    hyperparams: dict,
+    base_seed: int,
+    job_seed: int,
+    visual_embeddings,
+) -> dict:
+    """Identity block of the S04 diagnostics JSON (recipe attributes when present)."""
+    feature: dict = {}
+    if visual_embeddings is not None:
+        feature["shape"] = [int(s) for s in getattr(visual_embeddings, "shape", ())]
+        for attr in (
+            "normalize",
+            "recipe_version",
+            "sidecar_recipe_version",
+            "strategy",
+            "source_dims",
+            "aligned_dim",
+        ):
+            if hasattr(visual_embeddings, attr):
+                feature[attr] = getattr(visual_embeddings, attr)
+    return {
+        "run_id": run_id,
+        "dataset": dataset_name,
+        "model": model_name,
+        "embedding": embedding_name,
+        "hyperparams": dict(hyperparams),
+        "base_seed": int(base_seed),
+        "job_seed": int(job_seed),
+        "feature": feature,
+    }
+
+
 def train_single_run(
     model_cls,
     model_name: str,
@@ -772,6 +809,31 @@ def train_single_run(
     # index restored from the envelope fully determines the next draw.
     sampler = BPRBatchSampler(train_interactions, n_items, batch_size, seed=job_seed)
 
+    # SDD S04: opt-in bounded probe diagnostics (``diagnostics.enabled``),
+    # ``None`` by default.  Every measurement runs under a forked RNG on
+    # detached copies, so the trajectory is identical with it on or off.
+    diagnostics = TrainingDiagnostics.for_run(
+        model,
+        config=config,
+        train_interactions=train_interactions,
+        n_users=n_users,
+        n_items=n_items,
+        identity=_diagnostics_identity(
+            run_id,
+            dataset_name,
+            model_name,
+            embedding_name,
+            hyperparams,
+            base_seed,
+            job_seed,
+            visual_embeddings,
+        ),
+        device=device,
+    )
+    global_step = state.start_epoch * sampler.n_batches()
+    if diagnostics is not None and state.start_epoch == 0:
+        diagnostics.record_init()
+
     # NB: the Evaluator's second positional arg is its generic held-out
     # slot; here it carries the VALIDATION interactions (selection), not
     # the test set — hence the neutral parameter name above.
@@ -818,6 +880,15 @@ def train_single_run(
                 # eval-mode probe and ``record`` is a counter, so running
                 # it after the optimiser step is equivalent to before.
                 _account_flops(model, users, pos_items, neg_items)
+                global_step += 1
+                if diagnostics is not None and diagnostics.wants_step(global_step):
+                    diagnostics.record_step(
+                        step=global_step,
+                        epoch=epoch,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        steps_attempted=global_step,
+                    )
 
                 total_loss += loss
                 n_batches += 1
@@ -862,6 +933,16 @@ def train_single_run(
                 else:
                     # Ties keep the earlier winner and advance patience.
                     state.epochs_without_improvement += eval_every_epochs
+
+                if diagnostics is not None:
+                    diagnostics.record_validation(
+                        epoch=epoch,
+                        step=global_step,
+                        metrics=metrics,
+                        es_metric=es_metric,
+                        checkpoint_exists=trial_best_path.exists(),
+                        has_valid_observation=state.has_valid_observation,
+                    )
 
                 if optuna_trial is not None:
                     optuna_trial.report(current_metric, step=epoch)
@@ -921,6 +1002,8 @@ def train_single_run(
         )
         return state.best_metric
     finally:
+        if diagnostics is not None:
+            diagnostics.write()
         # Trial-local best weights are dead after the trial ends on ANY
         # path: promoted already (normal exit) or intentionally dropped
         # (prune / exception).

@@ -125,6 +125,24 @@ telemetry:
   # results/runs/<run_id>/telemetry_samples.jsonl for plotting.
   save_samples: true
 
+# Opt-in bounded training diagnostics (SDD S04; src/utils/diagnostics.py).
+# Off by default and inert when off.  When enabled, every training run
+# records — at initialisation, at the listed optimizer steps and at each
+# validation — a detached summary on a fixed seeded probe (feature norm
+# quantiles, pre-ReLU branch statistics for models that expose them,
+# score spread / ties, loss components, gradient and parameter-delta
+# norms, optimizer steps applied, zero-metric flag, checkpoint existence)
+# to ``<output_dir>/<run_id>.json``.  Measurements run under a forked RNG
+# on detached copies: the training trajectory is the same on or off.
+diagnostics:
+  enabled: false
+  probe_users: 64
+  probe_items: 256
+  probe_pairs: 64
+  probe_seed: 0
+  steps: [1, 10, 100, 1000]
+  output_dir: "results/diagnostics"
+
 # =============================================================================
 # DataLoader sizing (optional)
 # =============================================================================
