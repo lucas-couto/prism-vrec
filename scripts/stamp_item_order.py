@@ -42,9 +42,13 @@ def _stamp_dataset(embeddings_dir: Path, processed_dir: Path) -> list[str]:
         npy_path = embeddings_dir / f"{stem}.npy"
         ids_path = embeddings_dir / f"{stem}_ids.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if "item_order" in meta:
+        if isinstance(meta.get("item_order"), dict):
             lines.append(f"{dataset}/{stem}: already stamped")
             continue
+        # A first version of this script (2026-09-06) merged the block's
+        # keys into the top level instead of nesting them; drop them.
+        for key in ("schema_version", "n_items", "digest"):
+            meta.pop(key, None)
         if not npy_path.exists() or not ids_path.exists():
             lines.append(f"{dataset}/{stem}: SKIPPED (missing .npy or _ids.json)")
             continue
@@ -56,7 +60,7 @@ def _stamp_dataset(embeddings_dir: Path, processed_dir: Path) -> list[str]:
                 f"expected={len(expected)}, order_equal={recorded == expected}) — left unstamped"
             )
             continue
-        meta.update(item_order_metadata(expected))
+        meta["item_order"] = item_order_metadata(expected)
         _write_json(meta_path, meta)
         lines.append(f"{dataset}/{stem}: stamped ({n_rows} rows)")
     return lines
