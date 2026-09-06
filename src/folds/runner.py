@@ -133,12 +133,12 @@ def _embedding_path(embeddings_dir: str, dataset: str, visual_config: str) -> st
     return resolve(embeddings_dir, dataset, visual_config)
 
 
-def _load_visual(emb_path: str | None):
+def _load_visual(emb_path: str | None, *, lazy: bool = False):
     if emb_path is None:
         return None
     from src.fusions import load_embedding
 
-    return load_embedding(emb_path)
+    return load_embedding(emb_path, lazy=lazy)
 
 
 def _ctor_kwargs(model_cls: type, split: FoldSplit, dataset: str, processed_dir: str) -> dict:
@@ -299,8 +299,10 @@ def run_cell_folds(
         embedding_name=cell.visual_config,
         results_root=results_dir,
     )
+    from src.steps.train import lazy_features_for
+
     emb_path = _embedding_path(config["paths"]["embeddings"], cell.dataset, cell.visual_config)
-    visual = _load_visual(emb_path)
+    visual = _load_visual(emb_path, lazy=lazy_features_for(config, emb_path))
     artifact_root = Path(results_dir)  # artifact_paths appends per_user/<dataset>
     metadata = CellMetadata(
         dataset=cell.dataset,

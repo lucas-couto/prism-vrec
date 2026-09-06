@@ -294,6 +294,12 @@ def _binding_matches(entry: dict | None, checkpoint_digest: str, identity_digest
     )
 
 
+def _lazy_features(config: dict, embeddings_dir: str, dataset_name: str, stem: str) -> bool:
+    from src.steps.train import lazy_features_for
+
+    return lazy_features_for(config, _embedding_artifact(embeddings_dir, dataset_name, stem))
+
+
 def _checkpoint_digest(path: str) -> str:
     """Digest of the selected checkpoint's bytes; ``""`` when the file is absent.
 
@@ -400,6 +406,7 @@ def _evaluate_cell(
     seed: int = 42,
     *,
     identity: dict | None = None,
+    lazy_features: bool = False,
 ) -> pd.DataFrame | None:
     """Load a cell's best checkpoint and return its per-user metrics.
 
@@ -407,7 +414,10 @@ def _evaluate_cell(
     embedding cannot be resolved — same semantics as the previous inline
     logic.  ``identity`` (see :func:`evaluation_identity`) is recorded in
     the per-user artifact's ``config_hash`` so the artifact says which
-    data, protocol and checkpoint bytes produced it.
+    data, protocol and checkpoint bytes produced it.  ``lazy_features``
+    reads the artifact through bounded row access (M05 opt-in via
+    ``resources.feature_residency``); the default keeps the resident
+    matrix.
     """
     try:
         spec = get_recommender_spec(model_info["model_name"])
@@ -432,7 +442,7 @@ def _evaluate_cell(
             return None
         from src.fusions import load_embedding
 
-        visual_emb = load_embedding(emb_path)
+        visual_emb = load_embedding(emb_path, lazy=lazy_features)
 
     # I02: a cell is evaluable only from a loadable, complete winner.  An
     # absent / truncated / legacy flat checkpoint raises
@@ -619,6 +629,7 @@ def run(condition: str = "frozen") -> None:
                     per_user_out_dir=str(results_root),
                     seed=int(config.get("seed", 42)),
                     identity=identity,
+                    lazy_features=_lazy_features(config, embeddings_dir, dataset_name, en),
                 )
             if per_user is None:
                 continue

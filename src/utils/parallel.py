@@ -29,7 +29,7 @@ import torch.multiprocessing as mp
 
 from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
-from src.utils.memory import available_cpus, plan_pool_workers
+from src.utils.memory import AdmissionPlan, available_cpus, plan_pool_workers
 
 logger = get_logger(__name__)
 
@@ -167,6 +167,9 @@ class TrainingJob:
     retry_count: int = 0
     submit_index: int = _NO_ASSIGNMENT
     data_identity: dict | None = None
+    #: Read the feature artifact through bounded row access (M01/M02)
+    #: instead of a resident matrix; decided by the admission planner.
+    lazy_features: bool = False
 
     @property
     def job_id(self) -> str:
@@ -531,15 +534,17 @@ class _WorkerContext:
             lambda: self._read_data(processed_dir, dataset_name),
         )
 
-    def _load_embeddings(self, path: str | None):
+    def _load_embeddings(self, path: str | None, *, lazy: bool = False):
         # ``load_embedding`` transparently handles online-fusion
         # sidecars: a ``.json`` path expands to a stacked
         # ``(n_items, M, D)`` array, while ``.npy`` paths load directly.
+        # ``lazy`` (admission-decided, M05) returns a bounded source.
         if path is None:
             return None
         from src.fusions import load_embedding
 
-        return self._emb_cache.get_or_load(path, lambda p=path: load_embedding(p))
+        key = f"{path}#lazy" if lazy else path
+        return self._emb_cache.get_or_load(key, lambda p=path: load_embedding(p, lazy=lazy))
 
     def _ranking_budget(self, job: TrainingJob) -> int | None:
         # Each OOM retry halves the ranking budget, which halves the
@@ -571,7 +576,7 @@ class _WorkerContext:
             job.processed_dir,
             job.dataset_name,
         )
-        visual_emb = self._load_embeddings(job.embeddings_path)
+        visual_emb = self._load_embeddings(job.embeddings_path, lazy=job.lazy_features)
         # The parent resolved the data identity once per cell; the worker
         # binds its checkpoints and grid progress to the same digests.
         identity_context = build_identity_context(
@@ -760,6 +765,7 @@ class TrainingOrchestrator:
         *,
         job_runner: JobRunner | None = None,
         config: dict | None = None,
+        admission: AdmissionPlan | None = None,
     ) -> None:
         """Size the pool.
 
@@ -767,7 +773,10 @@ class TrainingOrchestrator:
         worker holds (interaction dicts + visual embeddings + the CUDA
         context).  It only applies to the auto-detected count: an
         explicit *n_workers* is honoured verbatim, because pinning the
-        pool is how a researcher overrides the heuristic.
+        pool is how a researcher overrides the heuristic -- except that
+        an *admission* plan (M05/M06) is enforced: a pinned count above
+        the admitted one is clamped with a warning, and a plan that
+        admits nothing refuses to build a pool.
 
         *job_runner* replaces the per-job training call inside every
         worker (fault-injection tests).  It must be picklable for the
@@ -781,6 +790,9 @@ class TrainingOrchestrator:
         self.n_workers = (
             detect_max_workers(device, per_worker_bytes) if n_workers <= 0 else n_workers
         )
+        self.admission = admission
+        if admission is not None:
+            self.n_workers = _enforce_admission(self.n_workers, admission)
         self._job_runner = job_runner
         self._config = config
         logger.info("Training orchestrator: %d workers", self.n_workers)
@@ -942,6 +954,25 @@ class TrainingOrchestrator:
             eta_h,
         )
         return now
+
+
+def _enforce_admission(n_workers: int, admission: AdmissionPlan) -> int:
+    """Clamp a pool size to what the resolved host budget admits (M06)."""
+    if not admission.admitted or admission.n_workers < 1:
+        from src.utils.memory import AdmissionError
+
+        raise AdmissionError(f"no worker admitted against the host budget: {admission.reason}")
+    if n_workers > admission.n_workers:
+        logger.warning(
+            "Training orchestrator: %d workers requested but the host budget admits %d "
+            "(%s); using %d.",
+            n_workers,
+            admission.n_workers,
+            admission.reason,
+            admission.n_workers,
+        )
+        return admission.n_workers
+    return n_workers
 
 
 def _drain_nowait(result_queue, registry: _JobRegistry) -> None:

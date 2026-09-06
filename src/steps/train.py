@@ -65,6 +65,16 @@ from src.utils.identity import (
     resolve_data_identity,
 )
 from src.utils.logging import get_logger
+from src.utils.memory import (
+    AdmissionPlan,
+    admit_workers,
+    available_cpus,
+    choose_lazy_features,
+    estimate_model_state_bytes,
+    npy_payload_bytes,
+    resolve_host_budget,
+    resolve_resources,
+)
 from src.utils.parallel import TrainingJob, TrainingOrchestrator, checkpoint_root
 from src.utils.seed import set_seed
 
@@ -789,18 +799,26 @@ def _run_grid(
 
     logger.info("Total pending jobs: %d", len(jobs))
 
+    # M05: admit jobs against the resolved host budget BEFORE launching
+    # anything.  A job whose declared minimum exceeds the budget is
+    # refused once (a failed outcome), never launched repeatedly.
     n_workers = 1 if sequential else workers
-    # The resolved configuration travels with the pool: a spawned worker
-    # must never rebuild it from the YAML defaults (F05).
-    orchestrator = TrainingOrchestrator(
-        n_workers=n_workers,
-        device=device,
-        log_dir="logs",
-        per_worker_bytes=_estimate_worker_bytes(jobs, processed_dir),
-        config=config,
+    admitted, refused, plan = plan_training_admission(
+        jobs, processed_dir, config, requested_workers=n_workers
     )
-
-    results = orchestrator.run(jobs)
+    results = [_refused_result(job, reason) for job, reason in refused]
+    if admitted:
+        # The resolved configuration travels with the pool: a spawned
+        # worker must never rebuild it from the YAML defaults (F05).
+        orchestrator = TrainingOrchestrator(
+            n_workers=plan.n_workers if not sequential else 1,
+            device=device,
+            log_dir="logs",
+            per_worker_bytes=plan.per_worker_bytes,
+            config=config,
+            admission=plan,
+        )
+        results.extend(orchestrator.run(admitted))
 
     ok = sum(1 for r in results if r.get("status") == "ok")
     logger.info("Training complete: %d/%d experiments succeeded.", ok, len(jobs))
@@ -818,43 +836,201 @@ _WORKER_BASE_BYTES = 1536 * 1024**2
 #: multiplier converts the on-disk CSV size into a resident estimate.
 _INTERACTIONS_MEMORY_FACTOR = 40
 
+#: Rows a lazy source stages per gather (``BaseRecommender._LAZY_ITEM_BLOCK``)
+#: and the number of such blocks charged to a lazy job (source rows on the
+#: host plus their cast/transfer copy).
+_LAZY_BLOCK_ROWS = 8192
+_LAZY_BLOCKS_CHARGED = 2
+
+
+@dataclass(frozen=True)
+class JobMemoryEstimate:
+    """Ledger of one training job's host footprint (M05, SPEC "Memory ledger")."""
+
+    feature_bytes: int
+    model_bytes: int
+    interactions_bytes: int
+    ranking_bytes: int
+    base_bytes: int = _WORKER_BASE_BYTES
+
+    @property
+    def total(self) -> int:
+        return (
+            self.base_bytes
+            + self.feature_bytes
+            + self.model_bytes
+            + self.interactions_bytes
+            + self.ranking_bytes
+        )
+
+
+def _file_size(path: str | Path) -> int:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def feature_payload_bytes(path: str | Path | None) -> tuple[int, int]:
+    """``(raw payload bytes, visual width)`` of a feature artifact.
+
+    A ``.npy`` is measured from its header; an online-fusion sidecar sums
+    the payloads of its components (its own JSON size says nothing about
+    what a worker loads).  Unreadable inputs count as ``(0, 0)``.
+    """
+    if path is None:
+        return 0, 0
+    file = Path(path)
+    try:
+        if file.suffix == ".json":
+            sidecar = json.loads(file.read_text(encoding="utf-8"))
+            parts = [npy_payload_bytes(file.parent / c) for c in sidecar.get("components", [])]
+            return sum(b for b, _ in parts), sum(w for _, w in parts)
+        return npy_payload_bytes(file)
+    except (OSError, ValueError, KeyError):
+        return 0, 0
+
+
+def _resident_feature_bytes(payload: int, width: int, *, lazy: bool) -> int:
+    if not lazy:
+        return payload
+    return min(payload, _LAZY_BLOCK_ROWS * width * 4 * _LAZY_BLOCKS_CHARGED)
+
+
+def estimate_job_bytes(
+    job: TrainingJob, processed_dir: str, config: dict, *, lazy: bool
+) -> JobMemoryEstimate:
+    """Host bytes one worker needs for *job*: payload, model/optimizer, data, ranking."""
+    from src.evaluation.protocol import host_ranking_bytes
+
+    payload, width = feature_payload_bytes(job.embeddings_path)
+    hp = job.hyperparams
+    total_dim = (
+        hp.get("total_dim") or hp.get("latent_dim") or config.get("common", {}).get("total_dim")
+    )
+    inter = _file_size(Path(processed_dir) / job.dataset_name / "train.csv") + _file_size(
+        Path(processed_dir) / job.dataset_name / "val.csv"
+    )
+    return JobMemoryEstimate(
+        feature_bytes=_resident_feature_bytes(payload, width, lazy=lazy),
+        model_bytes=estimate_model_state_bytes(
+            job.n_users, job.n_items, total_dim, visual_dim=width
+        ),
+        interactions_bytes=inter * _INTERACTIONS_MEMORY_FACTOR,
+        ranking_bytes=host_ranking_bytes(job.n_items),
+    )
+
+
+def plan_training_admission(
+    jobs: list[TrainingJob],
+    processed_dir: str,
+    config: dict,
+    *,
+    requested_workers: int,
+) -> tuple[list[TrainingJob], list[tuple[TrainingJob, str]], AdmissionPlan]:
+    """Split *jobs* into admitted / refused and size the pool (M05, Q10).
+
+    Each job is charged its feature payload (source bytes, not sidecar
+    size), model + optimizer state, interaction dicts and the host
+    ranking workspace, on top of the worker base.  Under
+    ``resources.feature_residency: auto`` a job whose dense payload does
+    not fit is switched to lazy reads before the verdict.  Jobs whose
+    declared minimum still exceeds ``budget - headroom`` are refused; the
+    pool is sized so the aggregate commitment of the admitted jobs'
+    heaviest estimate fits, capped by the requested/auto worker count,
+    the CPU quota and ``resources.max_workers``.
+    """
+    resources = resolve_resources(config)
+    budget = resolve_host_budget(config)
+    usable = max(0, budget.limit_bytes - resources.headroom_bytes)
+    admitted: list[TrainingJob] = []
+    refused: list[tuple[TrainingJob, str]] = []
+    heaviest = 0
+    for job in jobs:
+        payload, _ = feature_payload_bytes(job.embeddings_path)
+        job.lazy_features = choose_lazy_features(resources.feature_residency, payload, usable)
+        estimate = estimate_job_bytes(job, processed_dir, config, lazy=job.lazy_features)
+        if estimate.total > usable:
+            refused.append((job, _refusal_reason(estimate, usable, budget.source)))
+            continue
+        heaviest = max(heaviest, estimate.total)
+        admitted.append(job)
+    hard_cap = requested_workers if requested_workers > 0 else max(1, available_cpus() - 1)
+    plan = admit_workers(
+        heaviest,
+        hard_cap=hard_cap,
+        budget=budget,
+        headroom_bytes=resources.headroom_bytes,
+        max_workers=resources.max_workers,
+        label="training pool",
+    )
+    logger.info(
+        "Admission: %d job(s) admitted, %d refused; budget %.2f GB (%s), headroom %.2f GB, "
+        "heaviest job %.2f GB, workers %d, feature residency %s.",
+        len(admitted),
+        len(refused),
+        budget.limit_bytes / 1024**3,
+        budget.source,
+        resources.headroom_bytes / 1024**3,
+        heaviest / 1024**3,
+        plan.n_workers,
+        resources.feature_residency,
+    )
+    for job, reason in refused:
+        logger.error("  refused %s: %s", job.job_id, reason)
+    return admitted, refused, plan
+
+
+def _refusal_reason(estimate: JobMemoryEstimate, usable: int, source: str) -> str:
+    gb = 1024**3
+    return (
+        f"declared minimum {estimate.total / gb:.2f} GB (features {estimate.feature_bytes / gb:.2f}, "
+        f"model+optimizer {estimate.model_bytes / gb:.2f}, interactions "
+        f"{estimate.interactions_bytes / gb:.2f}, ranking {estimate.ranking_bytes / gb:.2f}, base "
+        f"{estimate.base_bytes / gb:.2f}) exceeds the usable host budget {usable / gb:.2f} GB "
+        f"({source}); not launched"
+    )
+
+
+def _refused_result(job: TrainingJob, reason: str) -> dict:
+    return {
+        "job_id": job.job_id,
+        "outcome": "failed",
+        "attempts": 0,
+        "status": "error",
+        "error": reason,
+        "error_type": "AdmissionRefused",
+    }
+
 
 def _estimate_worker_bytes(jobs: list[TrainingJob], processed_dir: str) -> int:
-    """Estimate the host RAM one training worker holds.
+    """Estimate the host RAM one training worker holds (heaviest job).
 
-    Workers are spawned, not forked, so nothing is shared: each one
-    caches the full visual embedding matrix plus the train/val
-    interaction dicts for the datasets it touches.  The estimate takes
-    the worst case across *jobs* (largest embedding file, largest
-    interaction file) so the pool is sized for the heaviest cell rather
-    than the average one.
-
-    Returns ``0`` when nothing can be measured, which
-    :func:`src.utils.parallel.detect_max_workers` reads as "unknown"
-    and leaves the VRAM heuristic untouched.
+    Kept for callers of the historical helper; the admission planner
+    above is what sizes the pool.  Returns ``0`` when nothing can be
+    measured (``detect_max_workers`` reads that as "unknown").
     """
+    estimates = [estimate_job_bytes(job, processed_dir, {}, lazy=job.lazy_features) for job in jobs]
+    measured = [e.total for e in estimates if e.feature_bytes or e.interactions_bytes]
+    return max(measured, default=0)
 
-    def _size(path: str | Path) -> int:
-        try:
-            return Path(path).stat().st_size
-        except OSError:
-            return 0
 
-    emb_bytes = max(
-        (_size(job.embeddings_path) for job in jobs if job.embeddings_path),
-        default=0,
-    )
-    inter_bytes = max(
-        (
-            _size(Path(processed_dir) / job.dataset_name / "train.csv")
-            + _size(Path(processed_dir) / job.dataset_name / "val.csv")
-            for job in jobs
-        ),
-        default=0,
-    )
-    if emb_bytes == 0 and inter_bytes == 0:
-        return 0
-    return _WORKER_BASE_BYTES + emb_bytes + inter_bytes * _INTERACTIONS_MEMORY_FACTOR
+def lazy_features_for(config: dict, embeddings_path: str | Path | None) -> bool:
+    """Whether a single (non-pooled) training/evaluation call should read lazily.
+
+    ``resources.feature_residency``: ``dense`` (default) keeps today's
+    resident matrices, ``lazy`` always reads bounded rows, ``auto``
+    switches when the dense payload would not fit the usable budget.
+    """
+    if embeddings_path is None:
+        return False
+    resources = resolve_resources(config)
+    if resources.feature_residency == "dense":
+        return False
+    budget = resolve_host_budget(config)
+    payload, _ = feature_payload_bytes(embeddings_path)
+    usable = max(0, budget.limit_bytes - resources.headroom_bytes)
+    return choose_lazy_features(resources.feature_residency, payload, usable)
 
 
 def _legit_trial_count(study) -> int:
@@ -1289,7 +1465,9 @@ def _train_one_optuna_trial(
 
     visual_embeddings = None
     if embeddings_path is not None:
-        visual_embeddings = load_embedding(embeddings_path)
+        visual_embeddings = load_embedding(
+            embeddings_path, lazy=lazy_features_for(config, embeddings_path)
+        )
 
     model_cls = get_recommender_class(cell.model_name)
     checkpoint_mgr = CheckpointManager(checkpoint_root(config))
