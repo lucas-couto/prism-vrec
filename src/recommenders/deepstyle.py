@@ -104,7 +104,7 @@ class DeepStyle(LinearVisualScoreMixin, BaseRecommender):
                 "Drop style_dim from the config or set it equal to latent_dim."
             )
 
-        if self.visual_features is None:
+        if not self.has_visual_features:
             raise RuntimeError("DeepStyle requires visual embeddings")
         dv: int = self.visual_dim_raw
 
@@ -170,9 +170,7 @@ class DeepStyle(LinearVisualScoreMixin, BaseRecommender):
         because the gate's output changes every optimisation step.
         """
 
-        def _style(ids: torch.Tensor) -> torch.Tensor:
-            return self.visual_projection(self._resolve_visual(ids)) - self.category_embedding(
-                self.item_category_idx[ids]
-            )
+        def _style(f: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            return self.visual_projection(f) - self.category_embedding(self.item_category_idx[ids])
 
-        return self._full_catalog_cache(item_ids, _style)
+        return self._full_catalog_cache(item_ids, lambda ids: self._map_visual(ids, _style))

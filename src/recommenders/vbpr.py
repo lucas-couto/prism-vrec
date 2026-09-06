@@ -86,7 +86,7 @@ class VBPR(LinearVisualScoreMixin, BaseRecommender):
         k: int = config["latent_dim"]
         kv: int = config["visual_dim"]
 
-        if self.visual_features is None:
+        if not self.has_visual_features:
             raise RuntimeError("VBPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
@@ -124,7 +124,8 @@ class VBPR(LinearVisualScoreMixin, BaseRecommender):
         every optimisation step.
         """
         return self._full_catalog_cache(
-            item_ids, lambda ids: self.visual_projection(self._resolve_visual(ids))
+            item_ids,
+            lambda ids: self._map_visual(ids, lambda f, _ids: self.visual_projection(f)),
         )
 
     def _item_visual_bias(self, item_ids: torch.Tensor) -> torch.Tensor:
@@ -137,7 +138,7 @@ class VBPR(LinearVisualScoreMixin, BaseRecommender):
         eligible = self._full_catalog_lookup(item_ids)
         if eligible and self._item_visual_bias_cache is not None:
             return self._item_visual_bias_cache
-        result = self._resolve_visual(item_ids) @ self.visual_bias
+        result = self._map_visual(item_ids, lambda f, _ids: f @ self.visual_bias)
         if eligible:
             self._item_visual_bias_cache = result
         return result

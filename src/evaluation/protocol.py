@@ -29,6 +29,7 @@ from tqdm import tqdm
 from src.evaluation.metrics import compute_all_metrics
 from src.utils import telemetry
 from src.utils.logging import get_logger
+from src.utils.memory import available_host_bytes
 
 logger = get_logger(__name__)
 
@@ -59,6 +60,32 @@ def _assert_finite_scores(finite_mask: np.ndarray | torch.Tensor, where: str) ->
         "train-item mask itself. Check the model for fp16/AMP "
         "overflow or uninitialised parameters."
     )
+
+
+class HostMemoryBudgetError(RuntimeError):
+    """The per-user CPU ranking cannot be admitted within the host budget.
+
+    SDD M04 design choice (recorded): the item-block path keeps the
+    reference full-vector ranking — one fp32 score per catalogue item,
+    the negated copy ``lexsort`` sorts, its int64 permutation and
+    workspace, the tie mask — and checks that this host allocation fits
+    before scoring, instead of introducing a streaming top-K.  When it
+    cannot fit there is no smaller exact alternative: the run fails here,
+    with the phase, shape and budget, and never writes a success marker.
+    """
+
+
+#: Host bytes the CPU full-vector ranking of ONE user holds per
+#: catalogue item at its peak: fp32 scores (4) + the negated copy
+#: ``np.lexsort`` receives (4) + the int64 permutation it returns (8) +
+#: its int64 working buffer (8) + the int64 tie-break key (8, resident)
+#: + boolean masks (2).  Rounded up to 40.
+HOST_RANKING_BYTES_PER_ITEM = 40
+
+
+def host_ranking_bytes(n_items: int) -> int:
+    """Peak host bytes of the reference CPU ranking for one user."""
+    return max(0, int(n_items)) * HOST_RANKING_BYTES_PER_ITEM
 
 
 #: Number of top items persisted per user for downstream inspection
@@ -195,6 +222,12 @@ class Evaluator:
         the device's total memory; a process capped by
         ``torch.cuda.set_per_process_memory_fraction`` must pass its own
         allowance, because that cap is invisible to the device query.
+    host_budget_bytes:
+        Keyword-only.  Host bytes the per-user CPU ranking (score vector
+        and sort buffers, see :func:`host_ranking_bytes`) may allocate.
+        ``None`` probes the container/host when the item-block path is
+        entered; an explicit value is enforced and raises
+        :class:`HostMemoryBudgetError` when one user's ranking cannot fit.
     """
 
     def __init__(
@@ -210,6 +243,8 @@ class Evaluator:
         negative_sampling_seed: int = 42,
         tiebreak_seed: int = 42,
         ranking_budget_bytes: int | None = None,
+        *,
+        host_budget_bytes: int | None = None,
     ) -> None:
         if protocol not in ("full_ranking", "sampled"):
             raise ValueError(f"protocol must be 'full_ranking' or 'sampled'; got {protocol!r}")
@@ -229,6 +264,11 @@ class Evaluator:
         #: ``set_per_process_memory_fraction`` passes its real allowance,
         #: which the device cannot report.
         self.ranking_budget_bytes = ranking_budget_bytes
+        #: Host bytes the per-user CPU ranking may allocate (SDD M04).
+        #: ``None`` probes the container/host at check time; a probe
+        #: that cannot answer skips the check with a warning (there is
+        #: no smaller exact alternative).  An explicit value is enforced.
+        self.host_budget_bytes = host_budget_bytes
 
         #: True when every test user holds out exactly ONE item.  The
         #: per-user sufficient-statistic records (``_rank``,
@@ -258,11 +298,13 @@ class Evaluator:
         self._tiebreak_key_gpu: torch.Tensor | None = None
         self._tiebreak_key_device: torch.device | None = None
 
-        # Lazy GPU cache: per-user training-item indices as a LongTensor on
-        # the same device used during evaluation.  Built once on first
-        # access and reused across epochs to avoid rebuilding tensors.
-        self._train_idx_gpu: dict[int, torch.Tensor | None] = {}
-        self._train_idx_device: torch.device | None = None
+        # Per-user training-item indices, HOST resident (SDD M04): the
+        # batched path transfers only the rows of the users in the current
+        # chunk, inside the OOM-guarded call, instead of holding every test
+        # user's index tensor on the device before the first prediction.
+        self._train_idx_host: dict[int, np.ndarray] = {}
+        self._catalogue_ids_gpu: torch.Tensor | None = None
+        self._catalogue_ids_device: torch.device | None = None
 
         all_test_users = sorted(test_interactions.keys())
 
@@ -357,7 +399,10 @@ class Evaluator:
         statistic is never recomputed in a second scoring pass.
         """
         device_obj = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
-        all_items = torch.arange(self.n_items, device=device_obj)
+        # Catalogue ids stay on the host; the ranking paths transfer either
+        # one bounded item block or, inside the guarded batched call, the
+        # full id vector once (SDD M04).
+        all_items = torch.arange(self.n_items)
         per_user_results: list[dict] = []
 
         model.eval()
@@ -367,9 +412,11 @@ class Evaluator:
             if self.protocol == "sampled":
                 per_user_results = self._evaluate_sampled(model, device_obj)
             elif has_batch:
-                per_user_results = self._evaluate_batched(model, all_items, batch_size)
+                per_user_results = self._evaluate_batched(
+                    model, all_items, batch_size, device=device_obj
+                )
             else:
-                per_user_results = self._evaluate_single(model, all_items)
+                per_user_results = self._evaluate_single(model, all_items, device=device_obj)
 
         return pd.DataFrame(per_user_results)
 
@@ -478,6 +525,8 @@ class Evaluator:
         all_items: torch.Tensor,
         users: list[int] | None = None,
         progress: bool = True,
+        *,
+        device: torch.device | None = None,
     ) -> list[dict]:
         """Fallback: score one user at a time.
 
@@ -487,11 +536,15 @@ class Evaluator:
             for those users only instead of failing.
         :param progress: Whether to draw a progress bar -- off when the
             batched path calls in, which already has one.
+        :param device: Device the model predicts on; defaults to
+            ``all_items.device`` so callers holding device ids still work.
         """
         results: list[dict] = []
         targets = self.test_users if users is None else users
+        if targets:
+            self._admit_host_ranking()
         for user_id in tqdm(targets, desc="Evaluating", disable=not progress):
-            user_scores = self._score_user_in_blocks(model, user_id, all_items)
+            user_scores = self._score_user_in_blocks(model, user_id, all_items, device=device)
             results.append(self._rank_and_score(user_id, user_scores))
             telemetry.add_items(1)
         return results
@@ -505,14 +558,23 @@ class Evaluator:
         return np.asarray(scores).copy()
 
     def _score_user_in_blocks(
-        self, model: Any, user_id: int, all_items: torch.Tensor
+        self,
+        model: Any,
+        user_id: int,
+        all_items: torch.Tensor,
+        *,
+        device: torch.device | None = None,
     ) -> np.ndarray:
         """Score EVERY item, shrinking device blocks on OOM; never sample.
 
-        Host scores and the subsequent CPU sort remain O(n_items). This
-        bounds scoring intermediates, not resident model/features or RAM.
+        Only the current block's ids are moved to *device* (inside the
+        guarded call), so the id transfer is bounded by the block too.
+        Host scores and the subsequent CPU sort remain O(n_items): that
+        allocation is admitted by :meth:`_admit_host_ranking`.  This
+        bounds scoring intermediates, not resident model/features.
         A failure at one item propagates: even that allocation must fit.
         """
+        target = all_items.device if device is None else device
         block_size = min(1024, len(all_items))
         scores = None
         start = 0
@@ -520,14 +582,14 @@ class Evaluator:
             stop = min(start + block_size, len(all_items))
             block = None
             try:
-                block = self._predict_item_block(model, user_id, all_items[start:stop])
+                block = self._predict_item_block(model, user_id, all_items[start:stop].to(target))
             except torch.cuda.OutOfMemoryError:
                 if stop - start == 1:
                     raise
             # Leave the except scope BEFORE retrying: its traceback owns
             # the failed prediction's tensors until the handler exits.
             if block is None:
-                _release_cuda_cache(all_items.device)
+                _release_cuda_cache(target)
                 block_size = max(1, (stop - start) // 2)
                 logger.warning(
                     "Ranking OOM for user %d; retrying item offset %d with block %d",
@@ -542,11 +604,38 @@ class Evaluator:
             start = stop
         return scores if scores is not None else np.empty(0, dtype=np.float32)
 
+    def _admit_host_ranking(self) -> None:
+        """Check one user's CPU full-vector ranking against the host budget.
+
+        See :class:`HostMemoryBudgetError` for the recorded design choice.
+        """
+        needed = host_ranking_bytes(self.n_items)
+        budget = self.host_budget_bytes
+        if budget is None:
+            budget = available_host_bytes()
+        if budget is None:
+            logger.warning(
+                "Host memory budget unknown; the per-user ranking needs %.1f MB "
+                "for %d items and proceeds unchecked",
+                needed / 1024**2,
+                self.n_items,
+            )
+            return
+        if needed > budget:
+            raise HostMemoryBudgetError(
+                f"per-user CPU ranking (phase: item-block scoring) needs {needed} B "
+                f"for n_items={self.n_items} ({HOST_RANKING_BYTES_PER_ITEM} B/item) "
+                f"but the host budget is {budget} B; the run cannot rank a single "
+                "user exactly within this budget."
+            )
+
     def _evaluate_batched(
         self,
         model: Any,
         all_items: torch.Tensor,
         batch_size: int,
+        *,
+        device: torch.device | None = None,
     ) -> list[dict]:
         """Score users in batches using model.predict_batch().
 
@@ -572,9 +661,13 @@ class Evaluator:
         All candidates, masks and tie-break keys are preserved. Resident
         model/features must still fit, as must one item's prediction;
         host memory must hold one score vector and its sorting buffers.
+
+        Nothing catalogue-sized is allocated on the device before the
+        guard: the full id vector and the chunk's train-mask indices are
+        transferred inside :meth:`_rank_user_chunk` (SDD M04).
         """
-        device = all_items.device
-        self._ensure_train_idx_cache(device)
+        device = all_items.device if device is None else device
+        self._ensure_train_idx_host()
 
         results: list[dict] = []
         n_users = len(self.test_users)
@@ -592,7 +685,7 @@ class Evaluator:
                 chunk = self.test_users[start : start + batch_size]
                 ranked = None
                 try:
-                    ranked = self._rank_user_chunk(model, all_items, chunk)
+                    ranked = self._rank_user_chunk(model, all_items, chunk, device=device)
                 except torch.cuda.OutOfMemoryError:
                     logger.debug("Ranking allocation failed; leaving handler before recovery")
                 if ranked is None:
@@ -610,7 +703,9 @@ class Evaluator:
                         "catalogue in item blocks and ranking on CPU",
                         chunk[0],
                     )
-                    ranked = self._evaluate_single(model, all_items, users=chunk, progress=False)
+                    ranked = self._evaluate_single(
+                        model, all_items, users=chunk, progress=False, device=device
+                    )
                 results.extend(ranked)
                 start += len(chunk)
                 progress.update(len(chunk))
@@ -621,6 +716,8 @@ class Evaluator:
         model: Any,
         all_items: torch.Tensor,
         batch_user_ids: list[int],
+        *,
+        device: torch.device | None = None,
     ) -> list[dict]:
         """Rank one batch of users against the full catalogue.
 
@@ -628,13 +725,15 @@ class Evaluator:
         around a whole batch and the batch retried smaller: every
         ``(B, N)`` buffer this allocates dies with the failed call.
         """
-        device = all_items.device
+        device = all_items.device if device is None else device
         neg_inf = float("-inf")
         results: list[dict] = []
 
         user_ids_tensor = torch.tensor(batch_user_ids, dtype=torch.long, device=device)
 
-        batch_scores = model.predict_batch(user_ids_tensor, all_items)
+        batch_scores = model.predict_batch(
+            user_ids_tensor, self._catalogue_ids_on(all_items, device)
+        )
         # R3 guard: raw scores must be finite BEFORE the train-item
         # mask goes in — the stable sort below ranks NaN at the top,
         # so a NaN would silently inflate the metrics.
@@ -646,10 +745,13 @@ class Evaluator:
         # see src.utils.flops on why scoring dispatches no counted FLOPs
         # for factorisation models.
 
-        for i, user_id in enumerate(batch_user_ids):
-            idx = self._train_idx_gpu.get(user_id)
-            if idx is not None:
-                batch_scores[i].index_fill_(0, idx, neg_inf)
+        # Train mask for THIS chunk only: (row, item) pairs built on the
+        # host and transferred once, bounded by the chunk's history size.
+        mask_rows, mask_cols = self._chunk_train_mask(batch_user_ids)
+        if mask_rows.size:
+            batch_scores[
+                torch.from_numpy(mask_rows).to(device), torch.from_numpy(mask_cols).to(device)
+            ] = neg_inf
 
         # Stable descending sort instead of topk: torch.topk's tie
         # order is backend-dependent (CPU vs GPU can rank tied items
@@ -732,28 +834,44 @@ class Evaluator:
             self._tiebreak_key_device = device
         return self._tiebreak_key_gpu
 
-    def _ensure_train_idx_cache(self, device: torch.device) -> None:
-        """Build per-user train-item index tensors on the target device.
+    def _catalogue_ids_on(self, all_items: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """``arange(n_items)`` on the evaluation device, transferred once.
 
-        Rebuilds the cache only when the device changes (e.g. first call
-        or after switching CPU↔GPU).  Each entry maps ``user_id`` to a
-        ``LongTensor`` of training item ids, or ``None`` for users with
-        no training history.
+        Called inside the OOM-guarded chunk, never before the first
+        prediction; the item-block path never needs it.
         """
-        if self._train_idx_device == device and self._train_idx_gpu:
+        if self._catalogue_ids_gpu is None or self._catalogue_ids_device != device:
+            self._catalogue_ids_gpu = all_items.to(device)
+            self._catalogue_ids_device = device
+        return self._catalogue_ids_gpu
+
+    def _ensure_train_idx_host(self) -> None:
+        """Build per-user training-item index arrays on the host, once.
+
+        Users without training history are absent from the dict.  The
+        arrays stay on the host; :meth:`_chunk_train_mask` assembles the
+        bounded per-chunk mask the batched path transfers.
+        """
+        if self._train_idx_host:
             return
-        self._train_idx_gpu = {}
         for user_id in self.test_users:
             items = self.train_interactions.get(user_id)
             if items:
-                self._train_idx_gpu[user_id] = torch.tensor(
-                    list(items),
-                    dtype=torch.long,
-                    device=device,
-                )
-            else:
-                self._train_idx_gpu[user_id] = None
-        self._train_idx_device = device
+                self._train_idx_host[user_id] = np.fromiter(items, dtype=np.int64, count=len(items))
+
+    def _chunk_train_mask(self, batch_user_ids: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        """``(rows, cols)`` of the train items of the chunk's users (host)."""
+        rows: list[np.ndarray] = []
+        cols: list[np.ndarray] = []
+        for i, user_id in enumerate(batch_user_ids):
+            idx = self._train_idx_host.get(user_id)
+            if idx is None:
+                continue
+            rows.append(np.full(idx.shape, i, dtype=np.int64))
+            cols.append(idx)
+        if not rows:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        return np.concatenate(rows), np.concatenate(cols)
 
     def _evaluate_sampled(
         self,

@@ -35,6 +35,7 @@ How online fusions plug into the framework
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -342,8 +343,18 @@ def online_module_for(strategy_name: str, dim: int) -> nn.Module:
     return factory(dim=dim)
 
 
-def load_embedding(path: str | Path):
+def load_embedding(path: str | Path, *, lazy: bool = False):
     """Load a visual-embedding artefact, transparently handling sidecars.
+
+    ``lazy=True`` (SDD M01, opt-in) returns a bounded
+    :class:`~src.data.feature_source.FeatureSource` instead of an array:
+    every ``.npy`` becomes a read-only memmap adapter, a learned sidecar a
+    :class:`~src.data.feature_source.ConcatFeatureSource` carrying the same
+    recipe attributes as :class:`RaggedSources`, and an equal-dim sidecar a
+    :class:`~src.data.feature_source.StackedFeatureSource`.  Rows are
+    gathered on demand by the recommender; nothing is stacked or
+    concatenated up front.  The default keeps the historical array forms
+    below byte-for-byte, so existing callers are unaffected.
 
     Two on-disk formats are accepted:
 
@@ -367,6 +378,8 @@ def load_embedding(path: str | Path):
     import numpy as np
 
     p = Path(path)
+    if lazy:
+        return _load_embedding_lazy(p)
     if p.suffix == ".json":
         sidecar = json.loads(p.read_text(encoding="utf-8"))
         components = sidecar.get("components") or []
@@ -431,6 +444,73 @@ def load_embedding(path: str | Path):
     return arr
 
 
+def _read_sidecar(p: Path) -> tuple[dict, list[Path]]:
+    """Parse an online-fusion sidecar and resolve its component paths.
+
+    Shared by the eager and lazy loaders so both apply the same
+    validation (non-empty component list, every file present) and the
+    same single-component warning.
+    """
+    sidecar = json.loads(p.read_text(encoding="utf-8"))
+    components = sidecar.get("components") or []
+    if not components:
+        raise ValueError(f"online sidecar {p} lists no components; cannot stack.")
+    if len(components) == 1:
+        from src.utils.logging import get_logger
+
+        get_logger(__name__).warning(
+            "online sidecar %s has a single component (%s); "
+            "fusion degenerates to a passthrough of that source.",
+            p,
+            components[0],
+        )
+    paths = [p.parent / fname for fname in components]
+    for comp_path in paths:
+        if not comp_path.exists():
+            raise FileNotFoundError(f"sidecar {p} references missing component {comp_path}")
+    return sidecar, paths
+
+
+def _load_embedding_lazy(p: Path):
+    """Bounded counterpart of :func:`load_embedding` (see ``lazy=True``).
+
+    Mirrors the eager branches one to one: the learned sidecar keeps its
+    sources' native widths in declared order, the equal-dim sidecar
+    requires identical component shapes, and a plain ``.npy`` is checked
+    against its ``.meta.json``.  Non-learned sidecar rows are returned as
+    stored (no normalisation), exactly as the eager stack does today.
+    """
+    from src.data.feature_source import (
+        ConcatFeatureSource,
+        NpyFeatureSource,
+        StackedFeatureSource,
+    )
+
+    if p.suffix != ".json":
+        source = NpyFeatureSource(p)
+        _validate_against_meta(p, source)
+        return source
+
+    sidecar, paths = _read_sidecar(p)
+    sources = [NpyFeatureSource(path) for path in paths]
+    if sidecar.get("alignment") == "learned":
+        return ConcatFeatureSource(
+            sources,
+            strategy=sidecar["strategy"],
+            aligned_dim=int(sidecar["dim"]),
+            normalize=bool(sidecar.get("normalize", True)),
+            fusion_kwargs=sidecar.get("fusion_kwargs") or {},
+        )
+    first_shape = sources[0].shape
+    for path, source in zip(paths, sources, strict=True):
+        if source.shape != first_shape:
+            raise ValueError(
+                f"sidecar {p}: component {path.name} has shape "
+                f"{source.shape}, expected {first_shape}."
+            )
+    return StackedFeatureSource(sources)
+
+
 def _validate_against_meta(npy_path, arr) -> None:
     """Cross-check a feature file against its ``.meta.json`` sidecar.
 
@@ -439,8 +519,6 @@ def _validate_against_meta(npy_path, arr) -> None:
     mismatch) — the exact silent-mixup the sidecar exists to prevent.
     Files without a sidecar (fusion outputs, legacy artifacts) pass.
     """
-    import json
-
     meta_path = npy_path.with_suffix("").with_suffix(".meta.json")
     if not meta_path.exists():
         return
