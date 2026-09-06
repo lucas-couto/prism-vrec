@@ -31,11 +31,15 @@ logger = get_logger(__name__)
 
 # Filename patterns the pipeline emits in ``results/tables/``.
 _EVAL_PATTERN = re.compile(r"^(?P<ds>.+?)_evaluation_(?P<cond>frozen|finetuned)\.csv$")
-# [a-z0-9]+ (not [a-z]+) so metrics with a digit like ``f1`` classify;
-# otherwise an f1 table would glob-match but silently fail to parse.
-_SUMMARY_PATTERN = re.compile(r"^(?P<ds>.+?)_summary\.csv$")
-_FRIEDMAN_PATTERN = re.compile(r"^(?P<ds>.+?)_friedman\.csv$")
-_PAIRWISE_PATTERN = re.compile(r"^(?P<ds>.+?)_pairwise\.csv$")
+# Statistical outputs are partitioned by the condition they compare and,
+# for a declared restricted population, by a ``_restricted`` marker
+# (``{ds}_{cond}[_restricted]_{kind}.csv``, R05).  Files without the
+# partition token are legacy, unpartitioned outputs and classify as such.
+_PARTITION = r"(?:_(?P<cond>frozen|finetuned|all)(?:_(?P<pop>restricted))?)?"
+_SUMMARY_PATTERN = re.compile(rf"^(?P<ds>.+?){_PARTITION}_summary\.csv$")
+_FRIEDMAN_PATTERN = re.compile(rf"^(?P<ds>.+?){_PARTITION}_friedman\.csv$")
+_PAIRWISE_PATTERN = re.compile(rf"^(?P<ds>.+?){_PARTITION}_pairwise\.csv$")
+REPORT_CONDITION_UNPARTITIONED = "unpartitioned"
 
 # icov is deliberately absent: it is an aggregate (per-cell) metric the
 # beyond_accuracy step replicates across per-user rows; melting it into
@@ -174,12 +178,15 @@ def summary_to_long(
     metric: str,
     k: int,
     known_recommenders: Iterable[str],
+    report_condition: str = REPORT_CONDITION_UNPARTITIONED,
 ) -> pd.DataFrame:
     """Reshape a per-config bootstrap summary into long format.
 
     Input has one row per ``config`` (= ``{recommender}_{embedding_name}``);
     output adds ``recommender``, ``extractor``, ``fusion``, ``condition``
-    columns plus the dataset/metric/k identifiers.
+    columns plus the dataset/metric/k identifiers and ``report_condition``
+    — the partition the file came from, so two invocations of the step
+    never merge into one row set (R05).
     """
     if summary_df.empty:
         return summary_df
@@ -189,11 +196,13 @@ def summary_to_long(
     )
     out = pd.concat([summary_df, parsed], axis=1)
     out["dataset"] = dataset
+    out["report_condition"] = report_condition
     out["metric"] = metric
     out["k"] = int(k)
 
     keep = [
         "dataset",
+        "report_condition",
         "recommender",
         "extractor",
         "fusion",
@@ -216,6 +225,7 @@ def friedman_to_long(
     dataset: str,
     metric: str,
     k: int,
+    report_condition: str = REPORT_CONDITION_UNPARTITIONED,
 ) -> pd.DataFrame:
     """Tag a single-row Friedman test with dataset/metric/k identifiers."""
     if friedman_df.empty:
@@ -223,12 +233,14 @@ def friedman_to_long(
 
     out = friedman_df.copy()
     out["dataset"] = dataset
+    out["report_condition"] = report_condition
     out["metric"] = metric
     out["k"] = int(k)
     out["test_type"] = "friedman"
 
     keep = [
         "dataset",
+        "report_condition",
         "metric",
         "k",
         "test_type",
@@ -251,6 +263,7 @@ def pairwise_to_long(
     metric: str,
     k: int,
     known_recommenders: Iterable[str],
+    report_condition: str = REPORT_CONDITION_UNPARTITIONED,
 ) -> pd.DataFrame:
     """Reshape a pairwise Wilcoxon table with parsed config_a/config_b."""
     if pairwise_df.empty:
@@ -270,15 +283,20 @@ def pairwise_to_long(
     )
     out = pd.concat([pairwise_df, parsed_a, parsed_b], axis=1)
     out["dataset"] = dataset
+    out["report_condition"] = report_condition
     out["metric"] = metric
     out["k"] = int(k)
     out["test_type"] = "wilcoxon"
 
     keep = [
         "dataset",
+        "report_condition",
         "metric",
         "k",
         "test_type",
+        "population_policy",
+        "n_excluded_a",
+        "n_excluded_b",
         "recommender_a",
         "extractor_a",
         "fusion_a",
@@ -316,15 +334,28 @@ def pairwise_to_long(
     return out.loc[:, [c for c in keep if c in out.columns]]
 
 
+def _report_condition(match: re.Match) -> str:
+    """``frozen`` / ``all`` / ``frozen_restricted`` ... or ``unpartitioned``."""
+    cond = match["cond"]
+    if cond is None:
+        return REPORT_CONDITION_UNPARTITIONED
+    return f"{cond}_{match['pop']}" if match["pop"] else cond
+
+
 def classify_table_file(path: Path) -> dict[str, str] | None:
-    """Return ``{kind, dataset, metric, k}`` for a tables-dir CSV, or None."""
+    """Return ``{kind, dataset, ...}`` for a tables-dir CSV, or None.
+
+    Statistical kinds also carry ``report_condition`` — the partition
+    token of the filename (``frozen``, ``all_restricted``, ...), or
+    ``unpartitioned`` for a legacy ``{ds}_{kind}.csv`` file.
+    """
     name = path.name
     if m := _EVAL_PATTERN.match(name):
         return {"kind": "evaluation", "dataset": m["ds"], "condition": m["cond"]}
     if m := _SUMMARY_PATTERN.match(name):
-        return {"kind": "summary", "dataset": m["ds"]}
+        return {"kind": "summary", "dataset": m["ds"], "report_condition": _report_condition(m)}
     if m := _FRIEDMAN_PATTERN.match(name):
-        return {"kind": "friedman", "dataset": m["ds"]}
+        return {"kind": "friedman", "dataset": m["ds"], "report_condition": _report_condition(m)}
     if m := _PAIRWISE_PATTERN.match(name):
-        return {"kind": "pairwise", "dataset": m["ds"]}
+        return {"kind": "pairwise", "dataset": m["ds"], "report_condition": _report_condition(m)}
     return None

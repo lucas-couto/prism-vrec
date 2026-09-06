@@ -119,6 +119,7 @@ def consolidate_bootstrap(
                 metric=metric,
                 k=k,
                 known_recommenders=recs,
+                report_condition=info["report_condition"],
             )
             if not long_df.empty:
                 frames.append(long_df)
@@ -142,7 +143,13 @@ def consolidate_statistical_tests(
         if info is None or info["kind"] != "friedman":
             continue
         for (metric, k), sub in _iter_metric_groups(pd.read_csv(path)):
-            long_df = friedman_to_long(sub, dataset=info["dataset"], metric=metric, k=k)
+            long_df = friedman_to_long(
+                sub,
+                dataset=info["dataset"],
+                metric=metric,
+                k=k,
+                report_condition=info["report_condition"],
+            )
             if not long_df.empty:
                 frames.append(long_df)
 
@@ -157,6 +164,7 @@ def consolidate_statistical_tests(
                 metric=metric,
                 k=k,
                 known_recommenders=recs,
+                report_condition=info["report_condition"],
             )
             if not long_df.empty:
                 frames.append(long_df)
