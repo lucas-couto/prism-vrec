@@ -88,9 +88,7 @@ def cap_process_vram(n_workers: int = 1) -> float:
 
     if not torch.cuda.is_available():
         return 0.0
-    fraction = (
-        POOL_VRAM_FRACTION / n_workers if n_workers > 1 else SOLO_PROCESS_VRAM_FRACTION
-    )
+    fraction = POOL_VRAM_FRACTION / n_workers if n_workers > 1 else SOLO_PROCESS_VRAM_FRACTION
     torch.cuda.set_per_process_memory_fraction(fraction)
     return fraction
 
