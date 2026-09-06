@@ -95,6 +95,14 @@ estimate", never guessed.
 
 ## Failures and retry
 
+- **Fusion runs on one worker** (`MAX_FUSION_WORKERS = 1` in
+  `src/steps/fuse.py`, decided 2026-09-06 after two PCA workers were
+  OOM-killed in the 16 GB container). A worker that vanishes mid-task
+  now raises `FusionWorkerLostError` with the completed count and the
+  container cgroup's `oom_kill` counter; finished outputs are reused on
+  the next run through their provenance record.
+
+
 A cell that fails is isolated (the others keep going) and marked `failed`
 in the manifest with the error message. To reprocess only the ones that
 failed:

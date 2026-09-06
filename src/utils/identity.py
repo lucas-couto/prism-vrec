@@ -432,10 +432,14 @@ class ArtifactProvenanceError(RuntimeError):
     """
 
 
+#: File-name suffix of the provenance sidecar written next to an artifact.
+PROVENANCE_SUFFIX = ".provenance.json"
+
+
 def provenance_path(artifact: str | Path) -> Path:
     """Sidecar path recording how *artifact* was derived."""
     artifact = Path(artifact)
-    return artifact.with_name(f"{artifact.name}.provenance.json")
+    return artifact.with_name(f"{artifact.name}{PROVENANCE_SUFFIX}")
 
 
 def fit_set_digest(train_items: Sequence[int] | np.ndarray | None) -> str | None:

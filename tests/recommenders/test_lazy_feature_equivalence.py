@@ -34,7 +34,13 @@ from src.recommenders.vbpr import VBPR
 from src.recommenders.vnpr import VNPR
 
 N_USERS, N_ITEMS, DV, M_COMP = 7, 23, 6, 3
-RTOL, ATOL = 1e-5, 1e-7
+# Scores are float32.  1e-7 absolute is below one ulp at unit scale, so
+# the same row-wise computation issued in different block sizes -- or
+# on a different BLAS (the CI runner's OpenBLAS vs the image's MKL) --
+# legitimately differs by a few ulp: DeepStyle-stacked missed by
+# 2.4e-7 on CI on 2026-09-06 while passing in the container.  1e-6 is
+# ~8 ulp; anything larger than that would be a real divergence.
+RTOL, ATOL = 1e-5, 1e-6
 USERS = torch.tensor([0, 3, 3, 6, 1])
 POS = torch.tensor([2, 9, 9, 22, 4])
 NEG = torch.tensor([9, 0, 15, 4, 4])
@@ -431,3 +437,53 @@ def test_vnpr_blocked_predict_batch_covers_a_short_final_block(tmp_path: Path) -
     with torch.no_grad():
         _close(lazy.predict_batch(USERS, items), dense.predict_batch(USERS, items), "all")
         _close(lazy.predict_batch(USERS, subset), dense.predict_batch(USERS, subset), "subset")
+
+
+# ------------------------------------------------------- dense blocking (B)
+@pytest.mark.parametrize(
+    ("model_cls", "kind"),
+    [
+        (VBPR, "pooled"),
+        (VBPR, "learned:mean"),
+        (VNPR, "learned:adaptive_gated"),
+        (DeepStyle, "stacked"),
+    ],
+    ids=["VBPR-pooled", "VBPR-learned", "VNPR-learned-gated", "DeepStyle-stacked"],
+)
+def test_dense_catalogue_requests_are_blocked_and_unchanged(
+    model_cls, kind, tmp_path: Path
+) -> None:
+    """The dense buffer is read in blocks too: same scores, bounded raw rows.
+
+    Indexing the resident buffer with the whole catalogue copies it
+    before the online fusion adds its temporaries; under an 8 GB VRAM
+    cap that sent every amazon_women learned-fusion evaluation into the
+    per-user fallback (2026-09-06).
+    """
+    dense_feats, _ = _variant(kind, tmp_path)
+    reference = _build(model_cls, dense_feats)
+    blocked = _build(model_cls, dense_feats)
+    blocked.load_state_dict(reference.state_dict())
+    blocked._LAZY_ITEM_BLOCK = 5
+    reference.eval()
+    blocked.eval()
+    seen: list[int] = []
+    raw = blocked._raw_visual_rows
+
+    def _spy(item_ids):
+        seen.append(int(item_ids.reshape(-1).shape[0]))
+        return raw(item_ids)
+
+    blocked._raw_visual_rows = _spy
+    all_items = torch.arange(N_ITEMS)
+
+    with torch.no_grad():
+        _close(blocked.predict(3, all_items), reference.predict(3, all_items), "predict")
+        _close(
+            blocked.predict_batch(USERS, all_items),
+            reference.predict_batch(USERS, all_items),
+            "predict_batch",
+        )
+
+    assert seen, "the blocked model never read its raw rows"
+    assert max(seen) <= 5

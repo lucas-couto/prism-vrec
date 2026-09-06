@@ -249,10 +249,16 @@ class BaseRecommender(nn.Module, abc.ABC):
             )
 
     # ----------------------------------------------------------- raw features
-    #: Items per block when a lazy source serves a request larger than
-    #: this (the catalogue at evaluation): callers that map a row-wise
-    #: function over the features use :meth:`_map_visual` so the raw
-    #: rows staged on the device are bounded by the block, not by ``N``.
+    #: Items per block when a request is larger than this (the catalogue
+    #: at evaluation).  Callers that map a row-wise function over the
+    #: features use :meth:`_map_visual`, and :meth:`_resolve_visual`
+    #: runs an online fusion block by block, so the raw rows staged on
+    #: the device are bounded by the block, not by ``N`` -- for a lazy
+    #: source *and* for the dense buffer: indexing the resident buffer
+    #: with the whole catalogue copies it (3.9 GB for amazon_women's
+    #: learned-fusion concat) before the fusion adds its own temporaries,
+    #: which is what pushed every user batch into the per-user fallback
+    #: under an 8 GB VRAM cap on 2026-09-06.  The name is historical.
     _LAZY_ITEM_BLOCK: int = 8192
 
     @property
@@ -300,14 +306,15 @@ class BaseRecommender(nn.Module, abc.ABC):
         item_ids: torch.Tensor,
         fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
-        """``fn(features, ids)`` over 1-D ``item_ids``, blocked for lazy sources.
+        """``fn(features, ids)`` over 1-D ``item_ids``, in blocks of at most
+        :attr:`_LAZY_ITEM_BLOCK` rows.
 
         ``fn`` must be row-wise (each output row depends on its input row
-        only) so concatenating per-block results equals one call.  The
-        dense path calls ``fn`` once, unchanged.
+        only) so concatenating per-block results equals one call.  A
+        request within the block size is a single call.
         """
         block = self._LAZY_ITEM_BLOCK
-        if self._feature_source is None or item_ids.shape[0] <= block:
+        if item_ids.shape[0] <= block:
             return fn(self._resolve_visual(item_ids), item_ids)
         parts = [
             fn(
@@ -340,11 +347,24 @@ class BaseRecommender(nn.Module, abc.ABC):
         """
         if not self.has_visual_features:
             raise RuntimeError("This recommender was instantiated without visual_embeddings.")
-
-        rows = self._raw_visual_rows(item_ids)
         if self._online_fusion is None:
-            return rows
+            return self._raw_visual_rows(item_ids)
+        block = self._LAZY_ITEM_BLOCK
+        if item_ids.dim() == 1 and item_ids.shape[0] > block:
+            # The fused output is (N, D_fused), small; the raw rows the
+            # fusion reads are the large part, so fuse block by block.
+            return torch.cat(
+                [
+                    self._fuse_rows(item_ids[start : start + block])
+                    for start in range(0, item_ids.shape[0], block)
+                ],
+                dim=0,
+            )
+        return self._fuse_rows(item_ids)
 
+    def _fuse_rows(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Gather the raw rows of ``item_ids`` and apply the online fusion."""
+        rows = self._raw_visual_rows(item_ids)
         from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
 
         if isinstance(self._online_fusion, LearnedAlignmentFusion):

@@ -168,10 +168,15 @@ class TestGridDispatch:
 
         assert trained == []
 
-    def test_unequal_grid_sizes_are_reported_not_equalised(self, tmp_path, spies, caplog) -> None:
+    def test_unequal_grid_sizes_are_reported_not_equalised(
+        self, tmp_path, spies, caplog, monkeypatch
+    ) -> None:
         cfg = _config(tmp_path, "grid")
         cfg["vbpr"] = {"l2_reg_visual_bias": [0.0, 1e-4]}
         ex._reset_grid_budget_warning_for_tests()
+        # The project's loggers do not propagate to the root logger,
+        # where caplog listens; let this one through for the assertion.
+        monkeypatch.setattr(ex.logger, "propagate", True)
 
         with caplog.at_level("WARNING"):
             ex.execute_cell(BatteryCell("synthetic", "resnet50", "vbpr", 1, "search"), cfg)

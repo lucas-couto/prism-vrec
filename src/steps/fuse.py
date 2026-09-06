@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,15 @@ logger = get_logger(__name__)
 
 _PCA_STRATEGIES = {"pca", "pca_per_model"}
 
+#: Hard ceiling on the fusion pool, set by the researcher on 2026-09-06
+#: after two PCA workers were OOM-killed inside the 16 GB container.
+#: Fusion is memory-bound, not CPU-bound: the PCA fits already use
+#: every core through BLAS, so one worker loses little wall-clock and
+#: keeps the whole container budget for the one fit matrix.  The
+#: memory-aware planner below still runs, so the log records what a
+#: larger pool *would* have been sized at.
+MAX_FUSION_WORKERS = 1
+
 #: Peak RSS of an *in-memory* fusion worker as a multiple of its source
 #: bytes.  Such a worker holds the loaded sources, the fused output
 #: (``concat`` is the worst case: as large as the sources combined) and
@@ -80,8 +90,13 @@ _FUSION_PEAK_FACTOR = 3.5
 _STREAM_CHUNK_FACTOR = 3.0
 
 #: And for the one allocation streaming cannot avoid — the PCA fit
-#: matrix.  ``copy=False`` lets scikit-learn centre it in place, so the
-#: matrix itself plus a single source's training rows is the peak.
+#: matrix.  ``copy=False`` lets scikit-learn centre it in place and the
+#: matrix is gathered in row blocks (``_gather_rows``), so the matrix
+#: itself plus the randomized-SVD workspace is the peak; the half on top
+#: is margin.  Before 3.0.0rc1 the gather materialised a whole source's
+#: training rows twice on top of the matrix (~8 GB for tradesy instead
+#: of ~3.5 GB) and two such workers were OOM-killed inside a 16 GB
+#: container that this estimate had admitted.
 _STREAM_FIT_FACTOR = 1.5
 
 #: Interpreter, numpy/scikit-learn and the memmap page cache a worker
@@ -166,11 +181,18 @@ def _plan_fusion_workers(pending: list[dict]) -> int:
     """
     cpu_cap = min(len(pending), available_cpus())
     per_worker = max((_task_peak_bytes(t) for t in pending), default=0)
-    return plan_pool_workers(
+    planned = plan_pool_workers(
         per_worker_bytes=per_worker,
         hard_cap=cpu_cap,
         label="fusion pool",
     )
+    if planned > MAX_FUSION_WORKERS:
+        logger.info(
+            "fusion pool: pinned to %d worker(s) (MAX_FUSION_WORKERS); the memory plan allowed %d",
+            MAX_FUSION_WORKERS,
+            planned,
+        )
+    return max(1, min(planned, MAX_FUSION_WORKERS))
 
 
 def task_provenance(task: dict) -> dict:
@@ -663,13 +685,59 @@ def run(condition: str = "frozen") -> None:
     n_workers = _plan_fusion_workers(pending)
     logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
 
-    completed = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_fuse_single, **task): task for task in pending}
-        for future in as_completed(futures):
-            result = future.result()
-            completed += 1
-            if result:
-                logger.info("  [%d/%d] %s", completed, len(pending), result)
-
+    _run_fusion_pool(pending, n_workers)
     logger.info("Embedding fusion complete.")
+
+
+class FusionWorkerLostError(RuntimeError):
+    """A fusion worker died without returning (usually killed by the cgroup)."""
+
+
+def _cgroup_oom_kills() -> int | None:
+    """``oom_kill`` counter of this container's cgroup (v2), if readable."""
+    try:
+        text = Path("/sys/fs/cgroup/memory.events").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "oom_kill" and value.strip().isdigit():
+            return int(value)
+    return None
+
+
+def _run_fusion_pool(pending: list[dict], n_workers: int, worker=_fuse_single) -> int:
+    """Run *pending* fusions on a process pool; return how many completed.
+
+    A worker that vanishes mid-task (the kernel's OOM killer is the
+    usual cause: the container hit ``mem_limit``) surfaces as
+    :class:`BrokenProcessPool` with no hint of *why*.  It is re-raised
+    as :class:`FusionWorkerLostError` naming the completed count, the
+    pool size and the cgroup's ``oom_kill`` counter, so the operator can
+    tell a memory kill from a crash.  Finished outputs stay on disk and
+    are reused by the next run (E05 provenance), so the retry only
+    redoes the lost tasks.
+    """
+    completed = 0
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(worker, **task): task for task in pending}
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                if result:
+                    logger.info("  [%d/%d] %s", completed, len(pending), result)
+    except BrokenProcessPool as exc:
+        oom = _cgroup_oom_kills()
+        cause = (
+            f"the container cgroup reports oom_kill={oom}"
+            if oom
+            else f"no cgroup OOM kill recorded (oom_kill={oom})"
+        )
+        raise FusionWorkerLostError(
+            f"A fusion worker was terminated before returning: {completed}/{len(pending)} "
+            f"fusions completed on {n_workers} worker(s); {cause}. Completed outputs are "
+            "kept and reused on the next run. If memory was the cause, lower the worker "
+            "count (PRISM_CPUS) or raise PRISM_MEM_LIMIT."
+        ) from exc
+    return completed

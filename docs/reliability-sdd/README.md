@@ -62,3 +62,9 @@ executor's `_evaluate_one_cell` does not pass `lazy_features` (M05);
 `CheckpointManager.clear_all_training_checkpoints` is defined and
 never called (E04); `evaluate._evaluate_cell` still reads
 `load_config()["paths"]` for DeepStyle categories (E03).
+
+## Follow-ups after the first real run
+
+| Record | Status | Scope |
+|---|---|---|
+| [RC1-FOLLOWUP](RC1-FOLLOWUP.md) | implemented, CPU-verified | phantom provenance embeddings, dense catalogue blocking, fusion fit-matrix peak + one-worker pin, CI-only test failures |

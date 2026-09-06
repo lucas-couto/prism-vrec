@@ -46,6 +46,42 @@ VNPR × hybrid collapse is still unresolved (S04 below).
 
 ### Fixed
 
+- **First run of the candidate (2026-09-06): four defects found on real
+  data, all fixed before the tag.** (1) The E05 provenance sidecar
+  `<artifact>.provenance.json` was matched by the embedding discovery
+  glob `hybrid_*.json` (`get_embedding_files`, `src/steps/train.py`),
+  which created phantom embeddings such as
+  `hybrid_adaptive_gated_learned_D128.json.provenance`; 92 battery jobs
+  failed on "sidecar lists no components". Discovery now skips the
+  `PROVENANCE_SUFFIX` (`tests/test_embedding_discovery.py`). (2) In
+  dense mode `_map_visual` and `_resolve_visual`
+  (`src/recommenders/base.py`) handed the whole catalogue to the online
+  fusion in one call: indexing the resident buffer copies it (3.9 GB
+  for amazon_women's learned-fusion concat) before the fusion adds its
+  own temporaries, so under the new 8 GB VRAM cap every user batch --
+  down to a single user -- hit CUDA OOM and the evaluator fell back to
+  per-user item-block scoring on CPU: `eval_s` went from 0.7 s to
+  414-482 s per pass. Catalogue-sized requests are now processed in
+  `_LAZY_ITEM_BLOCK` rows for the dense buffer as well (the lazy path
+  already was); scores are unchanged
+  (`test_dense_catalogue_requests_are_blocked_and_unchanged`). (3) The
+  fusion pool planner charged 5.6 GB per PCA worker while
+  `_assemble_fit_matrix` (`src/fusions/streaming.py`) fancy-indexed a
+  whole source with the training index and normalised the copy --
+  about 8.3 GB for tradesy -- and two workers were OOM-killed inside the
+  16 GB container (`docker events` showed `oom` then `die 1`;
+  `BrokenProcessPool` named no cause). The fit matrix and the
+  per-model blocks are now gathered in `CHUNK_ROWS` slices
+  (`_gather_rows`; tracemalloc peak above the fit matrix 31.4 MB ->
+  2.0 MB on the 20K x 256 fixture, `tests/test_fuse_fit_assembly.py`),
+  a lost worker raises `FusionWorkerLostError` naming the completed
+  count and the cgroup's `oom_kill` counter, and by the researcher's
+  decision the pool is pinned to `MAX_FUSION_WORKERS = 1`. (4) Two CI
+  failures outside the container: the lazy/dense equivalence tolerance
+  was below one float32 ulp (`atol` 1e-7 -> 1e-6, justified in the
+  test) and the grid-budget warning test listened on the root logger
+  that the project's loggers do not propagate to.
+
 - **A valid all-zero training run vanished from the experiment (F03;
   tasks I01, I02).** `train_single_run` (`src/utils/training.py`)
   started `best_metric` at `0.0`, saved a winner only on strict

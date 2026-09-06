@@ -57,6 +57,7 @@ from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.device import resolve_device
 from src.utils.identity import (
+    PROVENANCE_SUFFIX,
     SELECTION_SPLITS,
     DataIdentity,
     IdentityError,
@@ -133,7 +134,15 @@ def get_embedding_files(
     if not emb_dir.exists():
         return []
     names = [f.stem for f in sorted(emb_dir.glob("*.npy"))]
-    names.extend(f.stem for f in sorted(emb_dir.glob("hybrid_*.json")))
+    # ``<artifact>.provenance.json`` (E05) sits next to every fusion
+    # output, including the ``hybrid_*.json`` sidecars, so a bare glob
+    # would turn ``hybrid_x.json.provenance.json`` into a phantom
+    # embedding ``hybrid_x.json.provenance`` whose jobs can only fail.
+    names.extend(
+        f.stem
+        for f in sorted(emb_dir.glob("hybrid_*.json"))
+        if not f.name.endswith(PROVENANCE_SUFFIX)
+    )
     names = sorted(set(names))
     if dim_filter:
         names = [
