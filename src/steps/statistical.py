@@ -1,18 +1,27 @@
 """Step 07 — Statistical reporting.
 
-For every dataset and every PRIMARY metric this step produces three
-artefacts:
+For every dataset this step produces one file per kind, partitioned by
+the condition (and population policy) it was asked for — the stem is
+``{dataset}_{condition}[_restricted]`` (R05), so a ``frozen`` invocation
+never overwrites an ``all`` one:
 
-* ``{dataset}_summary_{metric}.csv``
+* ``{stem}_integrity.json``
+  What the report covers: run seed and distinct seed count, shared
+  provenance, expected/completed/missing cells (reconciled against the
+  evaluate step's completion record) and cells excluded with their
+  reason.  Written BEFORE the tests, so a rejected report leaves its
+  reasons on disk (see :mod:`src.steps.statistical_integrity`).
+
+* ``{stem}_summary.csv``
   Per-config mean with bootstrap confidence intervals (descriptive;
   the inference below is PAIRED — overlapping individual CIs do not
   contradict a significant paired test).
 
-* ``{dataset}_friedman_{metric}.csv``
+* ``{stem}_friedman.csv``
   Friedman omnibus test PER COMPARISON FAMILY — answers "is anyone
   different within this family?" before its pairwise tests.
 
-* ``{dataset}_pairwise_{metric}.csv``
+* ``{stem}_pairwise.csv``
   Wilcoxon signed-rank tests with the multiple-comparison correction
   (Holm by default) applied WITHIN each comparison family — the set of
   hypotheses one research question defines (see
@@ -55,6 +64,16 @@ Configuration knobs (``configs/evaluation.yaml`` -> ``statistical:``):
 * ``effect_size``                 — toggle Cliff's delta columns (default true)
 * ``include_cohens_d``            — add parametric Cohen's d (default false; see
                                     ``cohens_d_paired`` docstring for why)
+* ``population``                  — ``"strict"`` (default): every cell must cover the
+                                    same users, else the step fails with the offending
+                                    cells; ``"declared_intersection"``: an explicitly
+                                    declared restricted analysis over the shared users,
+                                    written to its own ``_restricted`` partition with
+                                    per-pair exclusion counts (R04/R05)
+
+Before any test the per-user rows are validated as unique observations
+(conflicting or unexplained duplicate rows, mixed seeds/protocols and
+mixed identities within a config fail — R04, F15).
 """
 
 from __future__ import annotations
@@ -67,10 +86,17 @@ from src.evaluation.comparison_families import (
     DEFAULT_FAMILIES,
     enumerate_family_instances,
 )
+from src.evaluation.paired_validation import POPULATION_STRICT, check_population_policy
 from src.evaluation.statistical import (
     friedman_test,
     pairwise_significance,
     per_model_summary,
+)
+from src.steps.statistical_integrity import (
+    enforce,
+    partition_stem,
+    reconcile,
+    write_integrity,
 )
 from src.utils.config import load_config
 from src.utils.logging import get_logger
@@ -108,13 +134,16 @@ def run(condition: str = "frozen") -> None:
     friedman_enabled = stat_cfg.get("friedman", {}).get("enabled", True)
     effect_size = stat_cfg.get("effect_size", True)
     include_cohens_d = stat_cfg.get("include_cohens_d", False)
+    population = str(stat_cfg.get("population", POPULATION_STRICT))
+    check_population_policy(population)
+    run_seed = config.get("seed")
 
     results_dir = Path(config.get("paths", {}).get("results", "results")) / "tables"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
         "Condition: %s  alpha=%.3f  correction=%s  families=%s  "
-        "primary_metrics=%s  bootstrap=%s  friedman=%s  effect_size=%s",
+        "primary_metrics=%s  bootstrap=%s  friedman=%s  effect_size=%s  population=%s",
         condition,
         alpha,
         correction,
@@ -123,6 +152,7 @@ def run(condition: str = "frozen") -> None:
         bootstrap_enabled,
         friedman_enabled,
         effect_size,
+        population,
     )
 
     for dataset_name in datasets:
@@ -130,6 +160,11 @@ def run(condition: str = "frozen") -> None:
         eval_df = _load_evaluation(results_dir, dataset_name, condition)
         if eval_df is None:
             continue
+        stem = partition_stem(dataset_name, condition, population)
+        if "user_id" in eval_df.columns:
+            eval_df = _reconcile_cells(
+                eval_df, results_dir, dataset_name, condition, stem, population, run_seed
+            )
 
         metrics = _metrics_to_test(eval_df, k_values, primary_metrics, include_derived)
         if not metrics:
@@ -168,7 +203,9 @@ def run(condition: str = "frozen") -> None:
 
                 fried_rows: list[dict] = []
                 if friedman_enabled and instances:
-                    fried_rows = _family_friedman_rows(eval_df, instances, metric, alpha)
+                    fried_rows = _family_friedman_rows(
+                        eval_df, instances, metric, alpha, population=population
+                    )
                     if fried_rows:
                         friedman_frames.append(
                             _tag_metric(pd.DataFrame(fried_rows), metric_name, metric_k)
@@ -199,6 +236,7 @@ def run(condition: str = "frozen") -> None:
                             include_cohens_d=include_cohens_d,
                             diff_ci=bootstrap_enabled,
                             n_iterations=bootstrap_iters,
+                            population=population,
                         )
                         for inst in instances
                     ]
@@ -237,7 +275,7 @@ def run(condition: str = "frozen") -> None:
         ):
             if not frames:
                 continue
-            out = results_dir / f"{dataset_name}_{kind}.csv"
+            out = results_dir / f"{stem}_{kind}.csv"
             merged = pd.concat(frames, ignore_index=True)
             merged.to_csv(out, index=False)
             logger.info("    %s: %d rows -> %s", kind, len(merged), out)
@@ -254,6 +292,48 @@ def run(condition: str = "frozen") -> None:
         logger.warning("Long-format consolidation skipped: %s", exc)
 
 
+def _reconcile_cells(
+    eval_df: pd.DataFrame,
+    results_dir: Path,
+    dataset_name: str,
+    condition: str,
+    stem: str,
+    population: str,
+    run_seed: int | None,
+) -> pd.DataFrame:
+    """Validate the per-user table, write the integrity record, enforce it.
+
+    Returns the validated frame (one row per observation key, sorted).
+    Raises :class:`~src.evaluation.paired_validation.PairedValidationError`
+    after the record is on disk when the report cannot be published.
+    """
+    validated, integrity = reconcile(
+        eval_df,
+        results_dir,
+        dataset_name,
+        condition,
+        population=population,
+        run_seed=run_seed,
+    )
+    path = write_integrity(results_dir, stem, integrity)
+    logger.info(
+        "  integrity: seed=%s (%d distinct)  cells expected=%d completed=%d "
+        "missing=%d excluded=%d  users=%d -> %s",
+        integrity.seed,
+        integrity.n_seeds_distinct,
+        integrity.n_cells_expected,
+        integrity.n_cells_completed,
+        len(integrity.cells_missing),
+        len(integrity.cells_excluded),
+        integrity.n_users_reference,
+        path,
+    )
+    for cell, reason in integrity.cells_excluded.items():
+        logger.warning("  excluded population: %s — %s", cell, reason)
+    enforce(integrity)
+    return validated
+
+
 def _tag_metric(df: pd.DataFrame, metric: str, k: str) -> pd.DataFrame:
     """Prepend ``metric`` / ``k`` identity columns to a result frame."""
     out = df.copy()
@@ -267,6 +347,8 @@ def _family_friedman_rows(
     instances: list,
     metric: str,
     alpha: float,
+    *,
+    population: str = POPULATION_STRICT,
 ) -> list[dict]:
     """One Friedman row per family instance with a defined omnibus.
 
@@ -283,7 +365,9 @@ def _family_friedman_rows(
     for inst in instances:
         if not inst.omnibus_defined:
             continue
-        fried = friedman_test(eval_df, metric=metric, alpha=alpha, configs=inst.configs)
+        fried = friedman_test(
+            eval_df, metric=metric, alpha=alpha, configs=inst.configs, population=population
+        )
         rows.append({"family": inst.family, "group": inst.group, **fried})
     return rows
 

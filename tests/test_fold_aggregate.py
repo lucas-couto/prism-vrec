@@ -268,3 +268,58 @@ class TestStatisticalPipelineCompatibility:
 
         assert list(matrix.columns) == ["vbpr__resnet"]
         assert len(matrix) == 9
+
+
+class TestPartialIdentity:
+    """R05: a partial of another artifact identity must not be concatenated."""
+
+    def test_should_raise_when_partial_latent_dim_disagrees(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[1]).read_text())
+        meta["d"] = 64
+        _meta_path(paths[1]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="identity.*d"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_should_raise_when_partial_protocol_version_disagrees(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[0]).read_text())
+        meta["eval_protocol_version"] = "0.1"
+        _meta_path(paths[0]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="identity.*eval_protocol_version"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_should_raise_when_partial_row_count_disagrees_with_its_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[0]).read_text())
+        meta["fold"]["n_users"] = 5
+        _meta_path(paths[0]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="n_users=5"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_should_raise_when_two_partials_share_a_fold_seed(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[1]).read_text())
+        meta["fold"]["seed"] = 100
+        _meta_path(paths[1]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="seed 100"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_aggregate_reports_distinct_fold_seed_count(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        _write_folds(tmp_path, metadata)
+
+        _, agg = concatenate_fold_artifacts(tmp_path, metadata, k=3, k_values=_K_VALUES)
+
+        assert agg.n_distinct_fold_seeds == 3
+        assert agg.to_dict()["n_distinct_fold_seeds"] == 3

@@ -63,6 +63,8 @@ class FoldAggregate:
     per_fold_metrics: list[dict[str, float]]
     between_fold_mean: dict[str, float]
     between_fold_std: dict[str, float]
+    #: Distinct fold seeds among the partials (equals ``k`` for a sound plan).
+    n_distinct_fold_seeds: int = 0
 
     def to_dict(self) -> dict:
         """Manifest-friendly plain dictionary."""
@@ -72,7 +74,22 @@ class FoldAggregate:
             "per_fold_metrics": [dict(m) for m in self.per_fold_metrics],
             "between_fold_mean": dict(self.between_fold_mean),
             "between_fold_std": dict(self.between_fold_std),
+            "n_distinct_fold_seeds": self.n_distinct_fold_seeds,
         }
+
+
+#: Metadata fields that identify the cell a partial belongs to; every
+#: partial must agree with the metadata the concatenation is asked for.
+_IDENTITY_FIELDS: tuple[str, ...] = (
+    "dataset",
+    "visual_config",
+    "recommender",
+    "seed",
+    "d",
+    "split",
+    "eval_protocol_version",
+    "n_items",
+)
 
 
 def fold_dir(out_dir: str | Path, fold_index: int) -> Path:
@@ -137,7 +154,39 @@ def _read_partial(
         raise ValueError(f"metadata of {records_path} claims k={fold['k']}, expected k={k}")
     if records.empty:
         raise ValueError(f"fold {fold_index} evaluated no users: {records_path}")
+    _check_identity(meta, metadata, records_path)
+    declared = fold.get("n_users")
+    if declared is not None and int(declared) != len(records):
+        raise ValueError(
+            f"metadata of {records_path} declares fold n_users={declared} but the partial "
+            f"has {len(records)} rows; the artifact is torn or stale"
+        )
     return records, fold
+
+
+def _check_identity(meta: dict, expected: CellMetadata, records_path: Path) -> None:
+    """A partial written for another cell identity must not be concatenated (R05)."""
+    wanted = expected.to_dict()
+    mismatched = [
+        f"{field}={meta.get(field)!r} (expected {wanted[field]!r})"
+        for field in _IDENTITY_FIELDS
+        if meta.get(field) != wanted[field]
+    ]
+    if mismatched:
+        raise ValueError(
+            f"partial {records_path} carries a different cell identity: {', '.join(mismatched)}"
+        )
+
+
+def _check_distinct_fold_seeds(read: list[tuple[pd.DataFrame, dict]]) -> int:
+    seeds = [int(f["seed"]) for _, f in read]
+    repeated = sorted({s for s in seeds if seeds.count(s) > 1})
+    if repeated:
+        raise ValueError(
+            f"fold seed {', '.join(str(s) for s in repeated)} is shared by more than one "
+            "partial; each fold must run under its own seed"
+        )
+    return len(set(seeds))
 
 
 def _assert_disjoint(partials: list[pd.DataFrame]) -> None:
@@ -155,7 +204,9 @@ def _assert_disjoint(partials: list[pd.DataFrame]) -> None:
         seen |= users
 
 
-def _between_folds(partials: list[pd.DataFrame], k_values: list[int]) -> FoldAggregate:
+def _between_folds(
+    partials: list[pd.DataFrame], k_values: list[int], n_distinct_fold_seeds: int
+) -> FoldAggregate:
     per_fold = [
         {
             name: value
@@ -172,6 +223,7 @@ def _between_folds(partials: list[pd.DataFrame], k_values: list[int]) -> FoldAgg
         per_fold_metrics=per_fold,
         between_fold_mean={n: float(v.mean()) for n, v in stacked.items()},
         between_fold_std={n: float(v.std(ddof=1)) for n, v in stacked.items()},
+        n_distinct_fold_seeds=n_distinct_fold_seeds,
     )
 
 
@@ -197,7 +249,9 @@ def concatenate_fold_artifacts(
     :param k_values: Cut-offs for the descriptive per-fold metrics (default 5/10/20).
     :returns: ``(concatenated records path, FoldAggregate)``.
     :raises ValueError: If ``k < 2``, a fold is empty, a partial's provenance
-        disagrees with its location, or users repeat across folds.
+        disagrees with its location, its cell identity or its declared row
+        count differs from ``metadata`` / the records, two partials share a
+        fold seed, or users repeat across folds.
     :raises FileNotFoundError: If any of the ``k`` partial artifacts is missing.
     """
     if k < 2:
@@ -205,6 +259,7 @@ def concatenate_fold_artifacts(
     cut_offs = list(k_values) if k_values is not None else list(DEFAULT_K_VALUES)
     read = [_read_partial(out_dir, metadata, i, k) for i in range(k)]
     partials = [records for records, _ in read]
+    n_distinct_seeds = _check_distinct_fold_seeds(read)
     _assert_disjoint(partials)
 
     concatenated = (
@@ -216,4 +271,4 @@ def concatenate_fold_artifacts(
         "n_users_per_fold": [int(len(p)) for p in partials],
     }
     records_path = write_cell_artifact(concatenated, replace(metadata, fold=fold), out_dir)
-    return records_path, _between_folds(partials, cut_offs)
+    return records_path, _between_folds(partials, cut_offs, n_distinct_seeds)
