@@ -314,6 +314,79 @@ class EnabledRecommenderHasNoCellsError(RuntimeError):
     """
 
 
+class TrainingJobsFailedError(RuntimeError):
+    """Required training work failed or was never accounted for (audit F04).
+
+    Raised by the grid and parallel-Optuna backends after every unit of
+    work has been collected, so the completed cells keep their artifacts
+    on disk while ``main.py`` still exits non-zero and the run manifest
+    records the failure.  ``failures`` lists one dict per non-successful
+    unit (``id``, ``status``, ``error``); ``total`` is the number
+    submitted.
+    """
+
+    #: Failures quoted verbatim in the message; the rest are summarised.
+    _QUOTED = 10
+
+    def __init__(self, failures: list[dict], total: int, *, unit: str) -> None:
+        self.failures = failures
+        self.total = total
+        self.unit = unit
+        super().__init__(self._summary())
+
+    def _summary(self) -> str:
+        counts: dict[str, int] = {}
+        for failure in self.failures:
+            counts[failure["status"]] = counts.get(failure["status"], 0) + 1
+        breakdown = ", ".join(f"{n} {status}" for status, n in sorted(counts.items()))
+        quoted = "; ".join(
+            f"{f['id']}: {f['status']} ({f.get('error') or 'no detail'})"
+            for f in self.failures[: self._QUOTED]
+        )
+        more = len(self.failures) - self._QUOTED
+        tail = f"; ... {more} more" if more > 0 else ""
+        return (
+            f"{len(self.failures)} of {self.total} {self.unit}s did not succeed "
+            f"({breakdown}): {quoted}{tail}"
+        )
+
+
+def _raise_if_work_failed(
+    results: list[dict],
+    expected_ids: list[str],
+    *,
+    id_key: str,
+    unit: str,
+) -> None:
+    """Reconcile *results* against *expected_ids*; raise on any shortfall.
+
+    A unit counts as failed when its result status is not ``ok`` and as
+    ``unaccounted`` when no result carries its id at all -- a worker
+    that died without publishing, or a message lost with it.  Duplicate
+    results for one id are tolerated (first wins).  Success is exactly
+    ``submitted == succeeded``; a log line is never a substitute for
+    the exception this raises.
+    """
+    seen: dict[str, dict] = {}
+    for result in results:
+        seen.setdefault(str(result.get(id_key)), result)
+
+    failures: list[dict] = []
+    for unit_id in expected_ids:
+        result = seen.get(unit_id)
+        if result is None:
+            failures.append({"id": unit_id, "status": "unaccounted", "error": None})
+        elif result.get("status") != "ok":
+            failures.append(
+                {"id": unit_id, "status": result.get("status"), "error": result.get("error")}
+            )
+    if not failures:
+        return
+    for failure in failures:
+        logger.error("  %s %s: %s (%s)", unit, failure["id"], failure["status"], failure["error"])
+    raise TrainingJobsFailedError(failures, len(expected_ids), unit=unit)
+
+
 def assert_enabled_recommenders_have_cells(
     cell_counts: dict[str, int],
     condition: str,
@@ -616,6 +689,9 @@ def _run_grid(
 
     ok = sum(1 for r in results if r.get("status") == "ok")
     logger.info("Training complete: %d/%d experiments succeeded.", ok, len(jobs))
+    # Completed jobs already wrote their checkpoints and grid progress;
+    # the exception only denies the step (and the run) a success marker.
+    _raise_if_work_failed(results, [j.job_id for j in jobs], id_key="job_id", unit="job")
 
 
 #: Host RAM a training worker needs on top of its data: the Python
@@ -984,7 +1060,10 @@ def _run_optuna(
         p.start()
         procs.append(p)
 
-    results: list[dict] = []
+    # One slot per submitted cell: a duplicate delivery cannot end the
+    # loop early and leave a real cell unaccounted.
+    expected = [cell.study_name() for cell, _n_users, _n_items, _emb_path in cells]
+    results: dict[str, dict] = {}
     total = len(cells)
     # Live cell-level battery bar (done/total, %, elapsed<ETA, rate).
     # Parent-side observability only — never touches worker computation.
@@ -996,19 +1075,22 @@ def _run_optuna(
     with tqdm(total=total, desc="Training (Optuna cells)", unit="cell", disable=None) as pbar:
         while len(results) < total:
             try:
-                results.append(result_queue.get(timeout=30))
+                last = result_queue.get(timeout=30)
             except Exception:  # noqa: BLE001, queue.Empty from a spawn context
                 if not any(p.is_alive() for p in procs):
                     logger.warning("All Optuna workers exited early.")
                     break
                 continue
+            if last.get("cell") in results:
+                logger.warning("Ignoring duplicate result for cell %s", last.get("cell"))
+                continue
+            results[str(last.get("cell"))] = last
             pbar.update(1)
             # Plain-log ETA for `docker logs` followers, where the tqdm
             # bar does not render (no TTY): rate = cells done / elapsed.
             done = len(results)
             elapsed = _time.monotonic() - t_start
             eta_s = elapsed / done * (total - done)
-            last = results[-1]
             logger.info(
                 "cell %d/%d done (%s, %s) — avg %.1f min/cell, ETA ~%dh%02dm",
                 done,
@@ -1022,11 +1104,11 @@ def _run_optuna(
     for p in procs:
         p.join(timeout=30)
 
-    ok = sum(1 for r in results if r.get("status") == "ok")
+    ok = sum(1 for r in results.values() if r.get("status") == "ok")
     logger.info("Optuna search complete: %d/%d cells succeeded.", ok, len(cells))
-    for r in results:
-        if r.get("status") != "ok":
-            logger.error("  cell %s failed: %s", r.get("cell"), r.get("error"))
+    # Studies of the completed cells are already persisted in the
+    # storage; the exception denies the step its success marker only.
+    _raise_if_work_failed(list(results.values()), expected, id_key="cell", unit="cell")
 
 
 def _list_cells(
