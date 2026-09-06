@@ -348,6 +348,24 @@ VNPR × hybrid collapse is still unresolved (S04 below).
 
 ### Changed
 
+- **Run resource share 65% -> 50%** (`docker-compose.yml`,
+  `src/utils/device.py`, `src/utils/parallel.py`). The 65% share (20g,
+  10.4 cores, 0.65 of VRAM) still pushed the desktop into swap once the
+  browser, IDE and another project's containers were counted (6 GB of
+  swap in use with the machine idle on 2026-09-06). Every service now
+  takes `16g` / `8` cores plus a soft `cpu_shares: 512`, so the
+  desktop's default weight wins under contention while idle cores stay
+  available to the run; `RUN_RESOURCE_SHARE = 0.5` and
+  `_RANKING_VRAM_SHARE = 0.125` keep ranking kernels short on the shared
+  card. Override per host with `PRISM_MEM_LIMIT` / `PRISM_CPUS`.
+- **`scripts/stamp_item_order.py`** adds the `item_order` digest (S01)
+  to pre-3.0 extractor sidecars without re-extracting, but only when the
+  extraction's own `<stem>_ids.json` record equals the canonical order
+  and the matrix has exactly that many rows; anything else is left
+  unstamped and reported. Fused and projected artifacts are not
+  migrated: regenerate them so they carry `recipe_version` and
+  provenance.
+
 - **Raw features can be gathered per forward from a bounded source
   instead of living in a module buffer (F02; tasks M01–M03).**
   `src/data/feature_source.py` introduces the `FeatureSource` Protocol
