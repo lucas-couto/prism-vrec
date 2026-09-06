@@ -64,6 +64,41 @@ def memory_budget_bytes() -> int:
     return int(_FALLBACK_MEMORY_GB * 1024**3)
 
 
+def available_host_bytes() -> int | None:
+    """Host memory this process can still allocate, or ``None`` when unknown.
+
+    The conservative minimum of the cgroup headroom (limit minus current
+    usage, v2 then v1) and the kernel's ``MemAvailable``; a memory-mapped
+    feature file's page cache counts against the cgroup, which is why
+    the cgroup figure is consulted first.  Pure read, no allocation.
+    Callers admitting a single unavoidable allocation (the evaluator's
+    full score vector) treat ``None`` as "unverifiable": they log and
+    proceed, because there is no smaller alternative to fall back to.
+    """
+    candidates: list[int] = []
+    limit = memory_budget_bytes()
+    usage = _read_int_file(Path("/sys/fs/cgroup/memory.current"))
+    if usage is None:
+        usage = _read_int_file(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+    if usage is not None and limit < _CGROUP_NO_LIMIT_THRESHOLD:
+        candidates.append(max(0, limit - usage))
+    mem_available = _read_meminfo_available()
+    if mem_available is not None:
+        candidates.append(mem_available)
+    return min(candidates) if candidates else None
+
+
+def _read_meminfo_available() -> int | None:
+    """``MemAvailable`` from ``/proc/meminfo`` in bytes, or ``None``."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def available_cpus() -> int:
     """CPU cores THIS process may actually use, honouring the cgroup quota.
 
