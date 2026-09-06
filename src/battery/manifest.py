@@ -16,8 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from src.battery.cells import BatteryCell
+from src.evaluation.persistence import ArtifactIntegrityError, validate_cell_artifact
 from src.evaluation.persistence import cell_key as _artifact_key
-from src.evaluation.persistence import read_cell_artifact
 
 STATES = ("pending", "running", "done", "failed")
 _MANIFEST_VERSION = 1
@@ -85,18 +85,28 @@ class BatteryManifest:
         return counts
 
 
-def is_cell_complete(cell: BatteryCell, results_dir: str | Path) -> bool:
-    """Idempotency: True if the cell's per-user artifact (F) exists + validates."""
+def cell_records_path(cell: BatteryCell, results_dir: str | Path) -> Path:
+    """Canonical per-user records path of *cell* under *results_dir*."""
     key = _artifact_key(cell.dataset, cell.visual_config, cell.recommender, cell.seed)
-    records_path = Path(results_dir) / "per_user" / cell.dataset / f"{key}.csv.gz"
-    meta_path = records_path.with_name(records_path.name.replace(".csv.gz", ".meta.json"))
-    if not (records_path.exists() and meta_path.exists()):
+    return Path(results_dir) / "per_user" / cell.dataset / f"{key}.csv.gz"
+
+
+def is_cell_complete(cell: BatteryCell, results_dir: str | Path) -> bool:
+    """Idempotency: True only if the cell's per-user artifact (F) is a validated generation.
+
+    The completion pointer must exist, match the records payload byte
+    for byte and declare at least one row (E06/E07).  A legacy artifact
+    without a completion block, a torn pair or a missing file is not
+    complete — it is recomputed, never skipped.
+    """
+    records_path = cell_records_path(cell, results_dir)
+    if not records_path.exists():
         return False
     try:
-        _, df = read_cell_artifact(records_path)
-    except Exception:  # noqa: BLE001 — a corrupt/partial artifact is not complete
+        completion = validate_cell_artifact(records_path)
+    except ArtifactIntegrityError:
         return False
-    return not df.empty and {"user_idx", "rank"}.issubset(df.columns)
+    return completion is not None and completion.row_count > 0
 
 
 def project_cost(manifest: BatteryManifest) -> dict:

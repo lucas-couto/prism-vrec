@@ -368,13 +368,23 @@ def evaluation_identity(
 
 
 def _append_cell(df: pd.DataFrame, target_path: Path) -> None:
-    """Append a cell's per-user rows to a battery CSV.
+    """Upsert a cell's per-user rows into a battery CSV (E06).
 
-    The header is written only when the file is first created so the
-    file stays a single valid CSV across many appended cells.
+    The battery CSV is a rebuildable view over the per-cell generations,
+    not a completion authority: rows of the same ``(model_name,
+    embedding_name)`` are replaced, never appended twice, so a repeated
+    evaluation cannot add a second scientific observation.  The whole
+    table is rewritten atomically.
     """
-    header = not target_path.exists()
-    df.to_csv(target_path, mode="a", header=header, index=False)
+    keys = [c for c in ("model_name", "embedding_name") if c in df.columns]
+    if target_path.exists():
+        existing = pd.read_csv(target_path)
+        if keys and all(k in existing.columns for k in keys):
+            incoming = set(map(tuple, df[keys].astype(str).drop_duplicates().to_numpy()))
+            stale = existing[keys].astype(str).apply(tuple, axis=1).isin(incoming)
+            existing = existing[~stale]
+        df = pd.concat([existing, df], ignore_index=True)
+    atomic_write(lambda tmp: df.to_csv(tmp, index=False), target_path)
 
 
 def _evaluate_cell(
@@ -476,7 +486,13 @@ def _evaluate_cell(
             n_items=n_items,
             config_hash=canonical_digest(identity) if identity is not None else None,
         )
-        write_cell_artifact(records, metadata, per_user_out_dir)
+        write_cell_artifact(
+            records,
+            metadata,
+            per_user_out_dir,
+            expected_users=evaluator.test_users,
+            identity_digest=metadata.config_hash,
+        )
     else:
         per_user = evaluator.evaluate_per_user(model, device=device)
 
