@@ -23,6 +23,7 @@ from src.fusions import (
     online_module_for,
     registered_fusion_strategies,
 )
+from src.fusions.strategies import l2_normalize
 
 
 def test_module_output_shape_matches_inputs() -> None:
@@ -216,8 +217,9 @@ def test_load_embedding_json_sidecar_stacks_components(tmp_path: Path) -> None:
     out = load_embedding(sidecar)
 
     assert out.shape == (4, 2, 8)
-    np.testing.assert_array_equal(out[:, 0], e1)
-    np.testing.assert_array_equal(out[:, 1], e2)
+    # ``normalize: true`` is honoured per source before stacking (SDD S02).
+    np.testing.assert_allclose(out[:, 0], l2_normalize(e1), rtol=1e-6)
+    np.testing.assert_allclose(out[:, 1], l2_normalize(e2), rtol=1e-6)
 
 
 def test_load_embedding_rejects_mismatched_components(tmp_path: Path) -> None:
