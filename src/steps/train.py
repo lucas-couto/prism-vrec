@@ -541,9 +541,13 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     # Fairness guard-rail (Task H): no recommender may declare its own
     # protocol budget — the budget is shared per dataset. Fail before
     # training rather than confound the comparison silently.
-    from src.recommenders.hp_budget import assert_uniform_budget
+    from src.recommenders.hp_budget import assert_uniform_budget, resolve_hp_budget
 
     assert_uniform_budget(config)
+    # Resolve every dataset's budget up front so an unsupported selection
+    # metric or a malformed value fails before any cell trains (R03).
+    for dataset_name in config.get("datasets", []):
+        resolve_hp_budget(config, dataset_name)
     # Dimension-parity guard-rail: every recommender draws its dimensions
     # from the shared common.total_dim budget (H1 controls capacity).
     assert_dimension_parity(config)
@@ -988,10 +992,13 @@ def _run_optuna(
     device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
-    n_trials = int(config["hp_search"]["optuna"]["n_trials"])
+    from src.recommenders.hp_budget import resolve_hp_budget
+
+    # The trial count is a per-dataset budget field (hp_budget override).
+    n_trials = {ds: resolve_hp_budget(config, ds)["n_trials"] for ds in config.get("datasets", [])}
 
     cells = _list_cells(condition, config, processed_dir, embeddings_dir)
-    logger.info("Optuna cells to process: %d (n_trials=%d)", len(cells), n_trials)
+    logger.info("Optuna cells to process: %d (n_trials per dataset=%s)", len(cells), n_trials)
 
     # D5: an enabled recommender with zero cells must fail, not vanish.
     counts = {name: 0 for name in _resolve_model_names(config)}
@@ -1177,7 +1184,10 @@ def _train_one_optuna_trial(
         visual_embeddings = load_embedding(embeddings_path)
 
     model_cls = get_recommender_class(cell.model_name)
-    checkpoint_mgr = CheckpointManager()
+    # Resume checkpoints live under the run's ``paths.checkpoints`` so a
+    # seed-isolated config (battery replay, --seeds) gets its own
+    # namespace instead of colliding on the default root (R01).
+    checkpoint_mgr = CheckpointManager(config.get("paths", {}).get("checkpoints") or "checkpoints")
 
     item_categories = None
     if getattr(model_cls, "wants_categories", False):

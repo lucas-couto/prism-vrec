@@ -263,10 +263,9 @@ class TestExecuteCellFixed:
         assert trained[0]["config"]["paths"]["results"] == str(tmp_path / "results") + "_seed7"
         assert len(evaluated) == 1
         assert result["role"] == role
-        assert result["hyperparam_origin"] == {
-            "source": "fixed",
-            "hyperparams": get_fixed_hyperparams("vbpr", cfg),
-            "reference": None,
-            "best_metric": None,
-        }
+        origin = result["hyperparam_origin"]
+        assert origin["source"] == "fixed"
+        assert origin["hyperparams"] == get_fixed_hyperparams("vbpr", cfg)
+        assert origin["reference"] is None and origin["best_metric"] is None
+        assert origin["provenance"]["strategy"] == "fixed"
         assert not (tmp_path / "must").exists()

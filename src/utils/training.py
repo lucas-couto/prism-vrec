@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from src.evaluation.protocol import Evaluator
+from src.recommenders.hp_budget import SELECTION_K_VALUES, resolve_hp_budget
 from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
 from src.utils.atomic_io import atomic_write
@@ -651,16 +652,24 @@ def train_single_run(
     )
 
     run_id = checkpoint_mgr.get_run_id(dataset_name, embedding_name, model_name, hyperparams)
-    epochs = config.get("common", {}).get("epochs", 100)
+    # The selection budget is resolved ONCE per dataset (R03): epochs,
+    # patience, metric and validation user sample come from
+    # ``resolve_hp_budget`` — ``common:`` plus the ``hp_budget[<dataset>]``
+    # override — so every entry path (CLI cell, grid worker, Optuna trial,
+    # battery replay, fold) consumes the same effective values.  The
+    # resolver also refuses a metric the selection evaluator does not
+    # produce, before any model is built.  Batch size and evaluation
+    # cadence are not budget fields and stay in ``common:``.
+    budget = resolve_hp_budget(config, dataset_name)
+    epochs = budget["epochs"]
     batch_size = config.get("common", {}).get("batch_size", 4096)
     # Patience is measured in EPOCHS (the counter advances by
     # eval_every_epochs per evaluation): patience=20 with eval_every=10
-    # stops after 2 consecutive non-improving evaluations.  Default
-    # matches the shipped configs/recommenders.yaml (F10).
-    patience = config.get("common", {}).get("early_stopping_patience", 20)
-    es_metric = config.get("common", {}).get("early_stopping_metric", "ndcg@10")
+    # stops after 2 consecutive non-improving evaluations.
+    patience = budget["early_stopping_patience"]
+    es_metric = budget["early_stopping_metric"]
     eval_every_epochs = config.get("common", {}).get("eval_every_epochs", 10)
-    eval_sample_size = config.get("common", {}).get("eval_sample_size")
+    eval_sample_size = budget["eval_sample_size"]
     base_seed = config.get("seed", 42)
     eval_sample_seed = base_seed
 
@@ -720,7 +729,7 @@ def train_single_run(
         eval_sample_size=eval_sample_size,
         eval_sample_seed=eval_sample_seed,
         tiebreak_seed=base_seed,
-        k_values=[10],
+        k_values=list(SELECTION_K_VALUES),
     )
     trial_best_path = _trial_best_path(
         results_root, dataset_name, model_name, embedding_name, run_id
@@ -779,7 +788,7 @@ def train_single_run(
         train_interactions,
         selection_interactions,
         n_items,
-        k_values=[10],
+        k_values=list(SELECTION_K_VALUES),
         sample_size=eval_sample_size,
         sample_seed=eval_sample_seed,
         tiebreak_seed=base_seed,
