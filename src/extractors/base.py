@@ -9,6 +9,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from src.extractors.components import pool_components
+from src.extractors.resume import progress_payload, resume_state, stream_identity
 from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast
 from src.utils.atomic_io import atomic_np_save, atomic_write
@@ -72,34 +73,19 @@ def _dataset_len(dataloader) -> int:
     return len(dataset)
 
 
-def _resume_state(part_path: Path, progress_path: Path, n_total: int):
-    """Reopen a part file + progress sidecar; restart clean when they don't match."""
-    if not (part_path.exists() and progress_path.exists()):
-        part_path.unlink(missing_ok=True)
-        progress_path.unlink(missing_ok=True)
-        return None, 0, 0, []
-    try:
-        progress = json.loads(progress_path.read_text(encoding="utf-8"))
-        candidate = np.lib.format.open_memmap(part_path, mode="r+")
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
-        logger.warning("Corrupt extraction checkpoint %s (%s); restarting", part_path, exc)
-        part_path.unlink(missing_ok=True)
-        progress_path.unlink(missing_ok=True)
-        return None, 0, 0, []
-    if candidate.shape[0] != n_total or progress.get("n_total") != n_total:
-        del candidate  # catalogue changed under the part file: restart clean
-        part_path.unlink()
-        progress_path.unlink()
-        return None, 0, 0, []
-    logger.info(
-        "  resume: %d/%d rows already on disk (%s)", progress["rows_done"], n_total, part_path.name
-    )
-    return (
-        candidate,
-        progress["last_batch_index"] + 1,
-        progress["rows_done"],
-        list(progress["item_ids"]),
-    )
+def _check_block_fits(memmap: np.memmap, row: int, feats: np.ndarray, part_path: Path) -> None:
+    """Fail loudly when a batch cannot land in the part file at *row*."""
+    if feats.shape[1:] != memmap.shape[1:]:
+        raise RuntimeError(
+            f"{part_path.name}: batch feature shape {feats.shape[1:]} differs from the part "
+            f"file's {memmap.shape[1:]}; the extractor output changed under a resume."
+        )
+    if row + feats.shape[0] > memmap.shape[0]:
+        raise RuntimeError(
+            f"{part_path.name}: batch would write rows {row}..{row + feats.shape[0]} past "
+            f"the catalogue size {memmap.shape[0]}; the dataloader yields more rows than "
+            "len(dataset)."
+        )
 
 
 def _finalise_array(array: np.ndarray, npy_path: Path) -> None:
@@ -509,44 +495,70 @@ class BaseExtractor(abc.ABC):  # noqa: B024 — template base: subclasses set ba
 
         *batch_factory(start_batch)* returns the batch iterator resumed at
         *start_batch* (see :meth:`_iter_batches`).
+
+        Resume semantics (see :mod:`src.extractors.resume`): the progress
+        sidecar is written only after the rows it counts are flushed, so
+        ``rows_done`` is a durable prefix; a resume validates the ordered
+        inputs, the extraction recipe, dtype and shape before reusing the
+        part file, rewinds to the last batch boundary of the *current*
+        batch size, and finalises a complete-but-unrenamed part file
+        instead of extracting batch zero again.
         """
         n_total = _dataset_len(dataloader)
         part_path = Path(f"{checkpoint_path}.part.npy")
         progress_path = Path(f"{checkpoint_path}.progress.json")
         part_path.parent.mkdir(parents=True, exist_ok=True)
+        identity = stream_identity(
+            dataloader,
+            self.metadata(),
+            n_total=n_total,
+            dtype=dtype,
+            kind="components" if len(empty_shape) == 3 else "pooled",
+            component_grid=self.component_grid,
+        )
+        point = resume_state(part_path, progress_path, identity)
+        memmap, row, all_item_ids = point.memmap, point.row, point.item_ids
 
-        memmap, start_batch, row, all_item_ids = _resume_state(part_path, progress_path, n_total)
-
-        def _save_progress(last_batch_index: int) -> None:
+        def _save_progress(last_batch_index: int, shape: tuple, *, complete: bool = False) -> None:
             payload = json.dumps(
-                {
-                    "last_batch_index": last_batch_index,
-                    "rows_done": row,
-                    "n_total": n_total,
-                    "item_ids": all_item_ids,
-                }
+                progress_payload(
+                    identity,
+                    last_batch_index=last_batch_index,
+                    rows_done=row,
+                    item_ids=all_item_ids,
+                    shape=shape,
+                    complete=complete,
+                )
             )
             atomic_write(
                 lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"),
                 progress_path,
             )
 
-        for batch_idx, feats, ids in batch_factory(start_batch):
-            if memmap is None:
-                memmap = np.lib.format.open_memmap(
-                    part_path, mode="w+", dtype=dtype, shape=(n_total, *feats.shape[1:])
-                )
-            memmap[row : row + feats.shape[0]] = feats
-            row += feats.shape[0]
-            all_item_ids.extend(ids)
-            if (batch_idx + 1) % save_every == 0:
-                memmap.flush()
-                _save_progress(batch_idx)
+        if not point.complete:
+            for batch_idx, feats, ids in batch_factory(point.start_batch):
+                if memmap is None:
+                    memmap = np.lib.format.open_memmap(
+                        part_path, mode="w+", dtype=dtype, shape=(n_total, *feats.shape[1:])
+                    )
+                _check_block_fits(memmap, row, feats, part_path)
+                memmap[row : row + feats.shape[0]] = feats
+                row += feats.shape[0]
+                all_item_ids.extend(ids)
+                if (batch_idx + 1) % save_every == 0:
+                    memmap.flush()
+                    _save_progress(batch_idx, memmap.shape)
 
         if memmap is None:
             return np.empty(empty_shape, dtype=dtype), all_item_ids
+        if row != n_total or len(all_item_ids) != n_total:
+            raise RuntimeError(
+                f"{part_path.name}: the dataloader yielded {row} rows / {len(all_item_ids)} ids "
+                f"for a catalogue of {n_total} items; the matrix is incomplete and is NOT "
+                "marked complete (rows are never fabricated)."
+            )
         memmap.flush()
-        _save_progress(-1)
+        _save_progress(-1, memmap.shape, complete=True)
         del memmap  # release the write mapping before reopening read-only
         return np.load(part_path, mmap_mode="r"), all_item_ids
 

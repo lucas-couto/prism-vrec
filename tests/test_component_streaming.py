@@ -28,6 +28,8 @@ class _IdDataset(Dataset):
 
     def __init__(self, n: int) -> None:
         self.n = n
+        # Ordered ids let the streaming resume verify input identity.
+        self.item_ids = list(range(n))
 
     def __len__(self) -> int:
         return self.n
