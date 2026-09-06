@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from src.utils.checkpoint import BestCheckpointError
 from src.utils.training import (
     _promote_trial_best,
     _save_best_model,
@@ -172,21 +173,50 @@ class TestTrialLocalPromotion:
 
         assert _load_best(tmp_path)["best_metric"] == 0.9
 
-    def test_promotion_without_trial_file_is_a_warned_noop(self, tmp_path: Path) -> None:
-        log = _SilentLog()
-
-        _promote_trial_best(
-            self._trial_path(tmp_path),
-            best_metric=0.5,
-            dataset_name="ds",
-            model_name="vbpr",
-            embedding_name="emb",
-            results_root=tmp_path,
-            log=log,
-        )
+    def test_promotion_without_trial_file_raises(self, tmp_path: Path) -> None:
+        # I01/I02: a best value with no usable file is a failure, never a
+        # warned no-op that lets the cell vanish from the evaluation.
+        with pytest.raises(BestCheckpointError, match="does not exist"):
+            _promote_trial_best(
+                self._trial_path(tmp_path),
+                best_metric=0.5,
+                dataset_name="ds",
+                model_name="vbpr",
+                embedding_name="emb",
+                results_root=tmp_path,
+                log=_SilentLog(),
+            )
 
         assert not _best_path(tmp_path).exists()
-        assert log.warnings
+
+    def test_promotion_rejects_metric_disagreeing_with_run(self, tmp_path: Path) -> None:
+        trial_path = self._write_trial(tmp_path, 0.7)
+
+        with pytest.raises(BestCheckpointError, match="best_metric"):
+            _promote_trial_best(
+                trial_path,
+                best_metric=0.9,
+                dataset_name="ds",
+                model_name="vbpr",
+                embedding_name="emb",
+                results_root=tmp_path,
+                log=_SilentLog(),
+            )
+
+    def test_promotion_rejects_foreign_fingerprint(self, tmp_path: Path) -> None:
+        trial_path = self._write_trial(tmp_path, 0.7)
+
+        with pytest.raises(BestCheckpointError, match="fingerprint"):
+            _promote_trial_best(
+                trial_path,
+                best_metric=0.7,
+                dataset_name="ds",
+                model_name="vbpr",
+                embedding_name="emb",
+                results_root=tmp_path,
+                log=_SilentLog(),
+                expected_fingerprint=_fingerprint(tiebreak_seed=7),
+            )
 
     def test_trial_files_are_invisible_to_best_pt_globs(self, tmp_path: Path) -> None:
         # export_best / evaluate discover checkpoints via ``*_best.pt``.

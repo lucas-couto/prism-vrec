@@ -64,7 +64,10 @@ def test_evaluate_cell_passes_train_only_history_to_history_model(tmp_path, monk
             return pd.DataFrame({"user_id": [0], "ndcg@10": [0.5]})
 
     monkeypatch.setattr(ev, "get_recommender_spec", lambda name: _FakeSpec())
-    monkeypatch.setattr(ev.torch, "load", lambda *a, **k: {"model_state": {}, "hyperparams": {}})
+    # I02: the winner is loaded through the validating reader.
+    monkeypatch.setattr(
+        ev, "load_best_checkpoint", lambda *a, **k: {"model_state": {}, "hyperparams": {}}
+    )
 
     train_only = {0: {1, 2}, 1: {3}}
     result = _evaluate_cell(

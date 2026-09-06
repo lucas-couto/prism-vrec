@@ -15,7 +15,6 @@ import json
 from pathlib import Path
 
 import pandas as pd
-import torch
 
 from src.evaluation.protocol import Evaluator
 from src.recommenders.registry import (
@@ -27,6 +26,7 @@ from src.utils.artifact_names import (
     is_finetuned_artifact,
     parse_checkpoint_stem,
 )
+from src.utils.checkpoint import load_best_checkpoint
 from src.utils.config import load_config
 from src.utils.device import cap_process_vram, resolve_device
 from src.utils.logging import get_logger
@@ -293,14 +293,14 @@ def _evaluate_cell(
 
         visual_emb = load_embedding(emb_path)
 
-    saved = torch.load(model_info["path"], map_location=device, weights_only=False)
-    if isinstance(saved, dict) and "model_state" in saved:
-        state_dict = saved["model_state"]
-        model_config = {**saved["hyperparams"]}
-    else:
-        state_dict = saved
-        model_config = {"latent_dim": 64, "l2_reg": 0.0001}
-        logger.warning("    Legacy checkpoint (no hyperparams): %s", model_info["path"])
+    # I02: a cell is evaluable only from a loadable, complete winner.  An
+    # absent / truncated / legacy flat checkpoint raises
+    # ``BestCheckpointError`` here instead of being skipped or guessed
+    # (the old fallback fabricated ``latent_dim=64``), so the cell fails
+    # loudly rather than disappearing from the expected set.
+    saved = load_best_checkpoint(model_info["path"], map_location=device)
+    state_dict = saved["model_state"]
+    model_config = {**saved["hyperparams"]}
     # Same seeded history subsample (ACF) the training run used.
     model_config["history_seed"] = seed
 
