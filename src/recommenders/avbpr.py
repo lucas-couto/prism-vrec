@@ -83,7 +83,7 @@ class AVBPR(LinearVisualScoreMixin, BaseRecommender):
         kv: int = config.get("visual_dim", k)
         att_hidden: int = config["att_hidden"]
 
-        if self.visual_features is None:
+        if not self.has_visual_features:
             raise RuntimeError("AVBPR requires visual embeddings")
         dv: int = self.visual_dim_raw
 
@@ -133,12 +133,12 @@ class AVBPR(LinearVisualScoreMixin, BaseRecommender):
         the gate's output depends on trainable parameters.
         """
 
-        def _attend(ids: torch.Tensor) -> torch.Tensor:
-            theta_i = self.visual_projection(self._resolve_visual(ids))
+        def _attend(f: torch.Tensor, _ids: torch.Tensor) -> torch.Tensor:
+            theta_i = self.visual_projection(f)
             a_i = torch.softmax(self.attention_net(theta_i), dim=-1)
             return theta_i * a_i
 
-        return self._full_catalog_cache(item_ids, _attend)
+        return self._full_catalog_cache(item_ids, lambda ids: self._map_visual(ids, _attend))
 
     def _item_visual_bias(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Visual bias ``beta'^T f_i`` of shape ``(B,)``.
@@ -150,7 +150,7 @@ class AVBPR(LinearVisualScoreMixin, BaseRecommender):
         eligible = self._full_catalog_lookup(item_ids)
         if eligible and self._item_visual_bias_cache is not None:
             return self._item_visual_bias_cache
-        result = self._resolve_visual(item_ids) @ self.visual_bias
+        result = self._map_visual(item_ids, lambda f, _ids: f @ self.visual_bias)
         if eligible:
             self._item_visual_bias_cache = result
         return result

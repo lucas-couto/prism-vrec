@@ -86,7 +86,7 @@ class ACF(BaseRecommender):
             n_users, n_items, visual_embeddings, config, train_interactions=train_interactions
         )
 
-        if self.visual_features is None or self.visual_features.dim() != 3:
+        if self.visual_shape is None or len(self.visual_shape) != 3:
             raise RuntimeError("ACF requires 3-D component embeddings (n_items, M, D).")
         if train_interactions is None:
             raise RuntimeError("ACF requires train_interactions to build the user history.")
@@ -97,7 +97,7 @@ class ACF(BaseRecommender):
         raw_max = config.get("max_history", 50)
         self.max_history: int | None = None if raw_max is None else int(raw_max)
         self.history_seed = int(config.get("history_seed", 42))
-        self.n_components = int(self.visual_features.shape[1])
+        self.n_components = int(self.visual_shape[1])
         dv: int = self.visual_dim_raw
 
         self.user_embedding = nn.Embedding(n_users, k)  # U
@@ -116,9 +116,11 @@ class ACF(BaseRecommender):
 
         self._build_history(train_interactions)
         self._comp_cache: torch.Tensor | None = None
+        self._comp_cache_key: tuple | None = None
 
     def train(self, mode: bool = True) -> ACF:
         self._comp_cache = None
+        self._comp_cache_key = None
         return super().train(mode)
 
     # ------------------------------------------------------------------ history
@@ -202,18 +204,71 @@ class ACF(BaseRecommender):
         return terms
 
     # -------------------------------------------------------------------- scoring
+    #: Byte limit of the optional eval-mode catalogue projection cache
+    #: (SDD M03).  Dense features: 1 GiB keeps the historical behaviour
+    #: for every battery catalogue (amazon_women, 347 591 items x 4
+    #: components x kv=128 x fp32 = 712 MB); a larger ``N x M x kv``
+    #: projects the needed history rows per batch instead.
+    DERIVED_CACHE_MAX_BYTES: int = 1 << 30
+    #: The same limit under a lazy (constrained) source.  ``0``: never
+    #: hold a derived full-catalogue tensor; project per history block.
+    #: The admission layer (M05) may raise it against a measured budget.
+    LAZY_DERIVED_CACHE_MAX_BYTES: int = 0
+
     def _projected_components(self, item_ids: torch.Tensor) -> torch.Tensor:
         """``W_c f`` for the given items: ``(..., M, kv)``.
 
-        In eval mode the catalogue projection is computed once and
-        cached (invalidated by :meth:`train`) so successive history
-        lookups only index it.
+        Training projects the gathered rows.  Evaluation uses the
+        bounded catalogue cache when :meth:`_catalogue_projection`
+        admits one, otherwise it also projects on demand.  A lazy source
+        projects the batch's *unique* items in blocks and scatters the
+        result back, so the device never stages more raw rows than
+        :attr:`_LAZY_ITEM_BLOCK`; repeated ids (padded history slots, an
+        item shared by several users) reproduce the dense rows exactly.
         """
-        if self.training:
+        if not self.training:
+            cache = self._catalogue_projection()
+            if cache is not None:
+                return cache[item_ids]
+        if not self.is_lazy_visual:
             return self.comp_projection(self.visual_features[item_ids].float())
-        if self._comp_cache is None:
-            self._comp_cache = self._project_catalogue()
-        return self._comp_cache[item_ids]
+        flat = item_ids.reshape(-1)
+        unique, inverse = torch.unique(flat, return_inverse=True)
+        projected = self._map_visual(unique, lambda f, _ids: self.comp_projection(f.float()))
+        return projected[inverse].reshape(*item_ids.shape, *projected.shape[1:])
+
+    def _catalogue_projection(self) -> torch.Tensor | None:
+        """Eval-mode ``W_c f`` over the catalogue, or ``None`` when not admitted.
+
+        The cache is keyed by the raw features' identity, the projection
+        weight's in-place version counter (an optimiser step bumps it,
+        so a stale projection is never reused across parameter updates
+        even without a ``train()`` call) and the device.  It is built
+        only when its size fits the mode's byte limit.
+        """
+        key = (
+            self._visual_generation(),
+            int(self.comp_projection.weight._version),
+            str(self._device()),
+        )
+        if self._comp_cache is not None and self._comp_cache_key == key:
+            return self._comp_cache
+        self._comp_cache = None
+        self._comp_cache_key = None
+        limit = (
+            self.LAZY_DERIVED_CACHE_MAX_BYTES
+            if self.is_lazy_visual
+            else self.DERIVED_CACHE_MAX_BYTES
+        )
+        if self._catalogue_projection_bytes() > limit:
+            return None
+        self._comp_cache = self._project_catalogue()
+        self._comp_cache_key = key
+        return self._comp_cache
+
+    def _catalogue_projection_bytes(self) -> int:
+        """fp32 bytes of ``(n_items, M, kv)``."""
+        return self.n_items * self.n_components * int(self.comp_projection.out_features) * 4
 
     #: Items projected per chunk when the eval cache is built; bounds the
     #: transient fp32 view of the fp16 component buffer.
@@ -221,12 +276,14 @@ class ACF(BaseRecommender):
 
     def _project_catalogue(self) -> torch.Tensor:
         """``W_c f`` for every item, built in chunks: ``(n_items, M, kv)``."""
-        chunks = [
-            self.comp_projection(
-                self.visual_features[start : start + self._CACHE_CHUNK_ITEMS].float()
-            )
-            for start in range(0, self.n_items, self._CACHE_CHUNK_ITEMS)
-        ]
+        chunks = []
+        for start in range(0, self.n_items, self._CACHE_CHUNK_ITEMS):
+            stop = min(start + self._CACHE_CHUNK_ITEMS, self.n_items)
+            if self.is_lazy_visual:
+                rows = self._raw_visual_rows(torch.arange(start, stop, device=self._device()))
+            else:
+                rows = self.visual_features[start:stop]
+            chunks.append(self.comp_projection(rows.float()))
         return torch.cat(chunks, dim=0)
 
     def _augmented_user(self, user_ids: torch.Tensor, gamma_u: torch.Tensor) -> torch.Tensor:
