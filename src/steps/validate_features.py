@@ -32,6 +32,11 @@ logger = get_logger(__name__)
 FEATURE_DTYPE = np.float32
 #: Rows with L2 norm below this are treated as empty (placeholder image).
 NORM_EPS = 1e-8
+#: Rows validated per pass (M06): finiteness masks and norms are computed
+#: per block, so host temporaries scale with the block, not the catalogue.
+BLOCK_ROWS = 65536
+#: Offending rows quoted in an error message.
+_QUOTED_ROWS = 10
 
 #: ``stats["alignment"]`` values: the sidecar's ``item_order`` digest
 #: matched the current ``item2idx`` order, or the artifact carries no
@@ -109,6 +114,7 @@ def validate_matrix(
     expected_rows: int,
     expected_dim: int | None = None,
     eps: float = NORM_EPS,
+    block_rows: int = BLOCK_ROWS,
 ) -> dict:
     """Validate one feature matrix, returning its stats or raising.
 
@@ -116,6 +122,12 @@ def validate_matrix(
     ``i``.  Only the row COUNT is verifiable from the matrix alone; the
     order is proven separately by :func:`verify_item_order` against the
     sidecar's ``item_order`` digest.
+
+    Finiteness and row norms are reduced in blocks of *block_rows* rows
+    (M06): no full-catalogue boolean mask or norm vector is ever
+    allocated, so a memory-mapped matrix is validated with host
+    temporaries bounded by the block.  The returned stats record the
+    block size actually used.
     """
     if matrix.ndim != 2:
         raise FeatureValidationError(f"{label}: expected a 2-D matrix, got shape {matrix.shape}.")
@@ -131,32 +143,24 @@ def validate_matrix(
         )
     if matrix.dtype != FEATURE_DTYPE:
         raise FeatureValidationError(f"{label}: dtype {matrix.dtype} != {np.dtype(FEATURE_DTYPE)}.")
+    if block_rows < 1:
+        raise ValueError(f"block_rows must be >= 1, got {block_rows}")
 
-    finite_rows = np.isfinite(matrix).all(axis=1)
-    if not finite_rows.all():
-        bad = np.where(~finite_rows)[0]
-        raise FeatureValidationError(
-            f"{label}: {bad.size} row(s) contain NaN/Inf, e.g. item_idx {bad[:10].tolist()}."
-        )
-
-    norms = np.linalg.norm(matrix, axis=1)
-    zero_rows = np.where(norms < eps)[0]
-    if zero_rows.size:
-        raise FeatureValidationError(
-            f"{label}: {zero_rows.size} row(s) with L2 norm < {eps} "
-            f"(zeroed/placeholder), e.g. item_idx {zero_rows[:10].tolist()}."
-        )
+    reducer = _NormReducer(eps)
+    n_rows = int(matrix.shape[0])
+    for start in range(0, n_rows, block_rows):
+        reducer.add(np.asarray(matrix[start : start + block_rows]), start)
+    reducer.raise_if_invalid(label)
 
     stats = {
-        "rows": int(matrix.shape[0]),
+        "rows": n_rows,
         "dim": int(matrix.shape[1]),
-        "norm_mean": float(norms.mean()),
-        "norm_std": float(norms.std()),
-        "norm_min": float(norms.min()),
-        "norm_max": float(norms.max()),
+        "block_rows": int(min(block_rows, max(n_rows, 1))),
+        "n_blocks": (n_rows + block_rows - 1) // block_rows,
+        **reducer.stats(),
     }
     logger.info(
-        "%s: OK (rows=%d, dim=%d, norm mean=%.4f std=%.4f min=%.4f max=%.4f)",
+        "%s: OK (rows=%d, dim=%d, norm mean=%.4f std=%.4f min=%.4f max=%.4f, block=%d)",
         label,
         stats["rows"],
         stats["dim"],
@@ -164,8 +168,73 @@ def validate_matrix(
         stats["norm_std"],
         stats["norm_min"],
         stats["norm_max"],
+        stats["block_rows"],
     )
     return stats
+
+
+class _NormReducer:
+    """Incremental finiteness / L2-norm reduction over row blocks."""
+
+    def __init__(self, eps: float) -> None:
+        self._eps = eps
+        self.n_nonfinite = 0
+        self.nonfinite_examples: list[int] = []
+        self.n_zero = 0
+        self.zero_examples: list[int] = []
+        self._count = 0
+        self._sum = 0.0
+        self._sumsq = 0.0
+        self._min = float("inf")
+        self._max = float("-inf")
+
+    def add(self, block: np.ndarray, offset: int) -> None:
+        finite = np.isfinite(block).all(axis=1)
+        if not finite.all():
+            bad = np.flatnonzero(~finite)
+            self.n_nonfinite += int(bad.size)
+            self._quote(self.nonfinite_examples, bad, offset)
+        norms = np.linalg.norm(block, axis=1).astype(np.float64)
+        zero = np.flatnonzero(norms < self._eps)
+        if zero.size:
+            self.n_zero += int(zero.size)
+            self._quote(self.zero_examples, zero, offset)
+        if norms.size:
+            self._count += int(norms.size)
+            self._sum += float(norms.sum())
+            self._sumsq += float(np.square(norms).sum())
+            self._min = min(self._min, float(norms.min()))
+            self._max = max(self._max, float(norms.max()))
+
+    @staticmethod
+    def _quote(examples: list[int], rows: np.ndarray, offset: int) -> None:
+        room = _QUOTED_ROWS - len(examples)
+        if room > 0:
+            examples.extend(int(r) + offset for r in rows[:room])
+
+    def raise_if_invalid(self, label: str) -> None:
+        if self.n_nonfinite:
+            raise FeatureValidationError(
+                f"{label}: {self.n_nonfinite} row(s) contain NaN/Inf, e.g. item_idx "
+                f"{self.nonfinite_examples}."
+            )
+        if self.n_zero:
+            raise FeatureValidationError(
+                f"{label}: {self.n_zero} row(s) with L2 norm < {self._eps} "
+                f"(zeroed/placeholder), e.g. item_idx {self.zero_examples}."
+            )
+
+    def stats(self) -> dict:
+        if self._count == 0:
+            return {"norm_mean": 0.0, "norm_std": 0.0, "norm_min": 0.0, "norm_max": 0.0}
+        mean = self._sum / self._count
+        variance = max(0.0, self._sumsq / self._count - mean * mean)
+        return {
+            "norm_mean": float(mean),
+            "norm_std": float(variance**0.5),
+            "norm_min": float(self._min),
+            "norm_max": float(self._max),
+        }
 
 
 def validate_backbone_feature(
@@ -187,7 +256,8 @@ def validate_backbone_feature(
     if not path.exists():
         raise FeatureValidationError(f"{label}: feature file missing at {path}.")
     item_ids = _item_order(processed_dir, dataset)
-    matrix = np.load(path)
+    # Memory-mapped: the blocked reducer touches one block at a time.
+    matrix = np.load(path, mmap_mode="r")
     stats = validate_matrix(
         matrix,
         label=label,
@@ -216,7 +286,7 @@ def validate_fused_feature(
     if not path.exists():
         raise FeatureValidationError(f"{label}: fused feature missing at {path}.")
     item_ids = _item_order(processed_dir, dataset)
-    matrix = np.load(path)
+    matrix = np.load(path, mmap_mode="r")
     stats = validate_matrix(
         matrix,
         label=label,

@@ -68,6 +68,13 @@ _PROGRESS_LOG_S = 30.0
 #: not running any job.
 _NO_ASSIGNMENT = -1
 
+#: Host bytes assumed per worker when the caller cannot estimate the
+#: footprint (M06): the interpreter + torch stack + CUDA context of a
+#: worker (``_WORKER_BASE_BYTES`` in the train step) plus room for one
+#: modest dataset.  An unknown footprint is never treated as free -- the
+#: pool used to be sized from VRAM alone, i.e. against infinite host RAM.
+UNKNOWN_WORKER_FOOTPRINT_BYTES = 2 * 1024**3
+
 #: Terminal outcome statuses (C03).
 OUTCOME_SUCCEEDED = "succeeded"
 OUTCOME_FAILED = "failed"
@@ -397,9 +404,12 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
     host RAM (``spawn`` shares nothing), so a pool sized purely from
     VRAM can exhaust system memory instead.  When *per_worker_bytes* is
     given, the host-memory budget lowers the count accordingly; the
-    default of ``0`` means "unknown", which preserves the VRAM-only
-    behaviour for callers that cannot estimate the footprint.
+    default of ``0`` means "unknown", which is charged the conservative
+    :data:`UNKNOWN_WORKER_FOOTPRINT_BYTES` per worker (M06) instead of
+    being read as "no host memory needed".
     """
+    if per_worker_bytes <= 0:
+        per_worker_bytes = UNKNOWN_WORKER_FOOTPRINT_BYTES
     if device == "cpu" or not torch.cuda.is_available():
         cpu_cap = max(1, available_cpus() - 1)
         return plan_pool_workers(
