@@ -736,14 +736,17 @@ def main(argv: list[str] | None = None) -> None:
         from src.folds.runner import run_folds
 
         cfg = load_config()
-        run_folds(cfg, cfg["paths"]["results"])
+        _require_complete(run_folds(cfg, cfg["paths"]["results"]), label="K-fold run")
         return
     if args.battery:
         from src.battery.execute import execute_cell
         from src.battery.runner import run_battery
 
         cfg = load_config()
-        run_battery(cfg, cfg["paths"]["results"], execute_cell, retry_failed=args.retry_failed)
+        manifest = run_battery(
+            cfg, cfg["paths"]["results"], execute_cell, retry_failed=args.retry_failed
+        )
+        _require_complete(manifest, label="battery")
         return
     if args.report:
         from src.utils.report import write_report
@@ -805,6 +808,61 @@ def main(argv: list[str] | None = None) -> None:
         _run_multi_seed(seeds, config, steps, condition, run_both)
     else:
         _run_single(config, steps, condition, run_both)
+
+
+class IncompleteRunError(RuntimeError):
+    """A battery / K-fold manifest still holds cells that did not finish.
+
+    The runners return their manifest even when cells failed; without
+    this check ``main.py`` exited zero on a battery with failed cells
+    (audit F04).  The manifest itself is untouched, so ``--battery
+    --retry-failed`` resumes exactly the cells listed here.
+    """
+
+
+def _require_complete(manifest: Any, *, label: str) -> None:
+    """Raise :class:`IncompleteRunError` unless every cell is ``done``."""
+    summary = manifest.summary()
+    unfinished = {state: n for state, n in summary.items() if state != "done" and n > 0}
+    if not unfinished:
+        return
+    breakdown = ", ".join(f"{n} {state}" for state, n in sorted(unfinished.items()))
+    raise IncompleteRunError(
+        f"{label} finished with unfinished cells ({breakdown}); "
+        f"{summary.get('done', 0)} done. See the manifest for the cell list."
+    )
+
+
+def run_cli(argv: list[str] | None = None) -> int:
+    """Run :func:`main` and translate its outcome into a process exit code.
+
+    ``0`` on success, the code carried by ``SystemExit``, ``130`` on
+    ``KeyboardInterrupt`` and ``1`` for any other exception -- which is
+    logged with its traceback so a step failure that already updated
+    the run manifest (see :func:`_run_single`) is never mistaken for a
+    clean finish.  This is the boundary tests exercise in-process.
+    """
+    try:
+        main(argv)
+    except SystemExit as exc:
+        return _exit_code(exc.code)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user.")
+        return 130
+    except Exception:  # noqa: BLE001 — the boundary must yield a code, not a traceback
+        logger.error("Pipeline failed.", exc_info=True)
+        return 1
+    return 0
+
+
+def _exit_code(code: object) -> int:
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    # ``sys.exit("message")`` prints the message and exits 1.
+    print(code, file=sys.stderr)
+    return 1
 
 
 def _run_single(
@@ -965,17 +1023,19 @@ def _format_duration(seconds: float) -> str:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    _code = run_cli(sys.argv[1:])
     # Workaround: PyTorch / Optuna can leave background threads alive
     # after the pipeline finishes (CPython does not always reap them
     # at shutdown), which leaves the user staring at a frozen prompt
     # for several seconds.  All durable outputs (manifest, CSVs,
     # checkpoints) are fsynced through atomic renames during the run,
-    # so an immediate process exit is safe.
+    # so an immediate process exit is safe.  The code is the one
+    # ``run_cli`` derived: a failed step exits non-zero even though the
+    # exception was consumed to reach this cleanup.
     import gc
     import multiprocessing
 
     gc.collect()
     for _child in multiprocessing.active_children():
         _child.terminate()
-    os._exit(0)
+    os._exit(_code)
