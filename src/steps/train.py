@@ -60,6 +60,8 @@ from src.utils.identity import (
     SELECTION_SPLITS,
     DataIdentity,
     IdentityError,
+    build_identity_context,
+    canonical_digest,
     resolve_data_identity,
 )
 from src.utils.logging import get_logger
@@ -495,11 +497,13 @@ def build_job_list(
     for cell in _iter_cells(condition, config, processed_dir, embeddings_dir, model_names):
         experiment_key = f"{cell.dataset_name}_{cell.embedding_name}_{cell.model_name}"
         completed = checkpoint_mgr.load_grid_search_progress(experiment_key)
-        completed_hashes = {json.dumps(c["hyperparams"], sort_keys=True) for c in completed}
         data_identity = _cell_data_identity(identities, cell, processed_dir)
+        context = build_identity_context(data_identity, condition=condition)
+        completed_digests = _completed_identity_digests(completed, experiment_key)
 
         for hp in get_hyperparam_grid(cell.model_name, config):
-            if json.dumps(hp, sort_keys=True) in completed_hashes:
+            digest = _job_identity_digest(cell, hp, config, context)
+            if digest in completed_digests:
                 continue
 
             jobs.append(
@@ -519,6 +523,69 @@ def build_job_list(
             )
 
     return jobs
+
+
+def _completed_identity_digests(completed: list[dict], experiment_key: str) -> set[str]:
+    """Identity digests of the grid entries that may be reused (E04, Q13).
+
+    A grid-progress entry is reusable only when it carries the identity
+    digest of the run that produced it; entries written before the field
+    existed match nothing — they are legacy, identified explicitly, and
+    the configuration is trained again rather than assumed complete.
+    """
+    digests = {str(c["identity_digest"]) for c in completed if c.get("identity_digest")}
+    n_legacy = len(completed) - len(digests)
+    if n_legacy:
+        logger.warning(
+            "%s: %d grid-progress entr%s carry no identity digest (legacy); not reused.",
+            experiment_key,
+            n_legacy,
+            "y" if n_legacy == 1 else "ies",
+        )
+    return digests
+
+
+def _job_identity_digest(cell: _Cell, hyperparams: dict, config: dict, context: dict) -> str:
+    """Digest of the C02 identity a job with *hyperparams* will train under."""
+    from src.recommenders import get_recommender_class
+    from src.utils.training import resolve_training_identity
+
+    return canonical_digest(
+        resolve_training_identity(
+            model_cls=get_recommender_class(cell.model_name),
+            model_name=cell.model_name,
+            dataset_name=cell.dataset_name,
+            embedding_name=cell.embedding_name,
+            hyperparams=hyperparams,
+            config=config,
+            identity_context=context,
+        )
+    )
+
+
+def identity_context_for(
+    processed_dir: str,
+    dataset_name: str,
+    embedding_name: str,
+    embeddings_path: str | None,
+    *,
+    fold: dict | None = None,
+) -> dict:
+    """Identity context of one training call (Optuna trial, replay, fold).
+
+    Resolves the data identity through the process-level digest cache;
+    unreadable inputs leave it unresolved (warned), never guessed.
+    """
+    from src.utils.identity import condition_of
+
+    try:
+        data = resolve_data_identity(
+            processed_dir, dataset_name, embeddings_path, splits=SELECTION_SPLITS
+        )
+    except IdentityError as exc:
+        logger.warning("%s/%s: data identity unresolved (%s).", dataset_name, embedding_name, exc)
+        data = None
+    return build_identity_context(data, condition=condition_of(embedding_name), fold=fold)
 
 
 def _cell_data_identity(
@@ -605,11 +672,10 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
         processed_dir=config["paths"]["data_processed"],
     )
 
-    startup_mgr = CheckpointManager()
-    removed = startup_mgr.clear_all_training_checkpoints()
-    if removed > 0:
-        logger.info("Cleared %d stale training checkpoint(s) at startup", removed)
-
+    # No global cleanup of ``checkpoints/training/`` here (E04): a resume
+    # envelope belongs to the run whose identity it carries, and
+    # ``train_single_run`` validates that identity before reuse.  Deleting
+    # every file at startup destroyed another run's resumable state.
     strategy = get_strategy(config)
     logger.info("Hyperparameter-search strategy: %s", strategy)
 
@@ -1251,6 +1317,9 @@ def _train_one_optuna_trial(
         optuna_trial=trial,
         item_categories=item_categories,
         ranking_budget_bytes=ranking_budget_bytes,
+        identity_context=identity_context_for(
+            processed_dir, cell.dataset_name, cell.embedding_name, embeddings_path
+        ),
     )
 
 

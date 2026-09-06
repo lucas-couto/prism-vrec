@@ -562,7 +562,8 @@ class _WorkerContext:
     def run(self, job: TrainingJob) -> float:
         """Train *job* and return its best validation metric."""
         from src.recommenders import get_recommender_class
-        from src.utils.training import train_single_run
+        from src.utils.identity import build_identity_context, canonical_digest, condition_of
+        from src.utils.training import resolve_training_identity, train_single_run
 
         torch.cuda.empty_cache()
         model_cls = get_recommender_class(job.model_name)
@@ -571,6 +572,22 @@ class _WorkerContext:
             job.dataset_name,
         )
         visual_emb = self._load_embeddings(job.embeddings_path)
+        # The parent resolved the data identity once per cell; the worker
+        # binds its checkpoints and grid progress to the same digests.
+        identity_context = build_identity_context(
+            job.data_identity, condition=condition_of(job.embedding_name)
+        )
+        identity_digest = canonical_digest(
+            resolve_training_identity(
+                model_cls=model_cls,
+                model_name=job.model_name,
+                dataset_name=job.dataset_name,
+                embedding_name=job.embedding_name,
+                hyperparams=job.hyperparams,
+                config=self._config,
+                identity_context=identity_context,
+            )
+        )
 
         best_val = train_single_run(
             model_cls=model_cls,
@@ -588,6 +605,7 @@ class _WorkerContext:
             device=job.device,
             item_categories=item_cats,
             ranking_budget_bytes=self._ranking_budget(job),
+            identity_context=identity_context,
         )
 
         experiment_key = f"{job.dataset_name}_{job.embedding_name}_{job.model_name}"
@@ -597,7 +615,11 @@ class _WorkerContext:
         gs_path = grid_progress_path(self._checkpoint_mgr, experiment_key)
         _locked_append_grid_progress(
             gs_path,
-            {"hyperparams": job.hyperparams, "best_metric": best_val},
+            {
+                "hyperparams": job.hyperparams,
+                "best_metric": best_val,
+                "identity_digest": identity_digest,
+            },
         )
 
         run_id = self._checkpoint_mgr.get_run_id(

@@ -26,9 +26,19 @@ from src.utils.artifact_names import (
     is_finetuned_artifact,
     parse_checkpoint_stem,
 )
+from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import load_best_checkpoint
 from src.utils.config import load_config
 from src.utils.device import cap_process_vram, resolve_device
+from src.utils.identity import (
+    EVALUATION_SPLITS,
+    IdentityError,
+    canonical_digest,
+    experiment_identity,
+    implementation_digest,
+    resolve_data_identity,
+    stream_digest,
+)
 from src.utils.logging import get_logger
 from src.utils.splits import assert_holdout_disjoint
 from src.utils.timing import note_skipped_cell, time_cell
@@ -224,20 +234,137 @@ def _done_path(results_dir: Path, dataset_name: str) -> Path:
     return results_dir / f"{dataset_name}_evaluation_done.csv"
 
 
+_DONE_KEY = ["target", "model_name", "embedding_name"]
+_DONE_BINDING = ["checkpoint_digest", "identity_digest"]
+
+
+def _load_done_index(path: Path) -> dict[tuple[str, str, str], dict]:
+    """Completed triples with the binding they were recorded under (E04).
+
+    Legacy rows (written before the binding columns existed) map to an
+    empty binding and therefore never match a current checkpoint.
+    """
+    if not path.exists():
+        return {}
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    index: dict[tuple[str, str, str], dict] = {}
+    for row in df.to_dict("records"):
+        key = (str(row["target"]), str(row["model_name"]), str(row["embedding_name"]))
+        index[key] = {c: row[c] for c in _DONE_BINDING if row.get(c)}
+    return index
+
+
 def _load_done(path: Path) -> set[tuple[str, str, str]]:
     """Load completed ``(target, model_name, embedding_name)`` triples."""
-    if not path.exists():
-        return set()
-    df = pd.read_csv(path, dtype=str)
-    return {(row.target, row.model_name, row.embedding_name) for row in df.itertuples(index=False)}
+    return set(_load_done_index(path))
 
 
-def _record_done(path: Path, rows: list[tuple[str, str, str]]) -> None:
-    """Append completed ``(target, model_name, embedding_name)`` triples."""
-    header = not path.exists()
-    pd.DataFrame(rows, columns=["target", "model_name", "embedding_name"]).to_csv(
-        path, mode="a", header=header, index=False
+def _record_done(
+    path: Path,
+    rows: list[tuple[str, str, str]],
+    *,
+    bindings: dict[tuple[str, str, str], dict] | None = None,
+) -> None:
+    """Upsert completed triples into the done table, atomically.
+
+    One row per triple (a repeated evaluation replaces its row instead
+    of appending a duplicate); ``bindings`` carries the checkpoint and
+    identity digests the completion is valid for.
+    """
+    index = _load_done_index(path)
+    for key in rows:
+        index[key] = dict((bindings or {}).get(key, {}))
+    table = pd.DataFrame(
+        [
+            {**dict(zip(_DONE_KEY, key, strict=True)), **{c: v.get(c, "") for c in _DONE_BINDING}}
+            for key, v in index.items()
+        ],
+        columns=_DONE_KEY + _DONE_BINDING,
     )
+    atomic_write(lambda tmp: table.to_csv(tmp, index=False), path)
+
+
+def _binding_matches(entry: dict | None, checkpoint_digest: str, identity_digest: str) -> bool:
+    """Whether a done entry was recorded for exactly this winner and identity."""
+    if not entry:
+        return False
+    return (
+        entry.get("checkpoint_digest") == checkpoint_digest
+        and entry.get("identity_digest") == identity_digest
+    )
+
+
+def _checkpoint_digest(path: str) -> str:
+    """Digest of the selected checkpoint's bytes; ``""`` when the file is absent.
+
+    An absent winner can match no recorded completion, so the cell is
+    evaluated and fails loudly in :func:`_evaluate_cell` instead of
+    being skipped as done.
+    """
+    try:
+        return stream_digest(path)
+    except IdentityError:
+        return ""
+
+
+def _embedding_artifact(embeddings_dir: str, dataset_name: str, stem: str) -> Path | None:
+    base = Path(embeddings_dir) / dataset_name
+    for candidate in (base / f"{stem}.npy", base / f"{stem}.json"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def evaluation_identity(
+    config: dict,
+    dataset_name: str,
+    model_info: dict,
+    evaluator: Evaluator,
+    *,
+    processed_dir: str,
+    embeddings_dir: str,
+    checkpoint_digest: str,
+) -> dict:
+    """C02 identity of one final-evaluation cell (E04).
+
+    Binds the dataset, every split (train/val/test), the feature artifact
+    content, the model implementation, the evaluation protocol (candidate
+    set, cutoffs, tie-break seed, protocol version) and the exact bytes
+    of the selected checkpoint.  The checkpoint carries the effective
+    hyperparameters, so they enter through its digest.
+    """
+    from src.evaluation.persistence import EVAL_PROTOCOL_VERSION
+
+    spec = get_recommender_spec(model_info["model_name"])
+    emb_path = None
+    if spec.requires_visual and model_info["embedding_name"] != "none":
+        emb_path = _embedding_artifact(embeddings_dir, dataset_name, model_info["embedding_name"])
+    try:
+        data = resolve_data_identity(
+            processed_dir, dataset_name, emb_path, splits=EVALUATION_SPLITS
+        )
+    except IdentityError as exc:
+        logger.warning("%s/%s: data identity unresolved (%s).", dataset_name, model_info, exc)
+        data = None
+    condition = "finetuned" if is_finetuned_artifact(model_info["embedding_name"]) else "frozen"
+    identity = experiment_identity(
+        data=data,
+        model_name=model_info["model_name"],
+        implementation=implementation_digest(spec.cls),
+        hyperparams={},
+        selection_budget=None,
+        seed=int(config.get("seed", 42)),
+        protocol={
+            "candidates": evaluator.protocol,
+            "k_values": list(evaluator.k_values),
+            "n_negatives": int(evaluator.n_negatives),
+            "tiebreak_seed": int(config.get("seed", 42)),
+            "eval_protocol_version": EVAL_PROTOCOL_VERSION,
+        },
+        condition=condition,
+    )
+    identity["checkpoint_digest"] = checkpoint_digest
+    return identity
 
 
 def _append_cell(df: pd.DataFrame, target_path: Path) -> None:
@@ -261,12 +388,16 @@ def _evaluate_cell(
     train_interactions: dict[int, set[int]] | None = None,
     per_user_out_dir: str | None = None,
     seed: int = 42,
+    *,
+    identity: dict | None = None,
 ) -> pd.DataFrame | None:
     """Load a cell's best checkpoint and return its per-user metrics.
 
     Returns ``None`` (skip) when the recommender is unknown or its
     embedding cannot be resolved — same semantics as the previous inline
-    logic.
+    logic.  ``identity`` (see :func:`evaluation_identity`) is recorded in
+    the per-user artifact's ``config_hash`` so the artifact says which
+    data, protocol and checkpoint bytes produced it.
     """
     try:
         spec = get_recommender_spec(model_info["model_name"])
@@ -343,6 +474,7 @@ def _evaluate_cell(
             split="test",
             n_users=n_users,
             n_items=n_items,
+            config_hash=canonical_digest(identity) if identity is not None else None,
         )
         write_cell_artifact(records, metadata, per_user_out_dir)
     else:
@@ -404,7 +536,7 @@ def run(condition: str = "frozen") -> None:
         evaluator = build_evaluator(config, seen_inter, test_inter, n_items)
 
         done_path = _done_path(results_dir, dataset_name)
-        done = _load_done(done_path)
+        done = _load_done_index(done_path)
         best_models = find_best_models(dataset_name, results_dir=results_root)
         # The models directory accumulates checkpoints across runs; only
         # cells the CURRENT config would train are evaluated (same
@@ -423,7 +555,35 @@ def run(condition: str = "frozen") -> None:
             mn = model_info["model_name"]
             en = model_info["embedding_name"]
             targets = _route_targets(mn, en)
-            pending = [t for t in targets if (t, mn, en) not in done]
+            # Reuse is bound to the exact checkpoint bytes and the
+            # evaluation identity (E04, Q13): a completion recorded for
+            # another winner, split, feature content, seed or protocol
+            # — or a legacy row without a binding — is not a completion.
+            checkpoint_digest = _checkpoint_digest(model_info["path"])
+            identity = evaluation_identity(
+                config,
+                dataset_name,
+                model_info,
+                evaluator,
+                processed_dir=processed_dir,
+                embeddings_dir=embeddings_dir,
+                checkpoint_digest=checkpoint_digest,
+            )
+            identity_digest = canonical_digest(identity)
+            pending = [
+                t
+                for t in targets
+                if not _binding_matches(done.get((t, mn, en)), checkpoint_digest, identity_digest)
+            ]
+            stale = [t for t in pending if (t, mn, en) in done]
+            if stale:
+                logger.warning(
+                    "  %s/%s: completion for %s does not match the current "
+                    "checkpoint/identity (or is legacy); re-evaluating.",
+                    mn,
+                    en,
+                    stale,
+                )
             if not pending:
                 logger.info("  %s/%s: already done, skipping.", mn, en)
                 note_skipped_cell()
@@ -442,6 +602,7 @@ def run(condition: str = "frozen") -> None:
                     train_interactions=train_only_inter,
                     per_user_out_dir=str(results_root),
                     seed=int(config.get("seed", 42)),
+                    identity=identity,
                 )
             if per_user is None:
                 continue
@@ -454,7 +615,9 @@ def run(condition: str = "frozen") -> None:
                     results_dir / f"{dataset_name}_evaluation_{target}.csv",
                 )
                 recorded.append((target, mn, en))
-            _record_done(done_path, recorded)
+            binding = {"checkpoint_digest": checkpoint_digest, "identity_digest": identity_digest}
+            _record_done(done_path, recorded, bindings=dict.fromkeys(recorded, binding))
+            done.update(dict.fromkeys(recorded, binding))
 
         for target in ("frozen", "finetuned"):
             _write_mean_table(results_dir, dataset_name, target)
