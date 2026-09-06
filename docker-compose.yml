@@ -68,18 +68,24 @@ services:
     # sizing heuristics (src/utils/memory.py, src/utils/dataloader.py)
     # read a real budget rather than the host's total RAM.
     #
-    # ONE budget, applied to every resource: a run may take 65% of the
+    # ONE budget, applied to every resource: a run may take half of the
     # machine, never more (RUN_RESOURCE_SHARE in src/utils/device.py caps
     # VRAM at the same fraction).  These are caps for the RUN, not for
-    # the WORKSTATION: the remaining third is what lets the researcher
-    # keep working across a battery that spans days.  20g and 10.4 cores
-    # are 65% of a 32 GB / 16-core host; override per host, e.g. on a
-    # 128 GB lab server:  PRISM_MEM_LIMIT=83g PRISM_CPUS=41 docker compose up -d
+    # the WORKSTATION: the other half is what lets the researcher keep
+    # working across a battery that spans days.  16g and 8 cores are 50%
+    # of a 32 GB / 16-core host; override per host, e.g. on a 128 GB lab
+    # server:  PRISM_MEM_LIMIT=64g PRISM_CPUS=32 docker compose up -d
+    # The 2026-09 65% share (20g / 10.4 cores) still left the desktop
+    # swapping once the browser, IDE and other containers were counted.
+    # cpu_shares is a *soft* weight (cgroup v2 cpu.weight): under
+    # contention the desktop's default weight (1024) wins over the run,
+    # while idle cores stay available to it.
     # memswap_limit equal to mem_limit disables swap for the container,
     # so hitting the cap kills one worker instead of thrashing the disk.
-    mem_limit: ${PRISM_MEM_LIMIT:-20g}
-    memswap_limit: ${PRISM_MEM_LIMIT:-20g}
-    cpus: ${PRISM_CPUS:-10.4}
+    mem_limit: ${PRISM_MEM_LIMIT:-16g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-16g}
+    cpus: ${PRISM_CPUS:-8}
+    cpu_shares: 512
     # Allocate a pseudo-TTY so tqdm renders live in-place progress bars
     # (download, image extraction, feature extraction, evaluation,
     # training). Follow them with a raw stream — ``docker logs -f
@@ -132,9 +138,10 @@ services:
         trap 'rm -f "$$OVERRIDE"' EXIT
         python main.py --from download --to preprocess
     shm_size: "2g"
-    mem_limit: ${PRISM_MEM_LIMIT:-20g}
-    memswap_limit: ${PRISM_MEM_LIMIT:-20g}
-    cpus: ${PRISM_CPUS:-10.4}
+    mem_limit: ${PRISM_MEM_LIMIT:-16g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-16g}
+    cpus: ${PRISM_CPUS:-8}
+    cpu_shares: 512
 
   shell:
     build: .
@@ -184,6 +191,7 @@ services:
     stdin_open: true
     tty: true
     shm_size: "4g"
-    mem_limit: ${PRISM_MEM_LIMIT:-20g}
-    memswap_limit: ${PRISM_MEM_LIMIT:-20g}
-    cpus: ${PRISM_CPUS:-10.4}
+    mem_limit: ${PRISM_MEM_LIMIT:-16g}
+    memswap_limit: ${PRISM_MEM_LIMIT:-16g}
+    cpus: ${PRISM_CPUS:-8}
+    cpu_shares: 512

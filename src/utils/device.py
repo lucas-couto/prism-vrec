@@ -59,8 +59,10 @@ def resolve_device(requested: str) -> str:
 #: keeps the workstation usable across a multi-day battery.  Chosen by
 #: the researcher on 2026-09-04, deliberately over throughput -- an
 #: uncapped run froze the machine and, on 2026-09-01, tripped the
-#: display driver's watchdog.
-RUN_RESOURCE_SHARE = 0.65
+#: display driver's watchdog.  Lowered from 0.65 to 0.5 on 2026-09-06:
+#: with the browser, IDE and another project's containers on the same
+#: host, the 65% run share still pushed the desktop into swap.
+RUN_RESOURCE_SHARE = 0.5
 
 #: VRAM cap for a process that has the card to itself.
 SOLO_PROCESS_VRAM_FRACTION = RUN_RESOURCE_SHARE

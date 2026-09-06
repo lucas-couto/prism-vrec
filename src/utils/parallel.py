@@ -44,8 +44,10 @@ logger = get_logger(__name__)
 #: the display driver's watchdog).  A quarter halves the user-batch, so
 #: the same work arrives as more, shorter kernels.  Cost: a few percent
 #: of validation time.  Metrics are unaffected -- the batch size is how
-#: the ranking is computed, not what it computes.
-_RANKING_VRAM_SHARE = 0.25
+#: the ranking is computed, not what it computes.  An eighth (2026-09-06)
+#: halves the kernel length again so the compositor keeps its slice
+#: while the card is shared with the desktop.
+_RANKING_VRAM_SHARE = 0.125
 
 #: Factor the ranking budget is multiplied by per OOM retry.  Halving
 #: halves the user-batch, which is what actually overflowed: the ranking
