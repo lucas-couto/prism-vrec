@@ -8,6 +8,19 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scripts/stamp_item_order.py` wrote the digest where nothing reads
+  it.** Its first version merged the `item_order` block's keys
+  (`schema_version`, `n_items`, `digest`) into the top level of
+  `<stem>.meta.json` instead of nesting them, so `validate_features`
+  kept reporting every extractor artifact as "alignment unverified"
+  and each sidecar carried three stray keys. The block is now nested,
+  the stray keys are removed on re-run, and the run's own validator is
+  exercised in `tests/test_stamp_item_order.py`. Feature identity is
+  unaffected: `feature_recipe` hashes the `.npy` header and content,
+  not the sidecar.
+
 ## [3.0.0rc1] - 2026-09-06
 
 **Release candidate.** This version carries the 27 tasks of the
