@@ -16,7 +16,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from src.battery.cells import BatteryCell, enumerate_cells
-from src.battery.manifest import BatteryManifest, is_cell_complete, project_cost
+from src.battery.manifest import (
+    BatteryManifest,
+    artifact_binding,
+    done_entry_valid,
+    present_artifact_binding,
+    project_cost,
+)
 from src.utils import telemetry
 from src.utils.logging import get_logger
 
@@ -72,7 +78,12 @@ def run_battery(
     finally:
         telemetry.stop()
 
-    logger.info("Battery run finished: %s", manifest.summary())
+    summary = manifest.summary()
+    unfinished = {k: v for k, v in summary.items() if k != "done" and v}
+    if unfinished:
+        logger.error("Battery run INCOMPLETE: %s", summary)
+    else:
+        logger.info("Battery run finished: %s", summary)
     return manifest
 
 
@@ -85,13 +96,25 @@ def _run_cells(
     retry_failed: bool,
     git: dict,
 ) -> None:
-    """Execute every not-yet-done cell, recording state as it goes."""
+    """Execute every not-yet-done cell, recording state as it goes.
+
+    A ``done`` entry counts only while its recorded artifact binding still
+    validates on disk (E07); otherwise the cell goes back to ``pending``
+    with the reason and runs again.  An artifact that validates and names
+    the cell is adopted as ``done`` even without a manifest entry.
+    """
     for cell in cells:
         key = cell.key()
         state = manifest.state_of(key)
-        if state == "done" or is_cell_complete(cell, results_dir):
-            if state != "done":
-                manifest.set_state(key, "done", note="artifact already present")
+        if state == "done":
+            valid, reason = done_entry_valid(manifest.cells.get(key, {}), cell, results_dir)
+            if valid:
+                continue
+            logger.warning("%s: done entry no longer valid (%s); re-running.", key, reason)
+            manifest.set_state(key, "pending", note=f"done entry invalid: {reason}")
+            manifest.save()
+        elif (binding := present_artifact_binding(cell, results_dir)) is not None:
+            manifest.set_state(key, "done", note="artifact already present", artifact=binding)
             continue
         if state == "failed" and not retry_failed:
             logger.info("Skipping failed cell (pass retry_failed=True to retry): %s", key)
@@ -103,12 +126,18 @@ def _run_cells(
         marker = telemetry.mark()
         try:
             extra = execute(cell, config) or {}
+            binding = artifact_binding(cell, results_dir)
+            if binding is None:
+                raise RuntimeError(
+                    "executor returned without a validated per-user artifact for the cell"
+                )
             manifest.set_state(
                 key,
                 "done",
                 duration_seconds=round(time.perf_counter() - started, 3),
                 telemetry=telemetry.summarise_since(marker),
                 error=None,
+                artifact=binding,
                 **extra,
             )
         except Exception as exc:  # noqa: BLE001 — isolate per-cell failures
