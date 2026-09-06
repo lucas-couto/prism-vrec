@@ -51,6 +51,12 @@ from src.fusions.streaming import (
 )
 from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
+from src.utils.identity import (
+    check_provenance,
+    feature_recipe,
+    fit_set_digest,
+    write_provenance,
+)
 from src.utils.logging import get_logger
 from src.utils.memory import available_cpus, plan_pool_workers
 from src.utils.splits import train_item_indices
@@ -166,6 +172,50 @@ def _plan_fusion_workers(pending: list[dict]) -> int:
     )
 
 
+def task_provenance(task: dict) -> dict:
+    """Ingredients a fusion output is reused against (E05).
+
+    Source content (recursive recipe of every input, in order), the
+    strategy and its keyword arguments, the normalisation flag, the
+    alignment declared by an online sidecar and the fit-set digest for
+    the PCA strategies.  Output paths and worker layout are excluded.
+    """
+    reserved = {
+        "strategy_name",
+        "output_path",
+        "emb_list_paths",
+        "normalize",
+        "train_items",
+        "sidecar_payload",
+        "provenance",
+    }
+    kwargs = {k: v for k, v in task.items() if k not in reserved}
+    sidecar = task.get("sidecar_payload")
+    return {
+        "kind": "fusion",
+        "strategy": task["strategy_name"],
+        "normalize": bool(task["normalize"]),
+        "kwargs": kwargs,
+        "sources": [feature_recipe(p) for p in task["emb_list_paths"]],
+        "fit_set_digest": fit_set_digest(task.get("train_items")),
+        "sidecar": {k: v for k, v in sidecar.items() if k != "components"} if sidecar else None,
+    }
+
+
+def _reusable(task: dict) -> bool:
+    """Whether the task's output exists AND was built from these ingredients.
+
+    A missing output is not reusable; a matching provenance record is;
+    a legacy output without a record is reused unverified (warned); a
+    differing record raises :class:`ArtifactProvenanceError`.
+    """
+    out = Path(task["output_path"])
+    if not out.exists():
+        return False
+    check_provenance(out, task["provenance"], label=str(out))
+    return True
+
+
 def _fuse_single(
     strategy_name: str,
     output_path: str,
@@ -173,19 +223,25 @@ def _fuse_single(
     normalize: bool,
     train_items: list[int] | None = None,
     sidecar_payload: dict | None = None,
+    provenance: dict | None = None,
     **kwargs,
 ) -> str | None:
     """Execute a single fusion and save the result. Pickled by ProcessPool.
 
     When ``sidecar_payload`` is given, no offline fusion runs — the JSON
     sidecar is written for the training step to build the online module
-    (learned alignment or adaptive_gated).
+    (learned alignment or adaptive_gated).  ``provenance`` (see
+    :func:`task_provenance`) is written next to the output BEFORE the
+    output itself, so an artifact on disk always has the record of its
+    ingredients or is recognisably legacy.
     """
     out = Path(output_path)
     if out.exists():
         return None
 
     out.parent.mkdir(parents=True, exist_ok=True)
+    if provenance is not None:
+        write_provenance(out, provenance)
 
     if sidecar_payload is not None:
         payload = json.dumps(sidecar_payload, indent=2)
@@ -234,12 +290,19 @@ def _ensure_pca_aligned_sources(
         return None
 
     aligned_paths = [dataset_dir / f"{ext}{suffix}_pcaD{dim}.npy" for ext in extractors]
-    if all(p.exists() for p in aligned_paths):
-        return aligned_paths
-
     # Streamed one source at a time: loading every native matrix at once
     # put several GB in the *parent* process before any worker started.
     for native, path in zip(native_paths, aligned_paths, strict=True):
+        expected = {
+            "kind": "pca_align",
+            "source": feature_recipe(native),
+            "dim": int(dim),
+            "fit_set_digest": fit_set_digest(train_items),
+        }
+        if path.exists():
+            check_provenance(path, expected, label=str(path))
+            continue
+        write_provenance(path, expected)
         shape = stream_pca_align(native, path, dim, np.asarray(train_items))
         logger.info("  pca-aligned source written: %s %s", path.name, shape)
     return aligned_paths
@@ -579,7 +642,12 @@ def run(condition: str = "frozen") -> None:
             )
             all_tasks.extend(tasks)
 
-    pending = [t for t in all_tasks if not Path(t["output_path"]).exists()]
+    for task in all_tasks:
+        task["provenance"] = task_provenance(task)
+    # Reuse requires the output AND a matching provenance record (E05):
+    # a fusion built from other source content, fit set, recipe or
+    # normalisation must not pass as this run's artifact.
+    pending = [t for t in all_tasks if not _reusable(t)]
     skipped = len(all_tasks) - len(pending)
     if skipped:
         logger.info("Skipping %d already existing fusions.", skipped)

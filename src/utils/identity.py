@@ -410,3 +410,110 @@ def condition_of(embedding_name: str) -> str:
     from src.utils.artifact_names import is_finetuned_artifact
 
     return "finetuned" if is_finetuned_artifact(embedding_name) else "frozen"
+
+
+# ---------------------------------------------------------------------
+# Derived-artifact provenance (E05)
+# ---------------------------------------------------------------------
+
+#: Schema version of the ``<artifact>.provenance.json`` sidecar.
+PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_VERIFIED = "verified"
+PROVENANCE_LEGACY = "legacy"
+
+
+class ArtifactProvenanceError(RuntimeError):
+    """A derived artifact on disk was built from other ingredients than requested.
+
+    Raised instead of reusing the artifact: the source content, the fit
+    set, the recipe, the dimensions or the seed differ from what the
+    current configuration would produce.  The file is never deleted;
+    the caller (or the researcher) decides what to do with it.
+    """
+
+
+def provenance_path(artifact: str | Path) -> Path:
+    """Sidecar path recording how *artifact* was derived."""
+    artifact = Path(artifact)
+    return artifact.with_name(f"{artifact.name}.provenance.json")
+
+
+def fit_set_digest(train_items: Sequence[int] | np.ndarray | None) -> str | None:
+    """Digest of the (sorted, de-duplicated) fit-set item indices; ``None`` for none."""
+    if train_items is None:
+        return None
+    ordered = np.unique(np.asarray(train_items, dtype=np.int64))
+    return hashlib.sha256(ordered.tobytes()).hexdigest()
+
+
+def write_provenance(artifact: str | Path, payload: Mapping[str, Any]) -> Path:
+    """Write the provenance sidecar of *artifact* atomically; return its path.
+
+    Written BEFORE the artifact itself: a sidecar without its artifact
+    is harmless (the artifact is recomputed), whereas an artifact without
+    a sidecar could only be trusted as legacy.
+    """
+    from src.utils.atomic_io import atomic_write
+
+    path = provenance_path(artifact)
+    record = {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "artifact": Path(artifact).name,
+        **_normalize(dict(payload), "$"),
+    }
+    record["digest"] = canonical_digest(payload)
+    text = json.dumps(record, indent=2, sort_keys=True)
+    atomic_write(lambda tmp: Path(tmp).write_text(text, encoding="utf-8"), path)
+    return path
+
+
+def read_provenance(artifact: str | Path) -> dict[str, Any] | None:
+    """The provenance record of *artifact*, or ``None`` when it has none (legacy)."""
+    path = provenance_path(artifact)
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ArtifactProvenanceError(f"{path}: unreadable provenance sidecar ({exc}).") from exc
+    if not isinstance(record, dict) or record.get("schema_version") != PROVENANCE_SCHEMA_VERSION:
+        raise ArtifactProvenanceError(
+            f"{path}: unsupported provenance schema {record.get('schema_version')!r}."
+        )
+    return record
+
+
+def check_provenance(artifact: str | Path, expected: Mapping[str, Any], *, label: str) -> str:
+    """Decide whether an existing *artifact* may be reused for *expected*.
+
+    :returns: :data:`PROVENANCE_VERIFIED` when the recorded ingredients
+        equal *expected*, or :data:`PROVENANCE_LEGACY` (with a warning)
+        when the artifact predates provenance recording — its
+        ingredients are unknown and it is reused *unverified*, never
+        relabelled as verified.
+    :raises ArtifactProvenanceError: When a record exists and any
+        ingredient differs (the differing keys are named).
+    """
+    from src.utils.logging import get_logger
+
+    record = read_provenance(artifact)
+    if record is None:
+        get_logger(__name__).warning(
+            "%s: reused UNVERIFIED — no provenance sidecar (legacy artifact); its source "
+            "content, fit set, recipe and seed cannot be checked. Rebuild to verify.",
+            label,
+        )
+        return PROVENANCE_LEGACY
+    if record.get("digest") == canonical_digest(expected):
+        return PROVENANCE_VERIFIED
+    wanted = _normalize(dict(expected), "$")
+    differing = sorted(
+        key
+        for key in set(wanted) | (set(record) - {"schema_version", "artifact", "digest"})
+        if wanted.get(key) != record.get(key)
+    )
+    raise ArtifactProvenanceError(
+        f"{label}: the artifact on disk was built from different ingredients "
+        f"(differs in {differing}); refusing to reuse it. Move it aside or delete "
+        "it deliberately to rebuild."
+    )
