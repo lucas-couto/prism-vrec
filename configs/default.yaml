@@ -125,15 +125,27 @@ telemetry:
   # results/runs/<run_id>/telemetry_samples.jsonl for plotting.
   save_samples: true
 
-# Opt-in bounded training diagnostics (SDD S04; src/utils/diagnostics.py).
+# =============================================================================
+# Opt-in bounded training diagnostics (task record S04;
+# src/utils/diagnostics.py)
+# =============================================================================
 # Off by default and inert when off.  When enabled, every training run
 # records — at initialisation, at the listed optimizer steps and at each
 # validation — a detached summary on a fixed seeded probe (feature norm
-# quantiles, pre-ReLU branch statistics for models that expose them,
-# score spread / ties, loss components, gradient and parameter-delta
-# norms, optimizer steps applied, zero-metric flag, checkpoint existence)
-# to ``<output_dir>/<run_id>.json``.  Measurements run under a forked RNG
-# on detached copies: the training trajectory is the same on or off.
+# quantiles per source and fused, pre-ReLU branch statistics for models
+# that expose them (VNPR), score spread / unique fraction / tie
+# fractions, loss components, gradient and parameter-delta norms,
+# optimizer steps attempted / applied / skipped, and per validation the
+# metric value, zero-metric flag, tie frequency and checkpoint
+# existence as SEPARATE fields) to ``<output_dir>/<run_id>.json``
+# (schema_version 1, written once at the end of the run, also for a
+# failed trial).  Measurements run under a forked RNG on detached
+# copies: the training trajectory is bit-identical on or off (tested).
+# The probe never scales with the catalogue: probe_users users with at
+# least one training interaction, probe_items items, probe_pairs fixed
+# item pairs, drawn from probe_seed.  `steps` are the optimizer-step
+# indices at which a record is taken (init and every validation are
+# always recorded).  Consumed by scripts/vnpr_collapse_diagnostic.py.
 diagnostics:
   enabled: false
   probe_users: 64
@@ -142,6 +154,38 @@ diagnostics:
   probe_seed: 0
   steps: [1, 10, 100, 1000]
   output_dir: "results/diagnostics"
+
+# =============================================================================
+# Host memory budget and feature residency (optional; 3.0.0, task
+# records M05/M06; src/utils/memory.py::resolve_resources)
+# =============================================================================
+# KEY NAMES ARE PROVISIONAL (contract proposal C06, pending approval).
+# The block is optional and every key is optional; ABSENT means the
+# conservative behaviour described next to each key — never "unlimited".
+# Training jobs are admitted against `host_budget − headroom` with a
+# per-job ledger (worker base + feature payload from the .npy headers,
+# a sidecar counting the sum of its components + model, gradient and
+# Adam state + interaction dicts + the CPU ranking workspace); a job
+# that does not fit is recorded as failed (AdmissionRefused) and never
+# launched, and the pool is sized so the aggregate commitment fits.
+# The ledger is ANALYTIC: no peak has been measured on a real catalogue
+# and no minimum RAM/VRAM is advertised (task V02 open).
+# Negative, non-finite, boolean or unknown values fail at resolution.
+#
+# resources:
+#   host_budget_bytes: null     # explicit budget in bytes; null = cgroup v2
+#                               # -> cgroup v1 -> host RAM -> 4 GiB fallback
+#   headroom_bytes: 4294967296  # withheld from every pool for the parent,
+#                               # page cache and transfer buffers (4 GiB)
+#   max_workers: null           # hard cap on concurrent workers; 0 admits
+#                               # nothing; null leaves the CPU/VRAM caps
+#   feature_residency: dense    # dense | lazy | auto — auto gathers rows
+#                               # per forward (FeatureSource) only when the
+#                               # dense payload exceeds half the usable
+#                               # budget; dense keeps today's resident
+#                               # matrices (default: lazy residency is
+#                               # numerically identical by test but its
+#                               # page-cache behaviour is unmeasured)
 
 # =============================================================================
 # DataLoader sizing (optional)

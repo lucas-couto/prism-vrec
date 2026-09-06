@@ -5,6 +5,14 @@ explicitly, in the order a reviewer would ask about them. Each item is
 implemented in code (pointers included) and must be restated in the
 dissertation's methodology chapter.
 
+Evidence index: every reliability change made for 3.0.0 has a task
+record under `docs/reliability-sdd/` (defect, reproduction, files,
+verification table, limits). Where this document says "verified", the
+record is the evidence; where it says "unmeasured" or "unresolved", no
+record claims otherwise. All of that verification ran on CPU in the
+container; GPU/AMP paths and real-catalogue resource peaks are not
+certified by 3.0.0rc1 (see `CHANGELOG.md`).
+
 ## 1. Native dimensionality at extraction; learned projection `E` in the recommender
 
 Comparing backbones is only valid if the backbone is the sole variable.
@@ -152,6 +160,24 @@ user's own test item stays in the candidate set and competes as an
 ordinary item; this is neutral across models and leaks nothing to the
 model (the model never sees which items are held out).
 
+**Selection rule (3.0.0, task records I01/R03).** The selection
+cut-off is the single declaration `SELECTION_K_VALUES = (10,)`
+(`src/recommenders/hp_budget.py`); a selection metric the training
+evaluator does not produce (`UnsupportedSelectionMetricError`) fails
+before any model or data is built. The **first finite validation
+observation is the winner even when it is exactly 0.0**; afterwards
+only strict improvement replaces it, ties keep the earlier winner and
+advance patience. A missing, non-scalar or non-finite selection metric
+raises `SelectionMetricError` and leaves no winner and no success
+marker — a legitimate zero result and an invalid one are never
+confused, and a zero cell is evaluated and reported like any other
+(before 3.0.0 an all-zero run wrote no `_best.pt` and vanished from
+the battery). The per-dataset budget (`hp_budget.<dataset>`: epochs,
+patience, metric, validation sample, trial count) is consumed
+identically by every training path — CLI cell, grid worker, Optuna
+trial, battery replay and folds — while `eval_every_epochs` and
+`batch_size` stay shared.
+
 **Training-time validation subsample (`common.eval_sample_size = 2000`).**
 Selection scores a fixed subset of 2000 **validation** users instead of
 all of them. The subset is drawn once per dataset, deterministically
@@ -223,6 +249,47 @@ users as the partition unit:
 - Folds and seeds are distinct variance sources: the manifest states that
   the reported between-fold variability is combined (partition +
   optimisation). The multi-seed robustness experiment stays separate.
+- **Fold plan digest (3.0.0, task record E07).** `fold_plan_digest`
+  (`src/folds/runner.py`) hashes `k`, the partition seed, `min_profile`,
+  the exact user→fold assignment and the train/val/test split and
+  item-mapping digests; it is the concatenated artifact's
+  `config_hash` (previously `None`) and flows into the partial
+  artifacts. A fold cell is complete only when its artifact validates
+  (payload digest, row count) and carries this digest with `fold.k`
+  and `fold.seeds == [seed + i]`; changing `folds.k`, the partition
+  seed or the split re-runs every cell. Each fold's training carries
+  `fold={index, k, partition_seed, min_profile}` in its scientific
+  identity, so its resume envelope and winner are bound to the fold.
+
+## 3c. Scientific identity (v2) versus execution metadata
+
+Every reuse decision of 3.0.0 — skipping a completed grid point,
+comparing two trial winners, accepting an evaluate completion, resuming
+a training envelope — is bound to a canonical **scientific identity**
+(`src/utils/identity.py`, schema version 2; task records E03/E04):
+
+| Field | Content |
+|---|---|
+| `dataset_digest`, `item_mapping_digest`, `split_digest` | SHA-256 of the interaction files, of `item2idx.json` by numeric index (insertion order irrelevant) and of the train/val(/test) splits in use |
+| `feature_digest` | content digest of the visual artifact plus, for a sidecar, the recipe (strategy, alignment, dim, normalisation, `recipe_version`) and the recipe of every component, in order |
+| `model_name`, `implementation_digest` | registered name and a digest of the recommender's source |
+| `effective_hyperparams` | the canonical expanded configuration (`effective_hyperparams`, §10.6): dimensions split from `total_dim`, single-valued defaults filled |
+| `selection_budget` | epochs, batch size, patience, cadence, metric, validation sample size and sample seed |
+| `seed`, `protocol`, `condition`, `fold` | training seed; full-ranking, K, mask policy and tie-break seed; frozen/finetuned; fold identity when applicable |
+
+The identity is the SHA-256 of the canonical JSON of that payload
+(sorted keys, compact separators, finite numbers only, strict
+bool/int/float distinction). Selection identity uses train+val splits;
+evaluation identity adds the test split and the streamed digest of the
+exact `_best.pt` evaluated. **Execution metadata is deliberately
+outside the identity**: block and batch sizes used for ranking, worker
+count, device, filesystem roots, the lazy/dense feature residency and
+wall-clock time change how a result is computed, not what it is (the
+lazy path is verified numerically equivalent; ranking layouts are
+verified against a golden fixture). Identical content under another
+root therefore has the same identity; another seed, split, feature
+content, budget or protocol does not, and legacy artifacts without an
+identity are identified as such and never reused as if they matched.
 
 ## 4. Deterministic tie-breaking
 
@@ -328,7 +395,38 @@ size, so the real exact-tie frequency is measured during the battery.
   min/median/max of the Holm-corrected p-value. This reconciliation is
   deliberately descriptive (no Fisher-style p-value combination);
   method-level claims require the verdict AND the sign of the effect
-  to agree across seeds.
+  to agree across seeds. `n_seeds` is the number of DISTINCT seeds
+  (`nunique`), not of rows: a duplicated source file is dropped with a
+  warning and two conflicting rows for one seed raise
+  `ObservationConflictError` (3.0.0, task record R05).
+- **Paired observation validity (3.0.0, task records R04/R05).**
+  Before any test, every per-user frame is validated
+  (`src/evaluation/paired_validation.py`). The observation key is the
+  provenance columns (`dataset, seed, split, protocol,
+  eval_protocol_version, fold_policy, split_digest, generation_id` —
+  each single-valued in a frame), the config identity columns
+  (`visual_input_dim, n_trainable_params, d, checkpoint_digest` —
+  constant within a config) and `(config, user_id)`. Two rows with
+  the same key and different values are a conflict (error); an
+  identical duplicate of a visual cell is a torn append (error); the
+  one accepted duplicate is the shared `bpr/none` baseline appearing in
+  both condition files. Non-finite metric values fail instead of being
+  dropped. **Population policy** (`statistical.population`): `strict`
+  (default) requires every cell of a comparison to cover one shared
+  user population and fails naming the users absent from each side;
+  `declared_intersection` restricts to the intersection explicitly,
+  writes to a separate `_restricted` partition and reports
+  `n_excluded_a` / `n_excluded_b` (Friedman: `n_users_excluded`) on
+  every row. Nothing intersects silently. Outputs are partitioned by
+  condition and policy —
+  `results/tables/{dataset}_{condition}[_restricted]_{summary|friedman|pairwise}_{metric}.csv`
+  — and a `{dataset}_{condition}[_restricted]_integrity.json` is
+  written BEFORE the tests with the seed and distinct-seed count, the
+  shared provenance, the expected / completed / missing cells
+  (reconciled against the evaluate step's completion record) and the
+  excluded cells with their reason; a missing expected cell always
+  fails, so a table over only the successful models is never published
+  as a complete battery.
 
 ## 6. Fusion pipeline (Pipeline B — separate from the 8-extractor Pipeline A)
 
@@ -422,6 +520,26 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   `tests/recommenders/test_vnpr_paper.py::test_adam_training_keeps_rows_outside_the_batch_at_their_initial_norm`.
   Every VNPR checkpoint trained before this change is visual-only and
   must be discarded.
+  **Status after 3.0.0 (task record S04): the collapse is NOT declared
+  fixed.** The BPR-Opt reading removed the whole-matrix mechanism
+  described above, but the 2026-09 battery still finished 55 of 354
+  jobs at `best_metric = 0.0000` with every catalogue item tied —
+  VBPR 0/96, VNPR native 3/112, VNPR × hybrid 52/146 (35.6 %), worst on
+  scale-distorting fusions — and no historical log carries the probes
+  needed to attribute it. 3.0.0 therefore (a) keeps zero cells visible
+  in every table (§3, first-observation rule), (b) ships opt-in
+  training diagnostics (`diagnostics:` in `configs/default.yaml`) and a
+  controlled driver (`scripts/vnpr_collapse_diagnostic.py`: seven
+  visual-input conditions, ≥ 3 seeds, same split/sampler/budget) whose
+  synthetic run observed none of the candidate mechanisms (dead ReLU,
+  skipped optimizer steps, scale, evaluation-only ties, data error),
+  and (c) makes no claim about amazon_women / tradesy until the same
+  probes are recorded there. The paragraph above is the historical
+  finding; the "‖f‖ ≈ 1 flattens the visual term" reading is a
+  hypothesis the synthetic ablation did not support (unit-norm input
+  lowered the metric, not viability). No activation, regularisation or
+  normalisation change is proposed; any such change is a separately
+  versioned experiment.
 - **DeepStyle (paper formulation)**: the item style term is
   `s_i = E·f_i − l_cat(i)` — a linear projection `E` (`D_backbone → d`)
   minus a **learned category embedding** subtracted in the style space,
@@ -491,6 +609,19 @@ fora da amostra, não enviesada pela seleção. Durante a validação, o item
 de teste do usuário permanece no conjunto de candidatos e compete como um
 item qualquer; isso é neutro entre os modelos e nada revela ao modelo.
 
+Regra de seleção (3.0.0): o corte de seleção é K = 10, declarado uma
+única vez no código (`SELECTION_K_VALUES`); uma métrica de seleção que o
+avaliador de treino não produz interrompe a execução antes de qualquer
+treinamento. A **primeira observação finita em validação é a vencedora,
+mesmo quando vale exatamente 0,0**; depois disso, apenas melhora estrita
+a substitui, e empates mantêm a vencedora anterior. Uma métrica ausente,
+não escalar ou não finita é uma falha explícita — não gera vencedora nem
+marcador de sucesso —, de modo que um resultado legitimamente nulo e um
+resultado inválido nunca se confundem, e uma célula com métrica zero é
+avaliada e reportada como qualquer outra. O orçamento por dataset
+(épocas, paciência, métrica, subamostra de validação, número de trials)
+é consumido de forma idêntica por todos os caminhos de treinamento.
+
 ### 10.3. Normalização pré-fusão
 
 Antes de qualquer fusão element-wise, cada fonte é L2-normalizada por
@@ -508,6 +639,23 @@ de fusão, 2026-09-04):
 | Offline nativo | `concat`, `pca`, `pca_per_model` | nas features nativas, antes da operação; a matriz de fit da PCA conjunta também é normalizada |
 | Online aprendido (`alignment.method: learned`) | família equal-dim | depois do `Linear(D_i → dim)` por fonte, antes da operação |
 | Alinhamento por PCA (`alignment.method: pca`) | família equal-dim | a PCA por fonte é ajustada nas features brutas; a normalização é aplicada às fontes já reduzidas |
+| Online não aprendido (`adaptive_gated` sobre fontes de mesma largura — `alignment: pca` ou `alignment: none` com fontes projetadas) | família equal-dim | **por fonte, uma única vez, no carregamento, antes da operação** (`load_embedding`, receita do sidecar versão 2) |
+
+Correção declarada (3.0.0, registro S02): até a 2.12.1 o caminho online
+não aprendido empilhava as fontes como armazenadas e ignorava a flag
+`normalize` do sidecar — era o único caminho desta seção alimentado por
+fontes não normalizadas, exatamente na família aditiva em que a fonte de
+maior norma domina. A partir da 3.0.0 cada fonte é L2-normalizada por
+vetor no carregamento (linhas nulas permanecem nulas), nos caminhos denso
+e preguiçoso, e o sidecar recebe `recipe_version: 2`; um sidecar sem o
+campo é identificado como legado. **Aviso de comparabilidade histórica:
+todo modelo ou resultado treinado a partir de sidecars
+`hybrid_adaptive_gated_*` sob a 2.x (`hybrid_adaptive_gated_pca_*.json`,
+`hybrid_adaptive_gated_p*.json`) não é comparável com resultados
+produzidos pela 3.x e deve ser regenerado em namespace próprio.** As
+células de alinhamento aprendido (`*_learned_D*.json`) e todas as fusões
+offline (`.npy`) não são afetadas. Nenhum ajuste de PCA mudou; apenas o
+consumo das fontes no caminho online.
 
 Consequências declaradas:
 

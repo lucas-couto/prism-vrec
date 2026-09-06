@@ -132,15 +132,16 @@ results/tables/
 ├── {dataset}_evaluation_frozen.csv        # Battery 1 per-user metrics (granular, kept for back-compat)
 ├── {dataset}_evaluation_finetuned.csv     # Battery 2 per-user metrics
 ├── {dataset}_evaluation_combined.csv      # Both batteries merged
-├── {dataset}_summary_{metric}.csv         # Per-model mean + bootstrap CI (granular)
-├── {dataset}_friedman_{metric}.csv        # Friedman omnibus test (granular)
-└── {dataset}_pairwise_{metric}.csv        # Wilcoxon + correction + effect sizes (granular)
+├── {dataset}_{condition}[_restricted]_integrity.json   # Written BEFORE the tests: seeds, provenance, expected/completed/missing/excluded cells
+├── {dataset}_{condition}[_restricted]_summary_{metric}.csv    # Per-model mean + bootstrap CI (granular)
+├── {dataset}_{condition}[_restricted]_friedman_{metric}.csv   # Friedman omnibus test (granular)
+└── {dataset}_{condition}[_restricted]_pairwise_{metric}.csv   # Wilcoxon + correction + effect sizes (granular)
 
 results/best_hyperparams.json              # Winning hyperparams per (dataset, model, embedding)
 results/models/<dataset>/*_best.pt         # Best checkpoint per cell
 ```
 
-The three long-format files at the top consolidate the ~160 granular per-(dataset, test_type, metric, k) CSVs into one row per observation with explicit identifier columns. Use them for thesis-time analysis (`pandas.read_csv` + `df.query`); the granular CSVs are kept for backwards compatibility.
+The three long-format files at the top consolidate the ~160 granular per-(dataset, test_type, metric, k) CSVs into one row per observation with explicit identifier columns. Use them for thesis-time analysis (`pandas.read_csv` + `df.query`); the granular CSVs are kept for backwards compatibility. Since 3.0.0 the granular files are partitioned by `--condition` and by the population policy (`_restricted` only under `statistical.population: declared_intersection`), so a `frozen` run never overwrites a `finetuned` or `all` one; see [§10](#10-evaluation).
 
 ---
 
@@ -209,9 +210,32 @@ pipeline:
   start_from: null # e.g. "train"
   stop_at: null # e.g. "fuse"
   condition: "both" # "frozen", "finetuned" or "both"
+
+# Opt-in bounded training diagnostics (off by default, inert when off):
+# per-run probes of feature norms, pre-ReLU branches, score ties,
+# gradients and optimizer steps under results/diagnostics/<run_id>.json.
+diagnostics:
+  enabled: false
+  probe_users: 64
+  probe_items: 256
+  probe_pairs: 64
+  probe_seed: 0
+  steps: [1, 10, 100, 1000]
+  output_dir: "results/diagnostics"
+
+# Host memory budget and feature residency (optional; key names are
+# PROVISIONAL pending approval).  Absent = cgroup/host budget with a
+# 4 GiB headroom, never unlimited; features stay dense.
+# resources:
+#   host_budget_bytes: null
+#   headroom_bytes: 4294967296
+#   max_workers: null
+#   feature_residency: dense   # dense | lazy | auto
 ```
 
 CLI flags (`--all` / `--step` / `--from` / `--to` / `--condition`) override the YAML when present.
+
+Three blocks were added in 3.0.0 (details in the YAML comments and in `docs/reliability-sdd/`): `diagnostics` (task S04) records bounded, detached probes per training run without changing the trajectory; `resources` (tasks M05/M06) is the host budget the training jobs are admitted against — a job whose analytic memory ledger does not fit is recorded as failed and never launched, and `feature_residency: auto` / `lazy` gathers visual rows per forward from a bounded `FeatureSource` instead of holding the catalogue in a module buffer (numerically identical by test; page-cache residency on real catalogues unmeasured); `statistical.population` lives in `configs/evaluation.yaml` below.
 
 ### `configs/extractors.yaml`
 
@@ -406,6 +430,11 @@ statistical:
     enabled: true
 
   effect_size: true
+
+  # "strict" (default): every compared cell must cover one shared user
+  # population, else the step fails.  "declared_intersection": restrict
+  # explicitly, write the _restricted partition, report n_excluded_*.
+  population: "strict"
 ```
 
 ### Runtime sizing knobs
@@ -684,14 +713,19 @@ Step 07 produces three granular CSVs per dataset and metric, plus three long-for
 
 | Output                            | Method                                           |
 | --------------------------------- | ------------------------------------------------ |
-| `{dataset}_summary_{metric}.csv`  | Bootstrap CI on the per-config mean (descriptive) |
-| `{dataset}_friedman_{metric}.csv` | Friedman omnibus test, one row per comparison-family instance |
-| `{dataset}_pairwise_{metric}.csv` | Wilcoxon signed-rank + within-family correction + Cliff's delta + paired-difference bootstrap CI |
+| `{stem}_integrity.json`           | Written BEFORE any test: seed and distinct-seed count, shared provenance, expected / completed / missing cells (reconciled against the evaluate step's completion record), cells excluded by population with the reason |
+| `{stem}_summary_{metric}.csv`     | Bootstrap CI on the per-config mean (descriptive) |
+| `{stem}_friedman_{metric}.csv`    | Friedman omnibus test, one row per comparison-family instance |
+| `{stem}_pairwise_{metric}.csv`    | Wilcoxon signed-rank + within-family correction + Cliff's delta + paired-difference bootstrap CI |
 | `evaluation_aggregated.csv`       | Long-format mean per cell (all datasets/metrics/k) |
 | `bootstrap_ci.csv`                | Long-format bootstrap CI rows                     |
 | `statistical_tests.csv`           | Long-format Friedman + Wilcoxon rows              |
 
-The three long-format files are auto-generated at the end of `statistical.run()` via `src.reporting.write_consolidated` — they collapse the ~160 granular files into one row per observation with explicit `dataset` / `recommender` / `extractor` / `fusion` / `condition` / `metric` / `k` columns, making thesis-time analysis a single `pandas.read_csv` + `df.query`.
+`{stem}` is `{dataset}_{condition}[_restricted]` (3.0.0): outputs are partitioned by the condition the step was asked for and by the population policy, so successive `frozen` / `finetuned` / `all` invocations never overwrite each other; every long-format row carries `report_condition` and `population_policy`. The three long-format files are auto-generated at the end of `statistical.run()` via `src.reporting.write_consolidated` — they collapse the ~160 granular files into one row per observation with explicit `dataset` / `recommender` / `extractor` / `fusion` / `condition` / `metric` / `k` columns, making thesis-time analysis a single `pandas.read_csv` + `df.query`.
+
+#### Paired validation before any test
+
+Every per-user frame is validated before a p-value is computed (`src/evaluation/paired_validation.py`, 3.0.0). An observation is keyed by its provenance (dataset, seed, split, protocol version, split digest, generation) plus config identity plus `(config, user_id)`: two rows with the same key and different values are a conflict and fail; an identical duplicate of a visual cell is a torn append and fails; the only accepted duplicate is the shared `bpr/none` baseline appearing in both condition files. Non-finite metric values fail instead of being dropped. Under `statistical.population: strict` (default) a user missing from one side of a comparison fails the step naming the users; `declared_intersection` restricts explicitly and reports `n_excluded_a` / `n_excluded_b` on every row. Missing expected cells always fail, so a table over only the successful models is never published as a complete battery. Cross-seed aggregates count distinct seeds, not rows.
 
 #### Comparison families
 
@@ -726,9 +760,9 @@ Each method is toggled individually in `configs/evaluation.yaml` -> `statistical
 | Optimisation                    | Where                                        | Effect                                                                                                                           |
 | ------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | Vectorised `VNPR.predict_batch` | `src/recommenders/vnpr.py`                   | Replaces a per-user Python loop with a chunked MLP forward over `(b × N)` pairs. Chunk size is picked from the GPU's VRAM at startup. |
-| Item-feature cache for VNPR     | `src/recommenders/vnpr.py`                   | Caches `[q_i, v_i]` for the full catalogue during evaluation, reused across `predict_batch` calls.                               |
-| GPU top-K in the Evaluator      | `src/evaluation/protocol.py`                 | Masks training items with `index_fill_` on GPU and runs `torch.topk` directly; only `(B, K)` indices cross to CPU.               |
-| Per-user train-mask cache       | `src/evaluation/protocol.py`                 | Builds per-user `LongTensor`s of training-item indices once and reuses across epochs.                                            |
+| Item-feature cache for VNPR     | `src/recommenders/vnpr.py`                   | Dense features: the catalogue "cache" is a zero-copy alias of the resident buffer; lazy sources are scored per item block and never cached (3.0.0). |
+| Chunked, guarded ranking        | `src/evaluation/protocol.py`                 | Scores users in chunks (and items in blocks on allocation failure, retrying the same offset), masks the chunk's training items with one advanced-index assignment on the device, ranks on the host under a checked budget; catalogue ids and per-user masks are host-resident and transferred inside the guard (3.0.0). |
+| Per-user train-mask cache       | `src/evaluation/protocol.py`                 | Builds per-user `np.int64` index arrays once on the host; the `(row, col)` pairs of the current chunk are assembled per chunk.    |
 | Combined pos+neg forward        | `src/recommenders/{vbpr,avbpr,deepstyle}.py` | Single `(2B,)` batched forward through the visual / style / attention path instead of two separate B-sized passes.               |
 | Per-epoch GPU loss accumulation | `src/utils/training.py`                      | Accumulates loss as a GPU tensor; calls `.item()` once per epoch instead of per batch.                                           |
 | Deterministic per-job seed      | `src/utils/training.py`                      | SHA-256 of `(dataset, model, embedding, hyperparams)` produces a reproducible seed per job.                                      |
@@ -754,6 +788,22 @@ The previous `scripts/watchdog.sh` supervisor (RunPod-era operational scaffoldin
 ## 12. Reproducibility
 
 Every grid-search run uses a deterministic per-job seed derived from the job identity (`dataset`, `model`, `embedding`, `hyperparams`) XOR-ed with the global base seed (42 by default; see `_derive_job_seed` in `src/utils/training.py`). CUDA matmul is non-deterministic by default, so numerical drift between runs is about 1e-5 in FP32.
+
+### Scientific identity (v2) and artifact provenance
+
+Since 3.0.0 every reuse decision is bound to a canonical scientific identity (`src/utils/identity.py`, schema 2; `docs/protocol.md` §3c): SHA-256 over canonical JSON of the dataset, item-mapping, split and feature-content digests, the model name and implementation digest, the effective hyperparameters, the selection budget, the seed, the protocol, the condition and the fold. Grid progress entries, trial winners (`_best.pt`), resume envelopes and evaluate completions carry that digest and are reused only on equality; block sizes, worker counts, devices, paths and wall-clock time are execution metadata and deliberately not part of it. Legacy artifacts without an identity are identified as such, never guessed.
+
+Provenance on disk:
+
+- `<artifact>.provenance.json` next to every projected, PCA-aligned and fused feature (`data/embeddings/`): source content digests, fit set, recipe, dims and seed; a mismatch refuses reuse, an absent record is reused with an explicit UNVERIFIED warning.
+- `item_order` block (digest of the row order by numeric index) in every extraction `.meta.json`, checked by `--validate-features` (`alignment: verified` / `unverified`).
+- Per-cell **generations** under `results/per_user/<dataset>/.generations/<cell_key>/`: each publication writes an immutable directory (payload + metadata + manifest, SHA-256 of the payload) and then replaces the canonical `<cell_key>.csv.gz` / `.meta.json` completion pointer atomically; readers validate the pointer against the payload (torn pairs fail) and generations are never pruned automatically.
+- Battery `done` entries bind the validated artifact (digest, generation, row count, identity); fold cells bind the fold-plan digest.
+- Every change and its verification is recorded in `docs/reliability-sdd/` (one task record per task, indexed by its README); `docs/environment.md` records the image inventory and the lock-backed build.
+
+### Reproducing the dissertation
+
+Placeholder — filled at 3.0.0 final, after the battery completes on the release candidate: the exact version and Zenodo version DOI, the command line, and the digest of the run manifest that produced the reported tables.
 
 ### Run manifest
 
@@ -859,7 +909,11 @@ prism-vrec/
 │   └── datasets/_example/        # Dataset scaffold (interactions.csv + images/)
 │                                 # Names starting with _ are never auto-registered
 ├── docs/
-│   └── extending.md              # Full guide for plugin authors
+│   ├── extending.md              # Full guide for plugin authors
+│   ├── protocol.md               # Methodological declarations (pt-BR §10 for the dissertation)
+│   ├── battery_runbook.md        # Launch / resume / failure semantics / test command
+│   ├── environment.md            # Image inventory and lock-backed build (3.0.0)
+│   └── reliability-sdd/          # One task record per reliability change (3.0.0), indexed
 │
 ├── tests/                        # pytest contract suite for plugins + FT checkpoint
 │
@@ -873,6 +927,8 @@ prism-vrec/
 ## 14. Hardware requirements
 
 The same image runs on all three tiers below. `docker compose up -d --build` is the only command the user needs, and the framework auto-detects the host (GPU presence, CPU count, cgroup memory, VRAM) at startup. The resolved values are recorded under `manifest['device']` and `manifest['dataloader_autotune']`.
+
+The tiers are sizing guidance from earlier runs, not certified minimums: no RAM/VRAM profile has been demonstrated end to end with measured peaks (that certification is open, see `CHANGELOG.md` 3.0.0rc1). Since 3.0.0 a job that does not fit the resolved host budget fails clearly before launching instead of being OOM-killed, and a ranking that cannot fit even one item block fails explicitly — a clear unsupported failure, not a guarantee of running on a given profile.
 
 | Tier             | CPU      | RAM     | GPU                          | Disk   | What it is good for                                                                  |
 | ---------------- | -------- | ------- | ---------------------------- | ------ | ------------------------------------------------------------------------------------ |
