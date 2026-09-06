@@ -53,6 +53,8 @@ class TestHyperparamOrigin:
             "hyperparams": {"a": 1},
             "reference": "ds__m__e",
             "best_metric": 0.5,
+            "suggestion": None,
+            "provenance": None,
         }
 
 
@@ -79,7 +81,11 @@ class TestResolveCellHyperparams:
         assert origin.source == "search"
         assert origin.reference == "amazon_fashion__vbpr__resnet50"
         assert origin.best_metric == 0.55
-        assert origin.hyperparams == _WINNERS["amazon_fashion"]["vbpr"]["resnet50"]["hyperparams"]
+        # The recorded winner is completed with the pinned default (l2_reg
+        # is single-valued in the config) through the canonical expansion.
+        recorded = _WINNERS["amazon_fashion"]["vbpr"]["resnet50"]["hyperparams"]
+        assert origin.hyperparams == {**recorded, "l2_reg": 1e-4}
+        assert origin.suggestion == {"total_dim": 128}
 
     def test_missing_winners_file_is_generated_from_best_checkpoints(self, tmp_path) -> None:
         ckpt = tmp_path / "models" / "amazon_fashion" / "vbpr_resnet50_best.pt"
@@ -89,7 +95,7 @@ class TestResolveCellHyperparams:
         origin = _resolve(_SEARCH_CONFIG, tmp_path)
 
         assert origin.source == "search"
-        assert origin.hyperparams == {"latent_dim": 64, "visual_dim": 64}
+        assert origin.hyperparams == {"latent_dim": 64, "visual_dim": 64, "l2_reg": 1e-4}
         assert origin.best_metric == 0.42
         assert origin.reference == "amazon_fashion__vbpr__resnet50"
         on_disk = json.loads((tmp_path / BEST_HYPERPARAMS_FILENAME).read_text())

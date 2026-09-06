@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from itertools import product
 from typing import Any
 
+from src.recommenders.hp_budget import resolve_hp_budget
 from src.recommenders.registry import get_recommender_spec
 
 logger = logging.getLogger(__name__)
@@ -177,7 +178,7 @@ def get_hyperparam_grid(model_name: str, config: dict) -> list[dict]:
     keys = list(params.keys())
     values = [_as_list(params[k]) for k in keys]
     grid = [dict(zip(keys, combo, strict=False)) for combo in product(*values)]
-    return [_expand_total_dim(model_name, hp) for hp in grid]
+    return [effective_hyperparams(model_name, hp, config) for hp in grid]
 
 
 def _declared_hyperparams(model_name: str, config: dict) -> dict:
@@ -235,14 +236,61 @@ def get_fixed_hyperparams(model_name: str, config: dict) -> dict:
             "to strategy 'grid'/'optuna' to search over them."
         )
     single = {k: _as_list(v)[0] for k, v in params.items()}
-    return _expand_total_dim(model_name, single)
+    return effective_hyperparams(model_name, single, config)
 
 
-def _expand_total_dim(model_name: str, hp: dict) -> dict:
-    """Add the model's own dimensions next to ``total_dim`` when present."""
-    if "total_dim" not in hp:
-        return hp
-    return {**hp, **resolve_dimensions(model_name, int(hp["total_dim"]))}
+class EffectiveHyperparamsError(RuntimeError):
+    """A suggestion contradicts the canonical expansion (e.g. a direct dimension)."""
+
+
+def effective_hyperparams(model_name: str, suggestion: dict, config: dict) -> dict:
+    """Canonical expansion of a raw suggestion into the effective configuration.
+
+    The ONE path from what a strategy chose (a grid point, the pinned
+    fixed values, an Optuna ``trial.params``) to what a model is built
+    with, used identically for the initial training, the winner export
+    and every replay (R02):
+
+    1. every declared key the suggestion does not carry and that resolves
+       to exactly one value (a scalar or a one-element list in
+       ``common:`` / the model block) is filled in as a pinned default —
+       a multi-valued key that was never chosen stays absent rather than
+       being fabricated;
+    2. ``total_dim`` is expanded into the model's own dimensions via
+       :func:`resolve_dimensions`.
+
+    The function is idempotent: applying it to an already effective
+    configuration returns it unchanged, so a consumer can always re-apply
+    it without double-expanding.  A direct ``latent_dim`` / ``visual_dim``
+    that disagrees with the budget split is refused, never overridden.
+
+    Raises
+    ------
+    EffectiveHyperparamsError
+        When the suggestion carries a dimension that contradicts the
+        model's split of ``total_dim``.
+    """
+    declared = _declared_hyperparams(model_name, config)
+    effective = dict(suggestion)
+    for key, value in declared.items():
+        if key in effective:
+            continue
+        values = _as_list(value)
+        if len(values) == 1:
+            effective[key] = values[0]
+    if "total_dim" not in effective:
+        return effective
+    derived = resolve_dimensions(model_name, int(effective["total_dim"]))
+    conflicts = {
+        k: (effective[k], v) for k, v in derived.items() if k in effective and effective[k] != v
+    }
+    if conflicts:
+        raise EffectiveHyperparamsError(
+            f"{model_name!r}: suggestion declares {conflicts} (declared, derived) but "
+            f"total_dim={effective['total_dim']} splits into {derived}; dimensions are "
+            "derived from the shared budget and cannot be overridden."
+        )
+    return {**effective, **derived}
 
 
 def _sample_from_space(trial, name: str, entry: dict) -> Any:
@@ -326,7 +374,7 @@ def sample_hyperparams(trial, model_name: str, config: dict) -> dict:
                 trial.suggest_categorical(key, choices) if len(choices) > 1 else choices[0]
             )
 
-    return _expand_total_dim(model_name, sampled)
+    return effective_hyperparams(model_name, sampled, config)
 
 
 def build_sampler(cfg: dict, base_seed: int):
@@ -402,6 +450,47 @@ def create_study(
     )
 
 
+class StudyNotFoundError(RuntimeError):
+    """A consumer asked for a study that the configured storage does not hold."""
+
+
+def load_existing_study(cell: CellKey, config: dict):
+    """Load the study of *cell* from ``hp_search.optuna.storage`` WITHOUT creating it.
+
+    The replay side of the battery must read the primary seed's search,
+    never start one: :func:`create_study` with ``load_if_exists`` would
+    silently open an empty study (and persist it) when the search never
+    ran.  An in-memory configuration (``storage: null``) holds no study a
+    later process could read, so it is refused as well.
+
+    Raises
+    ------
+    StudyNotFoundError
+        When the storage is not persistent or holds no study of that name.
+    """
+    import optuna
+
+    optuna_cfg = config.get("hp_search", {}).get("optuna", {})
+    storage = optuna_cfg.get("storage")
+    name = cell.study_name()
+    if not isinstance(storage, str) or not storage:
+        raise StudyNotFoundError(
+            f"study {name!r} cannot be loaded: hp_search.optuna.storage is not persistent "
+            f"({storage!r}); the primary seed's search must run with a storage URL."
+        )
+    if storage.startswith("sqlite:///"):
+        from pathlib import Path
+
+        if not Path(storage[len("sqlite:///") :]).exists():
+            raise StudyNotFoundError(
+                f"study {name!r} not found: storage {storage!r} does not exist yet."
+            )
+    try:
+        return optuna.load_study(study_name=name, storage=storage)
+    except KeyError as exc:
+        raise StudyNotFoundError(f"study {name!r} not found in storage {storage!r}.") from exc
+
+
 def iter_cells(
     cells: list[CellKey],
     config: dict,
@@ -470,11 +559,13 @@ def _iter_cells_optuna(
     import optuna
 
     optuna_cfg = config.get("hp_search", {}).get("optuna", {})
-    n_trials = optuna_cfg.get("n_trials", 30)
     timeout = optuna_cfg.get("timeout_seconds")
 
     for cell in cells:
         study = create_study(cell, config)
+        # The trial count is part of the per-dataset budget (R03), not a
+        # global Optuna setting: ``hp_budget[<dataset>].n_trials`` wins.
+        n_trials = resolve_hp_budget(config, cell.dataset_name)["n_trials"]
 
         def _objective(trial, _cell=cell):
             hp = sample_hyperparams(trial, _cell.model_name, config)
@@ -502,16 +593,20 @@ __all__ = [
     "STRATEGIES",
     "CellKey",
     "DimensionParityError",
+    "EffectiveHyperparamsError",
     "FixedHyperparamsError",
+    "StudyNotFoundError",
     "assert_dimension_parity",
     "resolve_dimensions",
     "build_pruner",
     "build_sampler",
     "create_study",
+    "effective_hyperparams",
     "get_fixed_hyperparams",
     "get_hyperparam_grid",
     "get_strategy",
     "has_hp_space",
     "iter_cells",
+    "load_existing_study",
     "sample_hyperparams",
 ]
