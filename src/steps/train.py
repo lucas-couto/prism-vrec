@@ -56,8 +56,14 @@ from src.utils.artifact_names import (
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.device import resolve_device
+from src.utils.identity import (
+    SELECTION_SPLITS,
+    DataIdentity,
+    IdentityError,
+    resolve_data_identity,
+)
 from src.utils.logging import get_logger
-from src.utils.parallel import TrainingJob, TrainingOrchestrator
+from src.utils.parallel import TrainingJob, TrainingOrchestrator, checkpoint_root
 from src.utils.seed import set_seed
 
 logger = get_logger(__name__)
@@ -454,9 +460,16 @@ def build_job_list(
     embeddings_dir: str,
     device: str,
 ) -> list[TrainingJob]:
-    """Return the list of pending training jobs for the given condition."""
-    checkpoint_mgr = CheckpointManager()
+    """Return the list of pending training jobs for the given condition.
+
+    Every job carries the content identity of its dataset and feature
+    artifact (resolved once per cell here, in the parent), and completed
+    work is read from the configuration's checkpoint root rather than
+    the repository default.
+    """
+    checkpoint_mgr = CheckpointManager(checkpoint_root(config))
     jobs: list[TrainingJob] = []
+    identities: dict[tuple[str, str | None], DataIdentity | None] = {}
 
     enabled = config.get("recommenders_enabled")
     if enabled is None or not enabled:
@@ -483,6 +496,7 @@ def build_job_list(
         experiment_key = f"{cell.dataset_name}_{cell.embedding_name}_{cell.model_name}"
         completed = checkpoint_mgr.load_grid_search_progress(experiment_key)
         completed_hashes = {json.dumps(c["hyperparams"], sort_keys=True) for c in completed}
+        data_identity = _cell_data_identity(identities, cell, processed_dir)
 
         for hp in get_hyperparam_grid(cell.model_name, config):
             if json.dumps(hp, sort_keys=True) in completed_hashes:
@@ -500,10 +514,42 @@ def build_job_list(
                     processed_dir=processed_dir,
                     device=device,
                     priority=cell.spec.priority,
+                    data_identity=data_identity.to_payload() if data_identity else None,
                 )
             )
 
     return jobs
+
+
+def _cell_data_identity(
+    cache: dict[tuple[str, str | None], DataIdentity | None],
+    cell: _Cell,
+    processed_dir: str,
+) -> DataIdentity | None:
+    """Content identity of *cell*'s dataset + feature, memoised per cell key.
+
+    ``None`` when the split files or the artifact cannot be read: the
+    job is then recorded with an *unresolved* identity (never a guessed
+    one) and the training call fails on the missing input itself.
+    """
+    key = (cell.dataset_name, cell.embedding_path)
+    if key not in cache:
+        try:
+            cache[key] = resolve_data_identity(
+                processed_dir,
+                cell.dataset_name,
+                cell.embedding_path,
+                splits=SELECTION_SPLITS,
+            )
+        except IdentityError as exc:
+            logger.warning(
+                "%s/%s: data identity unresolved (%s); jobs of this cell carry no content digests.",
+                cell.dataset_name,
+                cell.embedding_name,
+                exc,
+            )
+            cache[key] = None
+    return cache[key]
 
 
 def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -> None:
@@ -678,11 +724,14 @@ def _run_grid(
     logger.info("Total pending jobs: %d", len(jobs))
 
     n_workers = 1 if sequential else workers
+    # The resolved configuration travels with the pool: a spawned worker
+    # must never rebuild it from the YAML defaults (F05).
     orchestrator = TrainingOrchestrator(
         n_workers=n_workers,
         device=device,
         log_dir="logs",
         per_worker_bytes=_estimate_worker_bytes(jobs, processed_dir),
+        config=config,
     )
 
     results = orchestrator.run(jobs)
@@ -1177,7 +1226,7 @@ def _train_one_optuna_trial(
         visual_embeddings = load_embedding(embeddings_path)
 
     model_cls = get_recommender_class(cell.model_name)
-    checkpoint_mgr = CheckpointManager()
+    checkpoint_mgr = CheckpointManager(checkpoint_root(config))
 
     item_categories = None
     if getattr(model_cls, "wants_categories", False):

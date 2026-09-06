@@ -145,6 +145,13 @@ class TrainingJob:
     submission order; the parent uses it to recover which job a worker
     held when the worker died.  It is assigned by the orchestrator and
     is not part of the job identity.
+
+    ``data_identity`` is the content identity of the job's dataset and
+    feature artifact (:meth:`src.utils.identity.DataIdentity.to_payload`),
+    resolved once by the parent so every worker binds its checkpoints
+    and grid progress to the same digests (E03/E04).  ``None`` means the
+    parent did not resolve it; the worker then records the identity as
+    unresolved rather than guessing one.
     """
 
     dataset_name: str
@@ -159,6 +166,7 @@ class TrainingJob:
     priority: int = 0
     retry_count: int = 0
     submit_index: int = _NO_ASSIGNMENT
+    data_identity: dict | None = None
 
     @property
     def job_id(self) -> str:
@@ -458,16 +466,32 @@ class _WorkerContext:
     Built lazily by :func:`_worker_fn` the first time a real job runs,
     so a worker driven by an injected ``job_runner`` (tests) never
     touches the configuration directory or the checkpoint root.
+
+    ``config`` is the parent's RESOLVED configuration snapshot (custom
+    ``--config-dir``, multi-seed override, CLI overrides such as
+    ``--hp-search`` / ``--n-trials``, seed and result/checkpoint roots).
+    A spawned process starts with fresh module globals, so re-reading
+    the YAML here would silently drop every one of those (audit F05);
+    the snapshot travels through the process arguments instead.  The
+    disk fallback exists only for callers that predate the snapshot and
+    is logged as such.
     """
 
-    def __init__(self, n_workers: int, wlog) -> None:
+    def __init__(self, n_workers: int, wlog, config: dict | None = None) -> None:
         from src.utils.checkpoint import CheckpointManager
-        from src.utils.config import load_config
 
         self._wlog = wlog
         self._worker_vram = _probe_worker_vram(n_workers, wlog)
-        self._checkpoint_mgr = CheckpointManager()
-        self._config = load_config()
+        if config is None:
+            from src.utils.config import load_config
+
+            wlog.warning(
+                "worker received no resolved configuration snapshot; reloading the "
+                "YAML defaults from disk (CLI/seed/config-dir overrides are NOT applied)."
+            )
+            config = load_config()
+        self._config = config
+        self._checkpoint_mgr = CheckpointManager(checkpoint_root(config))
         # One slot each: an unbounded cache here is what OOM-killed the
         # worker mid-run.  See :class:`SingleSlotCache`.
         self._data_cache = SingleSlotCache()
@@ -567,7 +591,10 @@ class _WorkerContext:
         )
 
         experiment_key = f"{job.dataset_name}_{job.embedding_name}_{job.model_name}"
-        gs_path = Path("checkpoints/grid_search") / f"{experiment_key}.json"
+        # Same root the parent's ``build_job_list`` reads completed work
+        # from; a hard-coded ``checkpoints/`` here diverged from a
+        # seed-suffixed or custom root and the skip never fired.
+        gs_path = grid_progress_path(self._checkpoint_mgr, experiment_key)
         _locked_append_grid_progress(
             gs_path,
             {"hyperparams": job.hyperparams, "best_metric": best_val},
@@ -605,6 +632,21 @@ def _probe_worker_vram(n_workers: int, wlog) -> int:
         return 0
 
 
+def checkpoint_root(config: dict) -> str:
+    """The checkpoint root of a resolved configuration (``paths.checkpoints``)."""
+    return str((config.get("paths") or {}).get("checkpoints", "checkpoints"))
+
+
+def grid_progress_path(checkpoint_mgr, experiment_key: str) -> Path:
+    """Grid-progress file of *experiment_key* under the manager's root.
+
+    Mirrors ``CheckpointManager.load_grid_search_progress`` so the
+    writer (worker) and the reader (parent) can never disagree on the
+    directory.
+    """
+    return Path(checkpoint_mgr.checkpoint_dir) / "grid_search" / f"{experiment_key}.json"
+
+
 def _worker_fn(
     worker_id: int,
     job_queue,
@@ -613,6 +655,7 @@ def _worker_fn(
     log_dir: str,
     job_runner: JobRunner | None = None,
     assignment=None,
+    config: dict | None = None,
 ) -> None:
     """Worker process: pulls jobs from queue, trains, reports results.
 
@@ -623,7 +666,8 @@ def _worker_fn(
     the parent can fail it from the exit status if this process dies
     before the message is published.  ``job_runner`` replaces the real
     training call (fault-injection tests); ``None`` uses
-    :class:`_WorkerContext`.
+    :class:`_WorkerContext` built on ``config``, the parent's resolved
+    configuration snapshot.
     """
     project_root = str(Path(__file__).resolve().parent.parent.parent)
     if project_root not in sys.path:
@@ -643,7 +687,7 @@ def _worker_fn(
             break
 
         if runner is None:
-            runner = _WorkerContext(n_workers, wlog).run
+            runner = _WorkerContext(n_workers, wlog, config).run
 
         hp_str = " ".join(f"{k}={v}" for k, v in sorted(job.hyperparams.items()))
         wlog.info(
@@ -693,6 +737,7 @@ class TrainingOrchestrator:
         per_worker_bytes: int = 0,
         *,
         job_runner: JobRunner | None = None,
+        config: dict | None = None,
     ) -> None:
         """Size the pool.
 
@@ -705,6 +750,9 @@ class TrainingOrchestrator:
         *job_runner* replaces the per-job training call inside every
         worker (fault-injection tests).  It must be picklable for the
         spawned pool; ``None`` runs the real training.
+
+        *config* is the parent's resolved configuration snapshot, handed
+        to every worker so none of them reloads the YAML defaults.
         """
         self.device = device
         self.log_dir = log_dir
@@ -712,6 +760,7 @@ class TrainingOrchestrator:
             detect_max_workers(device, per_worker_bytes) if n_workers <= 0 else n_workers
         )
         self._job_runner = job_runner
+        self._config = config
         logger.info("Training orchestrator: %d workers", self.n_workers)
 
     def run(self, jobs: list[TrainingJob]) -> list[dict]:
@@ -746,7 +795,9 @@ class TrainingOrchestrator:
             for job in batch:
                 job_queue.put(job)
             job_queue.put(None)
-            _worker_fn(0, job_queue, result_queue, 1, self.log_dir, self._job_runner)
+            _worker_fn(
+                0, job_queue, result_queue, 1, self.log_dir, self._job_runner, config=self._config
+            )
             self._drain_sequential(registry, batch, result_queue)
             batch = registry.take_retries()
 
@@ -787,7 +838,11 @@ class TrainingOrchestrator:
             ctx.Process(
                 target=_worker_fn,
                 args=(i, job_queue, result_queue, self.n_workers, self.log_dir),
-                kwargs={"job_runner": self._job_runner, "assignment": assignment},
+                kwargs={
+                    "job_runner": self._job_runner,
+                    "assignment": assignment,
+                    "config": self._config,
+                },
                 daemon=True,
             )
             for i in range(self.n_workers)
