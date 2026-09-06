@@ -154,6 +154,11 @@ class VNPR(BaseRecommender):
     #: (``v_h``).
     _USER_TABLES: tuple[str, ...] = ("user_embedding", "visual_user_embedding")
 
+    #: Beyond the returned score matrix, :meth:`predict_batch` holds the
+    #: shared visual term and one branch's GEMM live -- two fp32
+    #: ``(B, N)`` buffers, 8 bytes per pair.
+    PREDICT_BATCH_BYTES_PER_ELEMENT: int = 8
+
     def __init__(
         self,
         n_users: int,
@@ -164,7 +169,7 @@ class VNPR(BaseRecommender):
         config = config or {}
         super().__init__(n_users, n_items, visual_embeddings, config)
 
-        if self.visual_features is None:
+        if not self.has_visual_features:
             raise RuntimeError("VNPR requires visual embeddings")
 
         k: int = config["latent_dim"]
@@ -188,8 +193,9 @@ class VNPR(BaseRecommender):
         nn.init.xavier_uniform_(self.dense.weight)
         nn.init.zeros_(self.dense.bias)
 
-        # Full-catalogue image features, cached in eval only (no online
-        # fusion) and invalidated by every train() call.
+        # Full-catalogue image features: in eval only (no online fusion)
+        # a zero-copy alias of the buffer, invalidated by every train()
+        # call (see :meth:`_catalogue_visual`).
         self._catalogue_visual_cache: torch.Tensor | None = None
 
     def train(self, mode: bool = True) -> VNPR:
@@ -232,8 +238,42 @@ class VNPR(BaseRecommender):
         f: torch.Tensor,
     ) -> torch.Tensor:
         """``ReLU(w^T [p ∘ q, v ∘ f] + b)`` for aligned ``(B, ·)`` tensors."""
+        return torch.relu(self._preactivation(p, q, v, f))
+
+    def _preactivation(
+        self,
+        p: torch.Tensor,
+        q: torch.Tensor,
+        v: torch.Tensor,
+        f: torch.Tensor,
+    ) -> torch.Tensor:
+        """``w^T [p ∘ q, v ∘ f] + b`` — the branch before its ReLU (Eq. 3)."""
         merged = torch.cat([p * q, v * f], dim=-1)
-        return torch.relu(self.dense(merged)).squeeze(-1)
+        return self.dense(merged).squeeze(-1)
+
+    def diagnostic_branches(
+        self,
+        user_ids: torch.Tensor,
+        pos_item_ids: torch.Tensor,
+        neg_item_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Pre-ReLU branch values of :meth:`forward` (SDD S04 diagnostics).
+
+        Same computation as :meth:`forward` up to the ReLU — dropout
+        follows the module's current mode, so the training view is
+        obtained in ``train()`` and the inference view ``(u, i, i)`` in
+        ``eval()``.  Read-only: no parameter, cache or buffer changes.
+        """
+        p = self.dropout(self.user_embedding(user_ids))
+        v = self.dropout(self.visual_user_embedding(user_ids))
+        q_pos = self.dropout(self.item_embedding(pos_item_ids))
+        q_neg = self.dropout(self.item_embedding_neg(neg_item_ids))
+        f_pos = self._resolve_visual(pos_item_ids)
+        f_neg = self._resolve_visual(neg_item_ids)
+        return {
+            "pos": self._preactivation(p, q_pos, v, f_pos),
+            "neg": self._preactivation(p, q_neg, v, f_neg),
+        }
 
     def forward(
         self,
@@ -269,6 +309,15 @@ class VNPR(BaseRecommender):
         its own ``(B,k)@(k,N)`` item GEMM before the ReLU, and the two
         are averaged.  Mathematically identical to :meth:`predict`
         (float reductions are reordered, so not bit-identical).
+
+        Exactly three ``(B, N)`` buffers are live at the peak -- the
+        shared visual term, the accumulating result and one branch's
+        GEMM -- which is what
+        :attr:`PREDICT_BATCH_BYTES_PER_ELEMENT` declares to the
+        evaluator's batch planner.  The fused ``addmm`` / in-place ReLU
+        below is what keeps it at three: the naive expression form holds
+        five, and the planner sizing a VNPR batch as if it held one is
+        how a full-ranking pass over a 326K-item catalogue OOM-ed.
         """
         k = self.latent_dim
         w = self.dense.weight.squeeze(0)
@@ -276,29 +325,105 @@ class VNPR(BaseRecommender):
 
         p = self.user_embedding(user_ids) * w_q  # (B, k)
         v = self.visual_user_embedding(user_ids) * w_f  # (B, dv)
-        f = self._catalogue_visual(item_ids)  # (N, dv)
+        full = self._is_full_catalogue(item_ids)
+        if self.is_lazy_visual:
+            return self._predict_batch_blocked(p, v, item_ids, full)
 
-        visual_term = v @ f.T + self.dense.bias  # (B, N)
-        r_pos = torch.relu(p @ self.item_embedding(item_ids).T + visual_term)
-        r_neg = torch.relu(p @ self.item_embedding_neg(item_ids).T + visual_term)
-        return 0.5 * (r_pos + r_neg)
+        f = self._catalogue_visual(item_ids)  # (N, dv)
+        q_pos = self._branch_items(self.item_embedding, item_ids, full)
+        q_neg = self._branch_items(self.item_embedding_neg, item_ids, full)
+        return self._score_block(p, v, f, q_pos, q_neg)
+
+    def _score_block(
+        self,
+        p: torch.Tensor,
+        v: torch.Tensor,
+        f: torch.Tensor,
+        q_pos: torch.Tensor,
+        q_neg: torch.Tensor,
+    ) -> torch.Tensor:
+        """``½(ReLU(shared + p·q) + ReLU(shared + p·q'))`` for one item block."""
+        # beta*input + mat1 @ mat2 in one kernel: the bias broadcasts
+        # over (B, N) instead of allocating a second matrix for the sum.
+        shared = torch.addmm(self.dense.bias, v, f.T)  # (B, N)
+
+        scores = torch.addmm(shared, p, q_pos.T)
+        torch.relu_(scores)
+        other = torch.addmm(shared, p, q_neg.T)
+        torch.relu_(other)
+        scores.add_(other).mul_(0.5)
+        del other
+        return scores
+
+    def _predict_batch_blocked(
+        self,
+        p: torch.Tensor,
+        v: torch.Tensor,
+        item_ids: torch.Tensor,
+        full_catalogue: bool,
+    ) -> torch.Tensor:
+        """Lazy-source ``predict_batch``: item blocks, never ``(N, dv)`` at once.
+
+        Every column of the ``(B, N)`` result depends on its own item
+        only, so filling it block by block is the same computation with
+        the raw feature staging bounded by :attr:`_LAZY_ITEM_BLOCK`
+        rows instead of the catalogue.
+        """
+        n = item_ids.shape[0]
+        out = torch.empty((p.shape[0], n), device=p.device, dtype=p.dtype)
+        block = self._LAZY_ITEM_BLOCK
+        for start in range(0, n, block):
+            stop = min(start + block, n)
+            ids = item_ids[start:stop]
+            f = self._resolve_visual(ids)  # (n_blk, dv)
+            if full_catalogue:
+                q_pos = self.item_embedding.weight[start:stop]
+                q_neg = self.item_embedding_neg.weight[start:stop]
+            else:
+                q_pos = self.item_embedding(ids)
+                q_neg = self.item_embedding_neg(ids)
+            out[:, start:stop] = self._score_block(p, v, f, q_pos, q_neg)
+        return out
+
+    def _is_full_catalogue(self, item_ids: torch.Tensor) -> bool:
+        """Whether ``item_ids`` is exactly ``arange(n_items)``."""
+        if item_ids.shape[0] != self.n_items:
+            return False
+        expected = torch.arange(self.n_items, device=item_ids.device)
+        return bool(torch.equal(item_ids, expected))
+
+    @staticmethod
+    def _branch_items(
+        table: nn.Embedding, item_ids: torch.Tensor, full_catalogue: bool
+    ) -> torch.Tensor:
+        """``q`` rows for *item_ids*, without copying the whole table.
+
+        Evaluation scores the full catalogue in order, and an
+        ``nn.Embedding`` lookup for ``arange(n_items)`` materialises a
+        second copy of the table -- 167 MB per branch at ``N`` = 326K,
+        ``k`` = 128, twice over.  ``weight`` carries the same values in
+        the same order, so the gather is pure waste there.
+        """
+        if full_catalogue:
+            return table.weight
+        return table(item_ids)
 
     def _catalogue_visual(self, item_ids: torch.Tensor) -> torch.Tensor:
-        """Image features of ``item_ids``, cached for the full catalogue.
+        """Image features of ``item_ids``; the dense full catalogue is an alias.
 
-        The cache is used only in eval mode, without an online fusion
-        (whose output depends on trainable parameters) and when
-        ``item_ids`` is exactly ``arange(n_items)``.
+        In eval mode, without an online fusion (whose output depends on
+        trainable parameters) and when ``item_ids`` is exactly
+        ``arange(n_items)``, the answer IS the resident 2-D buffer in its
+        own order, so the "cache" is a zero-copy alias of it (SDD M03:
+        no derived full-catalogue copy) — previously an ``(N, dv)`` fp32
+        duplicate of the buffer.  Invalidated by :meth:`train`.  Lazy
+        sources never reach here (see :meth:`_predict_batch_blocked`).
         """
         cacheable = (
-            not self.training
-            and self._online_fusion is None
-            and item_ids.shape[0] == self.n_items
-            and bool(torch.equal(item_ids, torch.arange(self.n_items, device=item_ids.device)))
+            not self.training and self._online_fusion is None and self._is_full_catalogue(item_ids)
         )
-        if cacheable and self._catalogue_visual_cache is not None:
-            return self._catalogue_visual_cache
-        f = self._resolve_visual(item_ids)
-        if cacheable:
-            self._catalogue_visual_cache = f
-        return f
+        if not cacheable:
+            return self._resolve_visual(item_ids)
+        if self._catalogue_visual_cache is None:
+            self._catalogue_visual_cache = self.visual_features
+        return self._catalogue_visual_cache

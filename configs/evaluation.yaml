@@ -154,3 +154,24 @@ statistical:
   # zero-dominated paired differences (std shrinks, d inflates); it is
   # available for diagnostics only.
   include_cohens_d: false
+
+  # User population policy for the paired tests (3.0.0, task records
+  # R04/R05; src/evaluation/paired_validation.py).  Every pairwise or
+  # Friedman comparison needs ONE shared user population — a user
+  # missing from one side is never silently inner-joined away.
+  #   "strict"                — default.  Every cell of a comparison must
+  #                             cover the same users; otherwise the step
+  #                             fails, naming the users absent from each
+  #                             side, and the `_integrity.json` lists the
+  #                             excluded cells with the reason.
+  #   "declared_intersection" — restrict every comparison to the users
+  #                             present in both cells, EXPLICITLY: the
+  #                             outputs go to their own
+  #                             `{dataset}_{condition}_restricted_*` files
+  #                             and every row carries population_policy,
+  #                             n_excluded_a / n_excluded_b (Friedman:
+  #                             n_users_excluded).
+  # Independently of the policy, conflicting duplicate observations
+  # (same user/config, different value) and non-finite metric values
+  # fail; missing expected cells always fail.  Uncomment to change:
+  # population: "strict"

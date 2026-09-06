@@ -2,7 +2,7 @@
 
 PyTorch's ``DataLoader`` exposes three knobs (``num_workers``,
 ``prefetch_factor``, ``batch_size``) that interact non-trivially with
-the host's CPU count and the cgroup memory budget.  Picking values
+the cgroup's CPU quota and memory budget.  Picking values
 that fit *every* deployment the framework runs on, laptops, CI,
 RunPod pods, lab servers, is impossible from a single hardcoded
 default: too low wastes throughput on a 128 GB lab box; too high
@@ -25,7 +25,7 @@ memory budget   num_workers  prefetch     batch_size
 >= 32 GB        min(12, cpu) 8            256
 ==============  ===========  ===========  ============
 
-``cpu`` is ``os.cpu_count() - 1`` (leaving one core for the main
+``cpu`` is ``available_cpus() - 1`` (leaving one core for the main
 process) clamped to at least 0.  When the cgroup or host memory
 cannot be read the function falls back to the safest tier so a
 misconfigured environment can never OOM through this code path.
@@ -33,7 +33,6 @@ misconfigured environment can never OOM through this code path.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -42,6 +41,7 @@ from src.utils.logging import get_logger
 # The budget itself is shared with the process-pool sizing in
 # :mod:`src.utils.memory`; re-exported under the private name this
 # module has always used so callers (and tests) keep one entry point.
+from src.utils.memory import available_cpus
 from src.utils.memory import memory_budget_bytes as _memory_budget_bytes
 
 logger = get_logger(__name__)
@@ -81,7 +81,7 @@ def autotune() -> DataLoaderTune:
     the cached result so step modules can ask for the settings as many
     times as they need without spamming the log.
     """
-    cpu = max(1, (os.cpu_count() or 1))
+    cpu = available_cpus()
     cpu_budget = max(1, cpu - 1)  # leave one core for the trainer
     mem_gb = _memory_budget_bytes() / (1024**3)
 
@@ -184,8 +184,23 @@ def resolve_dataloader_settings(config: dict | None = None) -> DataLoaderSetting
         value = dl_cfg.get(key)
         return fallback if value is None else int(value)
 
+    # A pinned num_workers states intent, not a licence to oversubscribe:
+    # loader processes above the cgroup's CPU quota only add context
+    # switching, and on a workstation that contention is felt as a frozen
+    # desktop.  One core is left for the process doing the training.
+    cpu_cap = max(1, available_cpus() - 1)
+    requested = _pick("num_workers", auto.num_workers)
+    num_workers = min(requested, cpu_cap)
+    if num_workers < requested:
+        logger.info(
+            "DataLoader num_workers clamped %d -> %d by the CPU quota (%d cores).",
+            requested,
+            num_workers,
+            available_cpus(),
+        )
+
     return DataLoaderSettings(
-        num_workers=_pick("num_workers", auto.num_workers),
+        num_workers=num_workers,
         prefetch_factor=_pick("prefetch_factor", auto.prefetch_factor),
         batch_size=_pick("batch_size", auto.batch_size),
     )

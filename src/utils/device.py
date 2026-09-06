@@ -52,18 +52,25 @@ def resolve_device(requested: str) -> str:
     return "cpu"
 
 
-#: VRAM cap for a process that has the card to itself, as a fraction
-#: of the card.  The 15% left over is not slack: it is what the display
-#: server and the compositor need to keep the workstation responsive
-#: while a battery runs.  The GPU that trains here is the same one that
-#: draws the desktop, so an uncapped process freezes the machine (and on
-#: 2026-09-01 tripped the display driver's watchdog).
-SOLO_PROCESS_VRAM_FRACTION = 0.85
+#: Share of the machine a run may consume, applied to VRAM here and
+#: mirrored for RAM and CPU by ``docker-compose.yml`` (``mem_limit``,
+#: ``cpus``).  The GPU that trains is the same one that draws the
+#: researcher's desktop, so the remaining third is not slack: it is what
+#: keeps the workstation usable across a multi-day battery.  Chosen by
+#: the researcher on 2026-09-04, deliberately over throughput -- an
+#: uncapped run froze the machine and, on 2026-09-01, tripped the
+#: display driver's watchdog.  Lowered from 0.65 to 0.5 on 2026-09-06:
+#: with the browser, IDE and another project's containers on the same
+#: host, the 65% run share still pushed the desktop into swap.
+RUN_RESOURCE_SHARE = 0.5
+
+#: VRAM cap for a process that has the card to itself.
+SOLO_PROCESS_VRAM_FRACTION = RUN_RESOURCE_SHARE
 
 #: Total share of the card the training workers may claim between them.
-#: Below 1.0 because every CUDA context lives *outside* the per-process
-#: cap, on top of it.
-POOL_VRAM_FRACTION = 0.90
+#: Never above :data:`RUN_RESOURCE_SHARE`, and every CUDA context lives
+#: *outside* the per-process cap, on top of it.
+POOL_VRAM_FRACTION = RUN_RESOURCE_SHARE
 
 
 def cap_process_vram(n_workers: int = 1) -> float:
@@ -83,9 +90,7 @@ def cap_process_vram(n_workers: int = 1) -> float:
 
     if not torch.cuda.is_available():
         return 0.0
-    fraction = (
-        POOL_VRAM_FRACTION / n_workers if n_workers > 1 else SOLO_PROCESS_VRAM_FRACTION
-    )
+    fraction = POOL_VRAM_FRACTION / n_workers if n_workers > 1 else SOLO_PROCESS_VRAM_FRACTION
     torch.cuda.set_per_process_memory_fraction(fraction)
     return fraction
 

@@ -10,7 +10,12 @@ import pandas as pd
 import pytest
 
 from src.evaluation.paired_loader import load_paired
-from src.evaluation.persistence import CellMetadata, artifact_paths, read_cell_artifact
+from src.evaluation.persistence import (
+    CellMetadata,
+    artifact_paths,
+    contract_fields,
+    read_cell_artifact,
+)
 from src.folds import FoldAggregate, concatenate_fold_artifacts, fold_dir, write_fold_artifact
 
 _K_VALUES = [5, 10]
@@ -80,7 +85,7 @@ class TestWriteFoldArtifact:
         assert not path.with_name(path.name.replace(".csv.gz", ".fold.json")).exists()
         meta, records = read_cell_artifact(path)
         assert meta["fold"] == {"index": 2, "k": 3, "seed": 7, "n_users": 2}
-        assert {k: v for k, v in meta.items() if k != "fold"} == {
+        assert {k: v for k, v in contract_fields(meta).items() if k != "fold"} == {
             k: v for k, v in metadata.to_dict().items() if k != "fold"
         }
         assert records["user_idx"].tolist() == [0, 3]
@@ -123,7 +128,7 @@ class TestConcatenateFoldArtifacts:
         assert path == records_path
         written = json.loads(meta_path.read_text())
         assert written["fold"] == {"k": 3, "seeds": [100, 101, 102], "n_users_per_fold": [3, 3, 3]}
-        assert {k: v for k, v in written.items() if k != "fold"} == {
+        assert {k: v for k, v in contract_fields(written).items() if k != "fold"} == {
             k: v for k, v in metadata.to_dict().items() if k != "fold"
         }
         assert metadata.fold is None
@@ -268,3 +273,58 @@ class TestStatisticalPipelineCompatibility:
 
         assert list(matrix.columns) == ["vbpr__resnet"]
         assert len(matrix) == 9
+
+
+class TestPartialIdentity:
+    """R05: a partial of another artifact identity must not be concatenated."""
+
+    def test_should_raise_when_partial_latent_dim_disagrees(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[1]).read_text())
+        meta["d"] = 64
+        _meta_path(paths[1]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="identity.*d"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_should_raise_when_partial_protocol_version_disagrees(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[0]).read_text())
+        meta["eval_protocol_version"] = "0.1"
+        _meta_path(paths[0]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="identity.*eval_protocol_version"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_should_raise_when_partial_row_count_disagrees_with_its_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[0]).read_text())
+        meta["fold"]["n_users"] = 5
+        _meta_path(paths[0]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="n_users=5"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_should_raise_when_two_partials_share_a_fold_seed(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        paths = _write_folds(tmp_path, metadata, _FOLDS[:2])
+        meta = json.loads(_meta_path(paths[1]).read_text())
+        meta["fold"]["seed"] = 100
+        _meta_path(paths[1]).write_text(json.dumps(meta))
+
+        with pytest.raises(ValueError, match="seed 100"):
+            concatenate_fold_artifacts(tmp_path, metadata, k=2, k_values=_K_VALUES)
+
+    def test_aggregate_reports_distinct_fold_seed_count(self, tmp_path: Path) -> None:
+        metadata = _metadata()
+        _write_folds(tmp_path, metadata)
+
+        _, agg = concatenate_fold_artifacts(tmp_path, metadata, k=3, k_values=_K_VALUES)
+
+        assert agg.n_distinct_fold_seeds == 3
+        assert agg.to_dict()["n_distinct_fold_seeds"] == 3

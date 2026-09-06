@@ -25,6 +25,7 @@ from src.evaluation.protocol import (
     RANKING_BYTES_PER_ELEMENT,
     Evaluator,
     default_ranking_budget,
+    model_bytes_per_element,
     plan_ranking_batch,
 )
 
@@ -178,3 +179,199 @@ class TestRecordsSurviveTheHeadSlice:
             tight.per_user_records(model, device="cpu"),
             loose.per_user_records(model, device="cpu"),
         )
+
+
+class _CountingOOMModel(_DeterministicModel):
+    """Raises OOM until the user batch drops to *threshold* or below.
+
+    Stands in for a ``predict_batch`` whose real peak exceeds the plan:
+    the evaluator must react to the failure rather than propagate it.
+    """
+
+    def __init__(self, threshold: int) -> None:
+        super().__init__()
+        self.threshold = threshold
+        self.attempted_batches: list[int] = []
+
+    def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        self.attempted_batches.append(len(user_ids))
+        if len(user_ids) > self.threshold:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return super().predict_batch(user_ids, item_ids)
+
+
+class _AlwaysOOMModel(_DeterministicModel):
+    """Overflows at every batch size, including a single user."""
+
+    def predict_batch(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        raise torch.cuda.OutOfMemoryError("simulated")
+
+
+class TestModelDeclaredElementCost:
+    def test_default_model_costs_only_the_evaluator_buffers(self):
+        assert model_bytes_per_element(_DeterministicModel()) == RANKING_BYTES_PER_ELEMENT
+
+    def test_declared_extra_buffers_raise_the_cost(self):
+        model = _DeterministicModel()
+        model.PREDICT_BATCH_BYTES_PER_ELEMENT = 8
+
+        assert model_bytes_per_element(model) == RANKING_BYTES_PER_ELEMENT + 8
+
+    def test_a_declaring_model_gets_a_smaller_batch(self):
+        """The VNPR case: same budget, same catalogue, smaller batch."""
+        budget = 4 * 1024**3
+
+        linear = plan_ranking_batch(512, 347_591, budget, RANKING_BYTES_PER_ELEMENT)
+        vnpr = plan_ranking_batch(512, 347_591, budget, RANKING_BYTES_PER_ELEMENT + 8)
+
+        assert vnpr < linear
+
+    def test_non_numeric_declaration_falls_back_to_the_default(self):
+        model = _DeterministicModel()
+        model.PREDICT_BATCH_BYTES_PER_ELEMENT = "wat"
+
+        assert model_bytes_per_element(model) == RANKING_BYTES_PER_ELEMENT
+
+    def test_negative_declaration_never_lowers_the_cost(self):
+        model = _DeterministicModel()
+        model.PREDICT_BATCH_BYTES_PER_ELEMENT = -100
+
+        assert model_bytes_per_element(model) == RANKING_BYTES_PER_ELEMENT
+
+
+class TestOOMDegradesInsteadOfFailing:
+    def _reference(self) -> pd.DataFrame:
+        evaluator = _evaluator(ranking_budget_bytes=0)
+        return (
+            evaluator.evaluate_per_user(_DeterministicModel(), device="cpu", batch_size=512)
+            .sort_values("user_id")
+            .reset_index(drop=True)
+        )
+
+    def test_batch_halves_until_it_fits_and_results_are_unchanged(self):
+        model = _CountingOOMModel(threshold=4)
+        evaluator = _evaluator(ranking_budget_bytes=0)
+
+        frame = (
+            evaluator.evaluate_per_user(model, device="cpu", batch_size=512)
+            .sort_values("user_id")
+            .reset_index(drop=True)
+        )
+
+        assert max(model.attempted_batches) > 4, "the oversized batch must be attempted first"
+        assert min(model.attempted_batches) <= 4, "it must come down to a size that fits"
+        pd.testing.assert_frame_equal(frame, self._reference())
+
+    def test_every_user_is_scored_exactly_once_after_a_retry(self):
+        """A retried batch must not double-count or skip its users."""
+        evaluator = _evaluator(ranking_budget_bytes=0)
+
+        frame = evaluator.evaluate_per_user(
+            _CountingOOMModel(threshold=3), device="cpu", batch_size=512
+        )
+
+        assert sorted(frame["user_id"].tolist()) == sorted(evaluator.test_users)
+
+    def test_single_user_overflow_falls_through_to_the_per_user_path(self):
+        """The floor: even B=1 failing must not fail the job."""
+        evaluator = _evaluator(ranking_budget_bytes=0)
+
+        frame = (
+            evaluator.evaluate_per_user(_AlwaysOOMModel(), device="cpu", batch_size=512)
+            .sort_values("user_id")
+            .reset_index(drop=True)
+        )
+
+        pd.testing.assert_frame_equal(frame, self._reference())
+
+
+class _ItemLimitedModel(_AlwaysOOMModel):
+    """Simulate a catalogue that fits only a few items at a time."""
+
+    def __init__(self, limit=3):
+        super().__init__()
+        self.limit = limit
+        self.scored = []
+        self.attempts = []
+
+    def predict(self, user_id, item_ids):
+        self.attempts.append(len(item_ids))
+        if len(item_ids) > self.limit:
+            raise torch.cuda.OutOfMemoryError("item block too large")
+        self.scored.extend((user_id, int(item)) for item in item_ids)
+        return super().predict(user_id, item_ids)
+
+
+def test_item_blocks_preserve_full_catalogue_metrics_and_records():
+    model = _ItemLimitedModel()
+    expected = _evaluator().evaluate_with_records(_DeterministicModel(), device="cpu")
+
+    actual = _evaluator().evaluate_with_records(model, device="cpu")
+
+    for frame, reference in zip(actual, expected, strict=True):
+        pd.testing.assert_frame_equal(frame, reference)
+    assert sorted(model.scored) == [(u, i) for u in range(N_USERS) for i in range(N_ITEMS)]
+    assert max(model.attempts) > model.limit
+    assert min(model.attempts) <= model.limit
+
+
+def test_item_block_failure_after_progress_does_not_repeat_completed_items():
+    class LateOOM(_ItemLimitedModel):
+        def predict(self, user_id, item_ids):
+            self.limit = 2 if int(item_ids[0]) >= 4 else 4
+            return super().predict(user_id, item_ids)
+
+    model = LateOOM()
+    evaluator = _evaluator()
+    with torch.no_grad():
+        scores = evaluator._score_user_in_blocks(model, 0, torch.arange(N_ITEMS))
+
+    np.testing.assert_array_equal(scores, model.table[0].numpy())
+    assert model.scored == [(0, i) for i in range(N_ITEMS)]
+
+
+def test_item_block_failure_releases_traceback_before_retry():
+    import weakref
+
+    class RetentionCheck(_ItemLimitedModel):
+        retained = None
+
+        def predict(self, user_id, item_ids):
+            assert self.retained is None or self.retained() is None
+            if len(item_ids) > self.limit:
+                intermediate = torch.zeros(3)
+                self.retained = weakref.ref(intermediate)
+                raise torch.cuda.OutOfMemoryError("retain tensor in traceback")
+            return super().predict(user_id, item_ids)
+
+    evaluator = _evaluator()
+    with torch.no_grad():
+        evaluator._score_user_in_blocks(RetentionCheck(), 0, torch.arange(N_ITEMS))
+
+
+def test_one_item_that_cannot_fit_fails_explicitly():
+    import pytest
+
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="item block too large"):
+        _evaluator().evaluate_per_user(_ItemLimitedModel(limit=0), device="cpu")
+
+
+def test_vnpr_item_blocks_match_its_full_catalogue_scores():
+    from src.recommenders.vnpr import VNPR
+
+    torch.manual_seed(123)
+    features = np.random.default_rng(123).normal(size=(N_ITEMS, 8)).astype(np.float32)
+    model = VNPR(N_USERS, N_ITEMS, features, {"latent_dim": 4}).eval()
+
+    class LimitedVNPR:
+        def predict(self, user_id, items):
+            if len(items) > 3:
+                raise torch.cuda.OutOfMemoryError("simulated VNPR item limit")
+            return model.predict(user_id, items)
+
+    items = torch.arange(N_ITEMS)
+    with torch.no_grad():
+        expected = model.predict(0, items).numpy()
+        actual = _evaluator()._score_user_in_blocks(LimitedVNPR(), 0, items)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-7)

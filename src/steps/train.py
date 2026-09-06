@@ -56,8 +56,27 @@ from src.utils.artifact_names import (
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
 from src.utils.device import resolve_device
+from src.utils.identity import (
+    PROVENANCE_SUFFIX,
+    SELECTION_SPLITS,
+    DataIdentity,
+    IdentityError,
+    build_identity_context,
+    canonical_digest,
+    resolve_data_identity,
+)
 from src.utils.logging import get_logger
-from src.utils.parallel import TrainingJob, TrainingOrchestrator
+from src.utils.memory import (
+    AdmissionPlan,
+    admit_workers,
+    available_cpus,
+    choose_lazy_features,
+    estimate_model_state_bytes,
+    npy_payload_bytes,
+    resolve_host_budget,
+    resolve_resources,
+)
+from src.utils.parallel import TrainingJob, TrainingOrchestrator, checkpoint_root
 from src.utils.seed import set_seed
 
 logger = get_logger(__name__)
@@ -115,7 +134,15 @@ def get_embedding_files(
     if not emb_dir.exists():
         return []
     names = [f.stem for f in sorted(emb_dir.glob("*.npy"))]
-    names.extend(f.stem for f in sorted(emb_dir.glob("hybrid_*.json")))
+    # ``<artifact>.provenance.json`` (E05) sits next to every fusion
+    # output, including the ``hybrid_*.json`` sidecars, so a bare glob
+    # would turn ``hybrid_x.json.provenance.json`` into a phantom
+    # embedding ``hybrid_x.json.provenance`` whose jobs can only fail.
+    names.extend(
+        f.stem
+        for f in sorted(emb_dir.glob("hybrid_*.json"))
+        if not f.name.endswith(PROVENANCE_SUFFIX)
+    )
     names = sorted(set(names))
     if dim_filter:
         names = [
@@ -314,6 +341,79 @@ class EnabledRecommenderHasNoCellsError(RuntimeError):
     """
 
 
+class TrainingJobsFailedError(RuntimeError):
+    """Required training work failed or was never accounted for (audit F04).
+
+    Raised by the grid and parallel-Optuna backends after every unit of
+    work has been collected, so the completed cells keep their artifacts
+    on disk while ``main.py`` still exits non-zero and the run manifest
+    records the failure.  ``failures`` lists one dict per non-successful
+    unit (``id``, ``status``, ``error``); ``total`` is the number
+    submitted.
+    """
+
+    #: Failures quoted verbatim in the message; the rest are summarised.
+    _QUOTED = 10
+
+    def __init__(self, failures: list[dict], total: int, *, unit: str) -> None:
+        self.failures = failures
+        self.total = total
+        self.unit = unit
+        super().__init__(self._summary())
+
+    def _summary(self) -> str:
+        counts: dict[str, int] = {}
+        for failure in self.failures:
+            counts[failure["status"]] = counts.get(failure["status"], 0) + 1
+        breakdown = ", ".join(f"{n} {status}" for status, n in sorted(counts.items()))
+        quoted = "; ".join(
+            f"{f['id']}: {f['status']} ({f.get('error') or 'no detail'})"
+            for f in self.failures[: self._QUOTED]
+        )
+        more = len(self.failures) - self._QUOTED
+        tail = f"; ... {more} more" if more > 0 else ""
+        return (
+            f"{len(self.failures)} of {self.total} {self.unit}s did not succeed "
+            f"({breakdown}): {quoted}{tail}"
+        )
+
+
+def _raise_if_work_failed(
+    results: list[dict],
+    expected_ids: list[str],
+    *,
+    id_key: str,
+    unit: str,
+) -> None:
+    """Reconcile *results* against *expected_ids*; raise on any shortfall.
+
+    A unit counts as failed when its result status is not ``ok`` and as
+    ``unaccounted`` when no result carries its id at all -- a worker
+    that died without publishing, or a message lost with it.  Duplicate
+    results for one id are tolerated (first wins).  Success is exactly
+    ``submitted == succeeded``; a log line is never a substitute for
+    the exception this raises.
+    """
+    seen: dict[str, dict] = {}
+    for result in results:
+        seen.setdefault(str(result.get(id_key)), result)
+
+    failures: list[dict] = []
+    for unit_id in expected_ids:
+        result = seen.get(unit_id)
+        if result is None:
+            failures.append({"id": unit_id, "status": "unaccounted", "error": None})
+        elif result.get("status") != "ok":
+            failures.append(
+                {"id": unit_id, "status": result.get("status"), "error": result.get("error")}
+            )
+    if not failures:
+        return
+    for failure in failures:
+        logger.error("  %s %s: %s (%s)", unit, failure["id"], failure["status"], failure["error"])
+    raise TrainingJobsFailedError(failures, len(expected_ids), unit=unit)
+
+
 def assert_enabled_recommenders_have_cells(
     cell_counts: dict[str, int],
     condition: str,
@@ -381,9 +481,16 @@ def build_job_list(
     embeddings_dir: str,
     device: str,
 ) -> list[TrainingJob]:
-    """Return the list of pending training jobs for the given condition."""
-    checkpoint_mgr = CheckpointManager()
+    """Return the list of pending training jobs for the given condition.
+
+    Every job carries the content identity of its dataset and feature
+    artifact (resolved once per cell here, in the parent), and completed
+    work is read from the configuration's checkpoint root rather than
+    the repository default.
+    """
+    checkpoint_mgr = CheckpointManager(checkpoint_root(config))
     jobs: list[TrainingJob] = []
+    identities: dict[tuple[str, str | None], DataIdentity | None] = {}
 
     enabled = config.get("recommenders_enabled")
     if enabled is None or not enabled:
@@ -409,10 +516,13 @@ def build_job_list(
     for cell in _iter_cells(condition, config, processed_dir, embeddings_dir, model_names):
         experiment_key = f"{cell.dataset_name}_{cell.embedding_name}_{cell.model_name}"
         completed = checkpoint_mgr.load_grid_search_progress(experiment_key)
-        completed_hashes = {json.dumps(c["hyperparams"], sort_keys=True) for c in completed}
+        data_identity = _cell_data_identity(identities, cell, processed_dir)
+        context = build_identity_context(data_identity, condition=condition)
+        completed_digests = _completed_identity_digests(completed, experiment_key)
 
         for hp in get_hyperparam_grid(cell.model_name, config):
-            if json.dumps(hp, sort_keys=True) in completed_hashes:
+            digest = _job_identity_digest(cell, hp, config, context)
+            if digest in completed_digests:
                 continue
 
             jobs.append(
@@ -427,10 +537,105 @@ def build_job_list(
                     processed_dir=processed_dir,
                     device=device,
                     priority=cell.spec.priority,
+                    data_identity=data_identity.to_payload() if data_identity else None,
                 )
             )
 
     return jobs
+
+
+def _completed_identity_digests(completed: list[dict], experiment_key: str) -> set[str]:
+    """Identity digests of the grid entries that may be reused (E04, Q13).
+
+    A grid-progress entry is reusable only when it carries the identity
+    digest of the run that produced it; entries written before the field
+    existed match nothing — they are legacy, identified explicitly, and
+    the configuration is trained again rather than assumed complete.
+    """
+    digests = {str(c["identity_digest"]) for c in completed if c.get("identity_digest")}
+    n_legacy = len(completed) - len(digests)
+    if n_legacy:
+        logger.warning(
+            "%s: %d grid-progress entr%s carry no identity digest (legacy); not reused.",
+            experiment_key,
+            n_legacy,
+            "y" if n_legacy == 1 else "ies",
+        )
+    return digests
+
+
+def _job_identity_digest(cell: _Cell, hyperparams: dict, config: dict, context: dict) -> str:
+    """Digest of the C02 identity a job with *hyperparams* will train under."""
+    from src.recommenders import get_recommender_class
+    from src.utils.training import resolve_training_identity
+
+    return canonical_digest(
+        resolve_training_identity(
+            model_cls=get_recommender_class(cell.model_name),
+            model_name=cell.model_name,
+            dataset_name=cell.dataset_name,
+            embedding_name=cell.embedding_name,
+            hyperparams=hyperparams,
+            config=config,
+            identity_context=context,
+        )
+    )
+
+
+def identity_context_for(
+    processed_dir: str,
+    dataset_name: str,
+    embedding_name: str,
+    embeddings_path: str | None,
+    *,
+    fold: dict | None = None,
+) -> dict:
+    """Identity context of one training call (Optuna trial, replay, fold).
+
+    Resolves the data identity through the process-level digest cache;
+    unreadable inputs leave it unresolved (warned), never guessed.
+    """
+    from src.utils.identity import condition_of
+
+    try:
+        data = resolve_data_identity(
+            processed_dir, dataset_name, embeddings_path, splits=SELECTION_SPLITS
+        )
+    except IdentityError as exc:
+        logger.warning("%s/%s: data identity unresolved (%s).", dataset_name, embedding_name, exc)
+        data = None
+    return build_identity_context(data, condition=condition_of(embedding_name), fold=fold)
+
+
+def _cell_data_identity(
+    cache: dict[tuple[str, str | None], DataIdentity | None],
+    cell: _Cell,
+    processed_dir: str,
+) -> DataIdentity | None:
+    """Content identity of *cell*'s dataset + feature, memoised per cell key.
+
+    ``None`` when the split files or the artifact cannot be read: the
+    job is then recorded with an *unresolved* identity (never a guessed
+    one) and the training call fails on the missing input itself.
+    """
+    key = (cell.dataset_name, cell.embedding_path)
+    if key not in cache:
+        try:
+            cache[key] = resolve_data_identity(
+                processed_dir,
+                cell.dataset_name,
+                cell.embedding_path,
+                splits=SELECTION_SPLITS,
+            )
+        except IdentityError as exc:
+            logger.warning(
+                "%s/%s: data identity unresolved (%s); jobs of this cell carry no content digests.",
+                cell.dataset_name,
+                cell.embedding_name,
+                exc,
+            )
+            cache[key] = None
+    return cache[key]
 
 
 def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -> None:
@@ -468,9 +673,13 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     # Fairness guard-rail (Task H): no recommender may declare its own
     # protocol budget — the budget is shared per dataset. Fail before
     # training rather than confound the comparison silently.
-    from src.recommenders.hp_budget import assert_uniform_budget
+    from src.recommenders.hp_budget import assert_uniform_budget, resolve_hp_budget
 
     assert_uniform_budget(config)
+    # Resolve every dataset's budget up front so an unsupported selection
+    # metric or a malformed value fails before any cell trains (R03).
+    for dataset_name in config.get("datasets", []):
+        resolve_hp_budget(config, dataset_name)
     # Dimension-parity guard-rail: every recommender draws its dimensions
     # from the shared common.total_dim budget (H1 controls capacity).
     assert_dimension_parity(config)
@@ -486,11 +695,10 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
         processed_dir=config["paths"]["data_processed"],
     )
 
-    startup_mgr = CheckpointManager()
-    removed = startup_mgr.clear_all_training_checkpoints()
-    if removed > 0:
-        logger.info("Cleared %d stale training checkpoint(s) at startup", removed)
-
+    # No global cleanup of ``checkpoints/training/`` here (E04): a resume
+    # envelope belongs to the run whose identity it carries, and
+    # ``train_single_run`` validates that identity before reuse.  Deleting
+    # every file at startup destroyed another run's resumable state.
     strategy = get_strategy(config)
     logger.info("Hyperparameter-search strategy: %s", strategy)
 
@@ -604,18 +812,32 @@ def _run_grid(
 
     logger.info("Total pending jobs: %d", len(jobs))
 
+    # M05: admit jobs against the resolved host budget BEFORE launching
+    # anything.  A job whose declared minimum exceeds the budget is
+    # refused once (a failed outcome), never launched repeatedly.
     n_workers = 1 if sequential else workers
-    orchestrator = TrainingOrchestrator(
-        n_workers=n_workers,
-        device=device,
-        log_dir="logs",
-        per_worker_bytes=_estimate_worker_bytes(jobs, processed_dir),
+    admitted, refused, plan = plan_training_admission(
+        jobs, processed_dir, config, requested_workers=n_workers
     )
-
-    results = orchestrator.run(jobs)
+    results = [_refused_result(job, reason) for job, reason in refused]
+    if admitted:
+        # The resolved configuration travels with the pool: a spawned
+        # worker must never rebuild it from the YAML defaults (F05).
+        orchestrator = TrainingOrchestrator(
+            n_workers=plan.n_workers if not sequential else 1,
+            device=device,
+            log_dir="logs",
+            per_worker_bytes=plan.per_worker_bytes,
+            config=config,
+            admission=plan,
+        )
+        results.extend(orchestrator.run(admitted))
 
     ok = sum(1 for r in results if r.get("status") == "ok")
     logger.info("Training complete: %d/%d experiments succeeded.", ok, len(jobs))
+    # Completed jobs already wrote their checkpoints and grid progress;
+    # the exception only denies the step (and the run) a success marker.
+    _raise_if_work_failed(results, [j.job_id for j in jobs], id_key="job_id", unit="job")
 
 
 #: Host RAM a training worker needs on top of its data: the Python
@@ -627,43 +849,201 @@ _WORKER_BASE_BYTES = 1536 * 1024**2
 #: multiplier converts the on-disk CSV size into a resident estimate.
 _INTERACTIONS_MEMORY_FACTOR = 40
 
+#: Rows a lazy source stages per gather (``BaseRecommender._LAZY_ITEM_BLOCK``)
+#: and the number of such blocks charged to a lazy job (source rows on the
+#: host plus their cast/transfer copy).
+_LAZY_BLOCK_ROWS = 8192
+_LAZY_BLOCKS_CHARGED = 2
+
+
+@dataclass(frozen=True)
+class JobMemoryEstimate:
+    """Ledger of one training job's host footprint (M05, SPEC "Memory ledger")."""
+
+    feature_bytes: int
+    model_bytes: int
+    interactions_bytes: int
+    ranking_bytes: int
+    base_bytes: int = _WORKER_BASE_BYTES
+
+    @property
+    def total(self) -> int:
+        return (
+            self.base_bytes
+            + self.feature_bytes
+            + self.model_bytes
+            + self.interactions_bytes
+            + self.ranking_bytes
+        )
+
+
+def _file_size(path: str | Path) -> int:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def feature_payload_bytes(path: str | Path | None) -> tuple[int, int]:
+    """``(raw payload bytes, visual width)`` of a feature artifact.
+
+    A ``.npy`` is measured from its header; an online-fusion sidecar sums
+    the payloads of its components (its own JSON size says nothing about
+    what a worker loads).  Unreadable inputs count as ``(0, 0)``.
+    """
+    if path is None:
+        return 0, 0
+    file = Path(path)
+    try:
+        if file.suffix == ".json":
+            sidecar = json.loads(file.read_text(encoding="utf-8"))
+            parts = [npy_payload_bytes(file.parent / c) for c in sidecar.get("components", [])]
+            return sum(b for b, _ in parts), sum(w for _, w in parts)
+        return npy_payload_bytes(file)
+    except (OSError, ValueError, KeyError):
+        return 0, 0
+
+
+def _resident_feature_bytes(payload: int, width: int, *, lazy: bool) -> int:
+    if not lazy:
+        return payload
+    return min(payload, _LAZY_BLOCK_ROWS * width * 4 * _LAZY_BLOCKS_CHARGED)
+
+
+def estimate_job_bytes(
+    job: TrainingJob, processed_dir: str, config: dict, *, lazy: bool
+) -> JobMemoryEstimate:
+    """Host bytes one worker needs for *job*: payload, model/optimizer, data, ranking."""
+    from src.evaluation.protocol import host_ranking_bytes
+
+    payload, width = feature_payload_bytes(job.embeddings_path)
+    hp = job.hyperparams
+    total_dim = (
+        hp.get("total_dim") or hp.get("latent_dim") or config.get("common", {}).get("total_dim")
+    )
+    inter = _file_size(Path(processed_dir) / job.dataset_name / "train.csv") + _file_size(
+        Path(processed_dir) / job.dataset_name / "val.csv"
+    )
+    return JobMemoryEstimate(
+        feature_bytes=_resident_feature_bytes(payload, width, lazy=lazy),
+        model_bytes=estimate_model_state_bytes(
+            job.n_users, job.n_items, total_dim, visual_dim=width
+        ),
+        interactions_bytes=inter * _INTERACTIONS_MEMORY_FACTOR,
+        ranking_bytes=host_ranking_bytes(job.n_items),
+    )
+
+
+def plan_training_admission(
+    jobs: list[TrainingJob],
+    processed_dir: str,
+    config: dict,
+    *,
+    requested_workers: int,
+) -> tuple[list[TrainingJob], list[tuple[TrainingJob, str]], AdmissionPlan]:
+    """Split *jobs* into admitted / refused and size the pool (M05, Q10).
+
+    Each job is charged its feature payload (source bytes, not sidecar
+    size), model + optimizer state, interaction dicts and the host
+    ranking workspace, on top of the worker base.  Under
+    ``resources.feature_residency: auto`` a job whose dense payload does
+    not fit is switched to lazy reads before the verdict.  Jobs whose
+    declared minimum still exceeds ``budget - headroom`` are refused; the
+    pool is sized so the aggregate commitment of the admitted jobs'
+    heaviest estimate fits, capped by the requested/auto worker count,
+    the CPU quota and ``resources.max_workers``.
+    """
+    resources = resolve_resources(config)
+    budget = resolve_host_budget(config)
+    usable = max(0, budget.limit_bytes - resources.headroom_bytes)
+    admitted: list[TrainingJob] = []
+    refused: list[tuple[TrainingJob, str]] = []
+    heaviest = 0
+    for job in jobs:
+        payload, _ = feature_payload_bytes(job.embeddings_path)
+        job.lazy_features = choose_lazy_features(resources.feature_residency, payload, usable)
+        estimate = estimate_job_bytes(job, processed_dir, config, lazy=job.lazy_features)
+        if estimate.total > usable:
+            refused.append((job, _refusal_reason(estimate, usable, budget.source)))
+            continue
+        heaviest = max(heaviest, estimate.total)
+        admitted.append(job)
+    hard_cap = requested_workers if requested_workers > 0 else max(1, available_cpus() - 1)
+    plan = admit_workers(
+        heaviest,
+        hard_cap=hard_cap,
+        budget=budget,
+        headroom_bytes=resources.headroom_bytes,
+        max_workers=resources.max_workers,
+        label="training pool",
+    )
+    logger.info(
+        "Admission: %d job(s) admitted, %d refused; budget %.2f GB (%s), headroom %.2f GB, "
+        "heaviest job %.2f GB, workers %d, feature residency %s.",
+        len(admitted),
+        len(refused),
+        budget.limit_bytes / 1024**3,
+        budget.source,
+        resources.headroom_bytes / 1024**3,
+        heaviest / 1024**3,
+        plan.n_workers,
+        resources.feature_residency,
+    )
+    for job, reason in refused:
+        logger.error("  refused %s: %s", job.job_id, reason)
+    return admitted, refused, plan
+
+
+def _refusal_reason(estimate: JobMemoryEstimate, usable: int, source: str) -> str:
+    gb = 1024**3
+    return (
+        f"declared minimum {estimate.total / gb:.2f} GB (features {estimate.feature_bytes / gb:.2f}, "
+        f"model+optimizer {estimate.model_bytes / gb:.2f}, interactions "
+        f"{estimate.interactions_bytes / gb:.2f}, ranking {estimate.ranking_bytes / gb:.2f}, base "
+        f"{estimate.base_bytes / gb:.2f}) exceeds the usable host budget {usable / gb:.2f} GB "
+        f"({source}); not launched"
+    )
+
+
+def _refused_result(job: TrainingJob, reason: str) -> dict:
+    return {
+        "job_id": job.job_id,
+        "outcome": "failed",
+        "attempts": 0,
+        "status": "error",
+        "error": reason,
+        "error_type": "AdmissionRefused",
+    }
+
 
 def _estimate_worker_bytes(jobs: list[TrainingJob], processed_dir: str) -> int:
-    """Estimate the host RAM one training worker holds.
+    """Estimate the host RAM one training worker holds (heaviest job).
 
-    Workers are spawned, not forked, so nothing is shared: each one
-    caches the full visual embedding matrix plus the train/val
-    interaction dicts for the datasets it touches.  The estimate takes
-    the worst case across *jobs* (largest embedding file, largest
-    interaction file) so the pool is sized for the heaviest cell rather
-    than the average one.
-
-    Returns ``0`` when nothing can be measured, which
-    :func:`src.utils.parallel.detect_max_workers` reads as "unknown"
-    and leaves the VRAM heuristic untouched.
+    Kept for callers of the historical helper; the admission planner
+    above is what sizes the pool.  Returns ``0`` when nothing can be
+    measured (``detect_max_workers`` reads that as "unknown").
     """
+    estimates = [estimate_job_bytes(job, processed_dir, {}, lazy=job.lazy_features) for job in jobs]
+    measured = [e.total for e in estimates if e.feature_bytes or e.interactions_bytes]
+    return max(measured, default=0)
 
-    def _size(path: str | Path) -> int:
-        try:
-            return Path(path).stat().st_size
-        except OSError:
-            return 0
 
-    emb_bytes = max(
-        (_size(job.embeddings_path) for job in jobs if job.embeddings_path),
-        default=0,
-    )
-    inter_bytes = max(
-        (
-            _size(Path(processed_dir) / job.dataset_name / "train.csv")
-            + _size(Path(processed_dir) / job.dataset_name / "val.csv")
-            for job in jobs
-        ),
-        default=0,
-    )
-    if emb_bytes == 0 and inter_bytes == 0:
-        return 0
-    return _WORKER_BASE_BYTES + emb_bytes + inter_bytes * _INTERACTIONS_MEMORY_FACTOR
+def lazy_features_for(config: dict, embeddings_path: str | Path | None) -> bool:
+    """Whether a single (non-pooled) training/evaluation call should read lazily.
+
+    ``resources.feature_residency``: ``dense`` (default) keeps today's
+    resident matrices, ``lazy`` always reads bounded rows, ``auto``
+    switches when the dense payload would not fit the usable budget.
+    """
+    if embeddings_path is None:
+        return False
+    resources = resolve_resources(config)
+    if resources.feature_residency == "dense":
+        return False
+    budget = resolve_host_budget(config)
+    payload, _ = feature_payload_bytes(embeddings_path)
+    usable = max(0, budget.limit_bytes - resources.headroom_bytes)
+    return choose_lazy_features(resources.feature_residency, payload, usable)
 
 
 def _legit_trial_count(study) -> int:
@@ -912,10 +1292,13 @@ def _run_optuna(
     device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
-    n_trials = int(config["hp_search"]["optuna"]["n_trials"])
+    from src.recommenders.hp_budget import resolve_hp_budget
+
+    # The trial count is a per-dataset budget field (hp_budget override).
+    n_trials = {ds: resolve_hp_budget(config, ds)["n_trials"] for ds in config.get("datasets", [])}
 
     cells = _list_cells(condition, config, processed_dir, embeddings_dir)
-    logger.info("Optuna cells to process: %d (n_trials=%d)", len(cells), n_trials)
+    logger.info("Optuna cells to process: %d (n_trials per dataset=%s)", len(cells), n_trials)
 
     # D5: an enabled recommender with zero cells must fail, not vanish.
     counts = {name: 0 for name in _resolve_model_names(config)}
@@ -984,7 +1367,10 @@ def _run_optuna(
         p.start()
         procs.append(p)
 
-    results: list[dict] = []
+    # One slot per submitted cell: a duplicate delivery cannot end the
+    # loop early and leave a real cell unaccounted.
+    expected = [cell.study_name() for cell, _n_users, _n_items, _emb_path in cells]
+    results: dict[str, dict] = {}
     total = len(cells)
     # Live cell-level battery bar (done/total, %, elapsed<ETA, rate).
     # Parent-side observability only — never touches worker computation.
@@ -996,19 +1382,22 @@ def _run_optuna(
     with tqdm(total=total, desc="Training (Optuna cells)", unit="cell", disable=None) as pbar:
         while len(results) < total:
             try:
-                results.append(result_queue.get(timeout=30))
+                last = result_queue.get(timeout=30)
             except Exception:  # noqa: BLE001, queue.Empty from a spawn context
                 if not any(p.is_alive() for p in procs):
                     logger.warning("All Optuna workers exited early.")
                     break
                 continue
+            if last.get("cell") in results:
+                logger.warning("Ignoring duplicate result for cell %s", last.get("cell"))
+                continue
+            results[str(last.get("cell"))] = last
             pbar.update(1)
             # Plain-log ETA for `docker logs` followers, where the tqdm
             # bar does not render (no TTY): rate = cells done / elapsed.
             done = len(results)
             elapsed = _time.monotonic() - t_start
             eta_s = elapsed / done * (total - done)
-            last = results[-1]
             logger.info(
                 "cell %d/%d done (%s, %s) — avg %.1f min/cell, ETA ~%dh%02dm",
                 done,
@@ -1022,11 +1411,11 @@ def _run_optuna(
     for p in procs:
         p.join(timeout=30)
 
-    ok = sum(1 for r in results if r.get("status") == "ok")
+    ok = sum(1 for r in results.values() if r.get("status") == "ok")
     logger.info("Optuna search complete: %d/%d cells succeeded.", ok, len(cells))
-    for r in results:
-        if r.get("status") != "ok":
-            logger.error("  cell %s failed: %s", r.get("cell"), r.get("error"))
+    # Studies of the completed cells are already persisted in the
+    # storage; the exception denies the step its success marker only.
+    _raise_if_work_failed(list(results.values()), expected, id_key="cell", unit="cell")
 
 
 def _list_cells(
@@ -1092,10 +1481,15 @@ def _train_one_optuna_trial(
 
     visual_embeddings = None
     if embeddings_path is not None:
-        visual_embeddings = load_embedding(embeddings_path)
+        visual_embeddings = load_embedding(
+            embeddings_path, lazy=lazy_features_for(config, embeddings_path)
+        )
 
     model_cls = get_recommender_class(cell.model_name)
-    checkpoint_mgr = CheckpointManager()
+    # Resume checkpoints live under the run's ``paths.checkpoints`` so a
+    # seed-isolated config (battery replay, --seeds) gets its own
+    # namespace instead of colliding on the default root (R01/E03).
+    checkpoint_mgr = CheckpointManager(checkpoint_root(config))
 
     item_categories = None
     if getattr(model_cls, "wants_categories", False):
@@ -1120,6 +1514,9 @@ def _train_one_optuna_trial(
         optuna_trial=trial,
         item_categories=item_categories,
         ranking_budget_bytes=ranking_budget_bytes,
+        identity_context=identity_context_for(
+            processed_dir, cell.dataset_name, cell.embedding_name, embeddings_path
+        ),
     )
 
 

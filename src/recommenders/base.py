@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -61,6 +62,19 @@ class BaseRecommender(nn.Module, abc.ABC):
     #: and evaluation steps pass ``train_interactions`` only to such
     #: models, so models that do not accept the keyword are untouched.
     wants_history: bool = False
+
+    #: Bytes held per ``(user, item)`` pair by :meth:`predict_batch`, on
+    #: top of the ``(B, N)`` score matrix it returns.  The evaluator
+    #: budgets its own buffers (the returned matrix, the tie-break
+    #: reordering and the sort workspace) and adds this, so a model that
+    #: keeps extra full-size intermediates alive gets a smaller user
+    #: batch instead of an OOM.
+    #:
+    #: ``0`` is right for any model whose ``predict_batch`` builds the
+    #: score matrix and nothing else of size ``(B, N)`` — the whole
+    #: linear visual-BPR family.  Count 4 bytes per extra fp32 buffer
+    #: live at the peak.
+    PREDICT_BATCH_BYTES_PER_ELEMENT: int = 0
 
     #: Embedding tables whose rows are gathered per batch for the
     #: BPR-Opt L2 penalty (see :meth:`l2_reg`).  ``_L2_USER_TABLES`` are
@@ -123,7 +137,7 @@ class BaseRecommender(nn.Module, abc.ABC):
         self.register_forward_pre_hook(_record_bpr_batch)
 
         # Register visual embeddings as a non-trainable buffer if provided.
-        # Three layouts are accepted:
+        # Three array layouts are accepted:
         #   2-D ``(n_items, D)``    — pre-fused or single-source embeddings
         #                             (the long-standing default).
         #   3-D ``(n_items, M, D)`` — M equal-dim source embeddings stacked
@@ -133,51 +147,89 @@ class BaseRecommender(nn.Module, abc.ABC):
         #                             differing dims + metadata; drives a
         #                             LearnedAlignmentFusion (per-source
         #                             learned projections, alignment=learned).
+        # A lazy ``FeatureSource`` (SDD M01/M02) carries the same three
+        # layouts by shape/attributes but is NOT registered as a buffer:
+        # ``model.to(device)`` moves no raw feature, and ``_resolve_visual``
+        # gathers only the requested rows per forward pass.
         # ``self.visual_dim_raw`` always reports the dimension the model's
         # learned projection E consumes, regardless of the layout.
         self._online_fusion: nn.Module | None = None
-        source_dims = getattr(visual_embeddings, "source_dims", None)
-        if visual_embeddings is not None and source_dims:
-            from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
+        self._feature_source = None
+        self._visual_shape: tuple[int, ...] | None = None
+        self.visual_dim_raw = 0
+        from src.data.feature_source import is_feature_source  # avoid cycle
 
+        if visual_embeddings is None:
+            self.visual_features: torch.Tensor | None = None
+        elif is_feature_source(visual_embeddings):
+            # No buffer: the plain attribute keeps ``model.visual_features``
+            # readable (``None``) while ``model.to`` has nothing to move.
+            self.visual_features = None
+            self._init_lazy_visual(visual_embeddings, config)
+        else:
+            self._init_dense_visual(visual_embeddings, config)
+
+    def _init_dense_visual(self, visual_embeddings: np.ndarray, config: dict) -> None:
+        """Historical path: the whole matrix becomes a non-persistent buffer."""
+        source_dims = getattr(visual_embeddings, "source_dims", None)
+        if source_dims:
             arr = torch.FloatTensor(np.asarray(visual_embeddings))
             self.register_buffer("visual_features", arr, persistent=False)
+            self._visual_shape = tuple(arr.shape)
             self.visual_dim_raw = int(visual_embeddings.aligned_dim)
-            self._online_fusion = LearnedAlignmentFusion(
-                source_dims=list(source_dims),
-                dim=int(visual_embeddings.aligned_dim),
-                strategy=visual_embeddings.strategy,
-                normalize=bool(visual_embeddings.normalize),
-                **visual_embeddings.fusion_kwargs,
-            )
-        elif visual_embeddings is not None:
-            raw = np.asarray(visual_embeddings)
-            if raw.ndim == 3 and self.consumes_raw_components:
-                # Raw component buffer (n_items, M, D): the consuming model
-                # (e.g. ACF) applies its own component attention; no online
-                # fusion module is created.  The on-disk dtype (fp16 for
-                # every extracted ``*_comp.npy``) is KEPT — the consumer
-                # casts the gathered rows — so the catalogue costs half the
-                # VRAM of an fp32 copy; ``np.array`` materialises a memmap.
-                arr = torch.from_numpy(np.array(raw))
-            else:
-                arr = torch.FloatTensor(raw)
-            if arr.dim() == 3 and not self.consumes_raw_components:
-                self.register_buffer("visual_features", arr, persistent=False)
-                self.visual_dim_raw = int(arr.shape[-1])
-                self._init_online_fusion(int(arr.shape[1]), self.visual_dim_raw, config)
-            elif arr.dim() in (2, 3):
-                # 2-D pooled features, or the raw component buffer above.
-                self.register_buffer("visual_features", arr, persistent=False)
-                self.visual_dim_raw = int(arr.shape[-1])
-            else:
-                raise ValueError(
-                    f"visual_embeddings must be 2-D (n_items, D) or 3-D "
-                    f"(n_items, M, D); got shape {tuple(arr.shape)}.",
-                )
+            self._init_learned_alignment(visual_embeddings)
+            return
+        raw = np.asarray(visual_embeddings)
+        if raw.ndim == 3 and self.consumes_raw_components:
+            # Raw component buffer (n_items, M, D): the consuming model
+            # (e.g. ACF) applies its own component attention; no online
+            # fusion module is created.  The on-disk dtype (fp16 for
+            # every extracted ``*_comp.npy``) is KEPT — the consumer
+            # casts the gathered rows — so the catalogue costs half the
+            # VRAM of an fp32 copy; ``np.array`` materialises a memmap.
+            arr = torch.from_numpy(np.array(raw))
         else:
-            self.visual_features: torch.Tensor | None = None
-            self.visual_dim_raw = 0
+            arr = torch.FloatTensor(raw)
+        if arr.dim() not in (2, 3):
+            raise ValueError(
+                f"visual_embeddings must be 2-D (n_items, D) or 3-D "
+                f"(n_items, M, D); got shape {tuple(arr.shape)}.",
+            )
+        self.register_buffer("visual_features", arr, persistent=False)
+        self._visual_shape = tuple(arr.shape)
+        self.visual_dim_raw = int(arr.shape[-1])
+        if arr.dim() == 3 and not self.consumes_raw_components:
+            self._init_online_fusion(int(arr.shape[1]), self.visual_dim_raw, config)
+
+    def _init_lazy_visual(self, source, config: dict) -> None:
+        """Bounded path: keep the source, gather rows on demand (no buffer)."""
+        shape = tuple(int(s) for s in source.shape)
+        if len(shape) not in (2, 3):
+            raise ValueError(
+                f"visual feature source must be 2-D (n_items, D) or 3-D "
+                f"(n_items, M, D); got shape {shape}.",
+            )
+        self._feature_source = source
+        self._visual_shape = shape
+        if getattr(source, "source_dims", None):
+            self.visual_dim_raw = int(source.aligned_dim)
+            self._init_learned_alignment(source)
+            return
+        self.visual_dim_raw = int(shape[-1])
+        if len(shape) == 3 and not self.consumes_raw_components:
+            self._init_online_fusion(int(shape[1]), self.visual_dim_raw, config)
+
+    def _init_learned_alignment(self, recipe) -> None:
+        """Build the learned-alignment fusion from a ragged source's recipe."""
+        from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
+
+        self._online_fusion = LearnedAlignmentFusion(
+            source_dims=list(recipe.source_dims),
+            dim=int(recipe.aligned_dim),
+            strategy=recipe.strategy,
+            normalize=bool(recipe.normalize),
+            **recipe.fusion_kwargs,
+        )
 
     def _init_online_fusion(self, n_sources: int, dim: int, config: dict) -> None:
         """Instantiate the online fusion module declared in ``config``.
@@ -196,6 +248,95 @@ class BaseRecommender(nn.Module, abc.ABC):
                 f"Online fusion {strategy!r} expects 2 source embeddings, got {n_sources}.",
             )
 
+    # ----------------------------------------------------------- raw features
+    #: Items per block when a request is larger than this (the catalogue
+    #: at evaluation).  Callers that map a row-wise function over the
+    #: features use :meth:`_map_visual`, and :meth:`_resolve_visual`
+    #: runs an online fusion block by block, so the raw rows staged on
+    #: the device are bounded by the block, not by ``N`` -- for a lazy
+    #: source *and* for the dense buffer: indexing the resident buffer
+    #: with the whole catalogue copies it (3.9 GB for amazon_women's
+    #: learned-fusion concat) before the fusion adds its own temporaries,
+    #: which is what pushed every user batch into the per-user fallback
+    #: under an 8 GB VRAM cap on 2026-09-06.  The name is historical.
+    _LAZY_ITEM_BLOCK: int = 8192
+
+    @property
+    def has_visual_features(self) -> bool:
+        """Whether the model was given visual features (dense or lazy)."""
+        return self._visual_shape is not None
+
+    @property
+    def visual_shape(self) -> tuple[int, ...] | None:
+        """Full ``(n_items, *trailing)`` shape of the raw features, or ``None``."""
+        return self._visual_shape
+
+    @property
+    def is_lazy_visual(self) -> bool:
+        """Whether raw rows are gathered from a bounded source on demand."""
+        return self._feature_source is not None
+
+    def _raw_visual_rows(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Raw feature rows for ``item_ids`` of any shape: ``(*ids.shape, *trailing)``.
+
+        Dense: plain buffer indexing.  Lazy: the unique ids are read from
+        the source once (I/O deduplication), moved to ``item_ids``'s
+        device and scattered back through the inverse index, so repeated
+        ids — ACF's padded histories, a positive that recurs in the batch
+        — reproduce exactly the rows and order the dense path yields.
+        Raw rows carry no gradient in either mode; whatever consumes
+        them (projection ``E``, online fusion) stays inside autograd.
+        """
+        if self._feature_source is None:
+            if self.visual_features is None:
+                raise RuntimeError("This recommender was instantiated without visual_embeddings.")
+            return self.visual_features[item_ids]
+        flat = item_ids.reshape(-1)
+        unique, inverse = torch.unique(flat, return_inverse=True)
+        rows = self._feature_source.read_rows(unique.cpu().numpy())
+        keep_dtype = self.consumes_raw_components and len(self._visual_shape or ()) == 3
+        tensor = torch.from_numpy(rows)
+        if not keep_dtype:
+            tensor = tensor.float()
+        gathered = tensor.to(item_ids.device)[inverse]
+        return gathered.reshape(*item_ids.shape, *gathered.shape[1:])
+
+    def _map_visual(
+        self,
+        item_ids: torch.Tensor,
+        fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """``fn(features, ids)`` over 1-D ``item_ids``, in blocks of at most
+        :attr:`_LAZY_ITEM_BLOCK` rows.
+
+        ``fn`` must be row-wise (each output row depends on its input row
+        only) so concatenating per-block results equals one call.  A
+        request within the block size is a single call.
+        """
+        block = self._LAZY_ITEM_BLOCK
+        if item_ids.shape[0] <= block:
+            return fn(self._resolve_visual(item_ids), item_ids)
+        parts = [
+            fn(
+                self._resolve_visual(item_ids[start : start + block]),
+                item_ids[start : start + block],
+            )
+            for start in range(0, item_ids.shape[0], block)
+        ]
+        return torch.cat(parts, dim=0)
+
+    def _visual_generation(self) -> tuple:
+        """Identity of the raw features for derived-cache keys.
+
+        The dense buffer's in-place version counter (tests mutate rows),
+        or the immutable lazy source's identity.
+        """
+        if self._feature_source is not None:
+            return ("source", id(self._feature_source))
+        if self.visual_features is None:
+            return ("none",)
+        return ("buffer", self.visual_features._version)
+
     def _resolve_visual(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Return per-item visual features as a ``(B, D)`` tensor.
 
@@ -204,23 +345,36 @@ class BaseRecommender(nn.Module, abc.ABC):
         is applied to produce the fused representation; otherwise the
         buffer is indexed directly.
         """
-        if self.visual_features is None:
+        if not self.has_visual_features:
             raise RuntimeError("This recommender was instantiated without visual_embeddings.")
-
         if self._online_fusion is None:
-            return self.visual_features[item_ids]
+            return self._raw_visual_rows(item_ids)
+        block = self._LAZY_ITEM_BLOCK
+        if item_ids.dim() == 1 and item_ids.shape[0] > block:
+            # The fused output is (N, D_fused), small; the raw rows the
+            # fusion reads are the large part, so fuse block by block.
+            return torch.cat(
+                [
+                    self._fuse_rows(item_ids[start : start + block])
+                    for start in range(0, item_ids.shape[0], block)
+                ],
+                dim=0,
+            )
+        return self._fuse_rows(item_ids)
 
+    def _fuse_rows(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Gather the raw rows of ``item_ids`` and apply the online fusion."""
+        rows = self._raw_visual_rows(item_ids)
         from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
 
         if isinstance(self._online_fusion, LearnedAlignmentFusion):
-            # 2-D ragged concat buffer: the module splits by source_dims,
+            # 2-D ragged concat rows: the module splits by source_dims,
             # projects each native source to the aligned dim and fuses.
-            return self._online_fusion(self.visual_features[item_ids])
+            return self._online_fusion(rows)
 
-        # 3-D buffer: features[item_ids] has shape (B, M, D).
-        stacked = self.visual_features[item_ids]
-        e1 = stacked[:, 0, :]
-        e2 = stacked[:, 1, :]
+        # 3-D rows (B, M, D).
+        e1 = rows[:, 0, :]
+        e2 = rows[:, 1, :]
         return self._online_fusion(e1, e2)
 
     @abc.abstractmethod

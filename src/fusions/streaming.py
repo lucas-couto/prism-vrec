@@ -233,8 +233,8 @@ def _stream_pca(
     """PCA over the concatenation of all sources, fit on train rows only.
 
     The fit matrix is the one irreducible allocation: an exact PCA needs
-    every training row at once.  It is assembled source by source so
-    only one source block is held on top of it, and handed to
+    every training row at once.  It is assembled source by source in
+    row blocks so only one chunk is held on top of it, and handed to
     scikit-learn with ``copy=False`` so the centring happens in place
     instead of doubling the peak.
     """
@@ -242,7 +242,9 @@ def _stream_pca(
     total_dim = sum(int(src.shape[1]) for src in sources)
     input_dtype = _output_dtype(sources, normalize)
 
-    fit_rows = _assemble_fit_matrix(sources, fit_idx, normalize, total_dim, input_dtype)
+    fit_rows = _assemble_fit_matrix(
+        sources, fit_idx, normalize, total_dim, input_dtype, chunk_rows=chunk_rows
+    )
     # Mirrors _fit_pca_train_only: clamped against the full matrix
     # first, then against the (smaller) fit matrix.
     k = min(n_components, n_rows, total_dim)
@@ -279,7 +281,8 @@ def _stream_pca_per_model(
     fitted = []
     for i, src in enumerate(sources):
         d = int(src.shape[1])
-        block = _prepare(src, fit_idx, normalize)
+        block = np.empty((int(fit_idx.shape[0]), d), dtype=_output_dtype([src], normalize))
+        _gather_rows(src, fit_idx, normalize, chunk_rows, out=block)
         k = min(n_components, n_rows, d)
         k = min(k, *block.shape)
         fitted.append(fit_pca_on_rows(block, k, random_state, f"pca_per_model[src{i}]", copy=False))
@@ -359,24 +362,48 @@ def stream_pca_align(
     return shape
 
 
+def _gather_rows(
+    source: np.ndarray,
+    fit_idx: np.ndarray,
+    normalize: bool,
+    chunk_rows: int,
+    out: np.ndarray,
+) -> np.ndarray:
+    """Copy ``source[fit_idx]`` (normalised on request) into *out* in row blocks.
+
+    Fancy-indexing a memmap with the whole *fit_idx* materialises every
+    selected row at once, and :func:`l2_normalize` then makes a second
+    full copy: for a 300K-item training set over a 2048-d source that
+    is two extra matrices of 2.5 GB on top of the destination.  Reading
+    *chunk_rows* indices at a time keeps those temporaries at chunk
+    size.  The values are identical: each row is produced by the same
+    :func:`_prepare` call the in-memory path uses.
+    """
+    for rows in _chunks(int(fit_idx.shape[0]), chunk_rows):
+        out[rows] = _prepare(source, fit_idx[rows], normalize)
+    return out
+
+
 def _assemble_fit_matrix(
     sources: list[np.ndarray],
     fit_idx: np.ndarray,
     normalize: bool,
     total_dim: int,
     dtype: np.dtype,
+    chunk_rows: int = CHUNK_ROWS,
 ) -> np.ndarray:
     """Build the ``(n_fit, total_dim)`` PCA fit matrix one source at a time.
 
     Equivalent to ``np.concatenate([...], axis=1)[fit_idx]`` but never
-    holds a full-catalogue array: the peak is the fit matrix plus a
-    single source's training rows.
+    holds a full-catalogue array: the peak is the fit matrix plus one
+    *chunk* of a single source's training rows (see
+    :func:`_gather_rows`), not the fit matrix plus a whole source.
     """
     fit_rows = np.empty((fit_idx.shape[0], total_dim), dtype=dtype)
     cursor = 0
     for src in sources:
         d = int(src.shape[1])
-        fit_rows[:, cursor : cursor + d] = _prepare(src, fit_idx, normalize)
+        _gather_rows(src, fit_idx, normalize, chunk_rows, out=fit_rows[:, cursor : cursor + d])
         cursor += d
     return fit_rows
 

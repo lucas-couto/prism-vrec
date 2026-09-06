@@ -11,7 +11,11 @@ import ast
 from pathlib import Path
 
 from src.evaluation.protocol import _DEFAULT_RANKING_VRAM_FRACTION
-from src.utils.device import POOL_VRAM_FRACTION, SOLO_PROCESS_VRAM_FRACTION
+from src.utils.device import (
+    POOL_VRAM_FRACTION,
+    RUN_RESOURCE_SHARE,
+    SOLO_PROCESS_VRAM_FRACTION,
+)
 from src.utils.parallel import _RANKING_VRAM_SHARE
 
 #: Every entry point that owns a CUDA process for a long stretch and so
@@ -30,12 +34,12 @@ def _planned_fraction(n_workers: int) -> float:
 
 
 def test_should_leave_vram_headroom_for_a_solo_process() -> None:
-    assert _planned_fraction(1) < 1.0
+    assert _planned_fraction(1) <= RUN_RESOURCE_SHARE
 
 
-def test_should_keep_the_sum_of_worker_caps_below_the_card() -> None:
+def test_should_hold_every_worker_count_to_the_run_resource_share() -> None:
     for n_workers in (1, 2, 3, 4, 8):
-        assert _planned_fraction(n_workers) * n_workers <= POOL_VRAM_FRACTION
+        assert _planned_fraction(n_workers) * n_workers <= RUN_RESOURCE_SHARE
 
 
 def test_should_size_the_ranking_budget_below_half_the_process_allowance() -> None:

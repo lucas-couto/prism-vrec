@@ -8,7 +8,12 @@ import torch
 
 from src.evaluation.derive_metrics import per_user_metrics
 from src.evaluation.paired_loader import UserSetMismatchError, load_paired
-from src.evaluation.persistence import CellMetadata, read_cell_artifact, write_cell_artifact
+from src.evaluation.persistence import (
+    CellMetadata,
+    contract_fields,
+    read_cell_artifact,
+    write_cell_artifact,
+)
 from src.evaluation.protocol import Evaluator
 
 
@@ -128,7 +133,7 @@ class TestFoldProvenanceCompatibility:
         read_meta, _ = read_cell_artifact(path)
 
         assert "fold" in read_meta and read_meta["fold"] is None
-        assert CellMetadata(**read_meta).fold is None
+        assert CellMetadata(**contract_fields(read_meta)).fold is None
 
     def test_legacy_meta_without_fold_key_still_reads(self, tmp_path) -> None:
         import json
@@ -144,7 +149,7 @@ class TestFoldProvenanceCompatibility:
 
         assert "fold" not in read_meta
         assert len(read_df) == _NU
-        assert CellMetadata(**read_meta).fold is None
+        assert CellMetadata(**contract_fields(read_meta)).fold is None
 
     def test_fold_provenance_round_trips(self, tmp_path) -> None:
         records = _evaluator().per_user_records(_ScoreModel(_distinct_scores()), device="cpu")
@@ -154,7 +159,7 @@ class TestFoldProvenanceCompatibility:
         read_meta, _ = read_cell_artifact(path)
 
         assert read_meta["fold"] == fold
-        assert CellMetadata(**read_meta) == self._meta(fold=fold)
+        assert CellMetadata(**contract_fields(read_meta)) == self._meta(fold=fold)
 
 
 def _write_cell(tmp_path, evaluator, scores, recommender, visual_config, seed=7) -> None:

@@ -68,6 +68,15 @@ import numpy as np
 import pandas as pd
 from scipy.stats import friedmanchisquare, wilcoxon
 
+from src.evaluation.paired_validation import (
+    POPULATION_STRICT,
+    align_pair,
+    check_finite,
+    check_population_policy,
+    require_equal_populations,
+    validate_observations,
+)
+
 
 def wilcoxon_test(
     scores_a: np.ndarray,
@@ -347,17 +356,15 @@ def _ensure_config(results_df: pd.DataFrame) -> pd.DataFrame:
 
     Non-visual baselines (``bpr`` / ``none``) are written to both battery
     files; in ``condition="all"`` they therefore appear twice per user
-    with identical metrics. Deduplicating on ``(user_id, config)`` keeps
-    one — lossless, and required so the pivots have a unique index.
+    with identical metrics.  That is the ONLY duplicate accepted, and only
+    after every value matches: a changed value under the same key, an
+    identical duplicate of a visual cell, mixed seeds/protocols or a
+    config whose rows come from more than one artifact all raise a
+    :class:`~src.evaluation.paired_validation.PairedValidationError`
+    (R04 / Q17; see that module).  Rows come back sorted by
+    ``(config, user_id)`` so results do not depend on input row order.
     """
-    out = results_df.copy()
-    if "embedding_name" in out.columns:
-        out["config"] = out["model_name"].astype(str) + "_" + out["embedding_name"].astype(str)
-    else:
-        out["config"] = out["model_name"].astype(str)
-    if "user_id" in out.columns:
-        out = out.drop_duplicates(subset=["user_id", "config"])
-    return out
+    return validate_observations(results_df)
 
 
 def per_model_summary(
@@ -379,9 +386,12 @@ def per_model_summary(
         )
 
     df = _ensure_config(results_df)
+    check_finite(df, metric)
     rows: list[dict] = []
     for config, group in df.groupby("config", sort=True):
-        scores = group[metric].dropna().to_numpy()
+        # Validated frames are sorted by user, so the seeded resample
+        # draws the same users whatever the caller's row order was.
+        scores = group[metric].to_numpy(dtype=float)
         mean, lo, hi = bootstrap_ci(
             scores,
             n_iterations=n_iterations,
@@ -406,6 +416,8 @@ def friedman_test(
     metric: str,
     alpha: float = 0.05,
     configs: list[str] | tuple[str, ...] | None = None,
+    *,
+    population: str = POPULATION_STRICT,
 ) -> dict:
     """Friedman test across configs on the same set of users.
 
@@ -414,7 +426,11 @@ def friedman_test(
     step applies it PER COMPARISON FAMILY (an omnibus over all ~77
     heterogeneous configs of a dataset answers no research question).
     Returns a dict with ``statistic``, ``p_value``, ``significant``
-    (bool against ``alpha``), ``n_configs``, ``n_users``.
+    (bool against ``alpha``), ``n_configs``, ``n_users``,
+    ``population_policy`` and ``n_users_excluded`` (users lacking a row in
+    some config; always 0 under ``"strict"``, which raises instead —
+    ``"declared_intersection"`` keeps the shared users and reports the
+    count, see :func:`pairwise_significance`).
 
     The reporting step (:mod:`src.steps.statistical`) computes this
     omnibus alongside the pairwise tests and ANNOTATES every pairwise
@@ -430,7 +446,18 @@ def friedman_test(
     df = _ensure_config(results_df)
     if configs is not None:
         df = df[df["config"].isin(set(configs))]
-    pivot = df.pivot(index="user_id", columns="config", values=metric).dropna()
+    check_population_policy(population)
+    check_finite(df, metric)
+    full = df.pivot(index="user_id", columns="config", values=metric)
+    # A joint test over unequal populations is a different comparison:
+    # never intersect the users away unless the caller declared it (R04).
+    if population == POPULATION_STRICT:
+        require_equal_populations(full)
+    pivot = full.dropna()
+    provenance = {
+        "population_policy": population,
+        "n_users_excluded": int(len(full) - len(pivot)),
+    }
     if pivot.shape[1] < 3:
         # Friedman undefined for < 3 groups; the pairwise test is the right tool.
         return {
@@ -440,6 +467,7 @@ def friedman_test(
             "n_configs": int(pivot.shape[1]),
             "n_users": int(pivot.shape[0]),
             "note": "friedman undefined for fewer than 3 configs; use pairwise Wilcoxon instead",
+            **provenance,
         }
 
     columns = [pivot[col].to_numpy() for col in pivot.columns]
@@ -450,6 +478,7 @@ def friedman_test(
         "significant": bool(p_value < alpha),
         "n_configs": int(pivot.shape[1]),
         "n_users": int(pivot.shape[0]),
+        **provenance,
     }
 
 
@@ -469,6 +498,8 @@ def pairwise_significance(
     diff_ci: bool = True,
     n_iterations: int = 1000,
     seed: int = 42,
+    *,
+    population: str = POPULATION_STRICT,
 ) -> pd.DataFrame:
     """Pairwise Wilcoxon tests with correction applied WITHIN one family.
 
@@ -508,6 +539,14 @@ def pairwise_significance(
         the Holm-corrected ``significant`` verdict (see
         :func:`bootstrap_diff_ci`); individual per-config CIs may
         overlap under a significant paired test.
+    population:
+        ``"strict"`` (default): the two configs of every pair must have
+        been evaluated on exactly the same users — a missing or extra
+        user raises instead of being inner-joined away.
+        ``"declared_intersection"``: an explicitly declared restricted
+        analysis over the shared users; every row then reports how many
+        users each side excluded (``n_excluded_a`` / ``n_excluded_b``).
+        Never the default and never chosen automatically (R04).
 
     Returns
     -------
@@ -516,8 +555,15 @@ def pairwise_significance(
         ``n_comparisons_in_family``, ``config_a``, ``config_b``,
         ``mean_a``, ``mean_b``, ``statistic``, ``p_value``,
         ``corrected_p``, ``significant``, ``n_pairs``,
-        ``n_nonzero_pairs``, plus the effect-size and paired-diff-CI
+        ``n_nonzero_pairs``, ``population_policy``, ``n_excluded_a``,
+        ``n_excluded_b``, plus the effect-size and paired-diff-CI
         columns enabled above.
+
+    Raises
+    ------
+    PairedValidationError
+        Conflicting or unexplained duplicate rows, mixed provenance,
+        non-finite metric values, or (strict) unequal populations.
     """
     if correction not in _VALID_CORRECTIONS:
         raise ValueError(
@@ -527,8 +573,10 @@ def pairwise_significance(
         raise ValueError(
             f"Metric '{metric}' not found in DataFrame columns: {list(results_df.columns)}"
         )
+    check_population_policy(population)
 
     df = _ensure_config(results_df)
+    check_finite(df, metric)
     if pairs is None:
         configs = sorted(df["config"].unique())
         if len(configs) < 2:
@@ -553,9 +601,9 @@ def pairwise_significance(
     m_family = len(pairs)
 
     for config_a, config_b in pairs:
-        valid = pivot[[config_a, config_b]].dropna()
-        scores_a = valid[config_a].to_numpy()
-        scores_b = valid[config_b].to_numpy()
+        scores_a, scores_b, n_excluded_a, n_excluded_b = align_pair(
+            pivot, config_a, config_b, population
+        )
 
         stat, p_val = wilcoxon_test(scores_a, scores_b)
         raw_p_values.append(p_val)
@@ -575,6 +623,11 @@ def pairwise_significance(
             # differences are zero; report it so n_pairs is not read as
             # the effective sample size.
             "n_nonzero_pairs": n_nonzero_pairs(scores_a, scores_b),
+            # Population provenance: which policy paired the users and
+            # how many each side lost (always zero under "strict").
+            "population_policy": population,
+            "n_excluded_a": n_excluded_a,
+            "n_excluded_b": n_excluded_b,
         }
         if diff_ci:
             diff_mean, diff_lo, diff_hi = bootstrap_diff_ci(

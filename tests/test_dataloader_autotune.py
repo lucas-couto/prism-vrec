@@ -33,7 +33,7 @@ def _reset_cache():
 
 @pytest.fixture
 def fake_host(monkeypatch):
-    """Return a callable that fakes ``cpu_count`` and the memory budget.
+    """Return a callable that fakes the CPU quota and the memory budget.
 
     Usage::
 
@@ -43,7 +43,7 @@ def fake_host(monkeypatch):
     """
 
     def _set(*, cpu: int, memory_gb: float) -> None:
-        monkeypatch.setattr(autotune_mod.os, "cpu_count", lambda: cpu)
+        monkeypatch.setattr(autotune_mod, "available_cpus", lambda: cpu)
         monkeypatch.setattr(
             autotune_mod,
             "_memory_budget_bytes",
@@ -117,8 +117,8 @@ def test_single_core_host_still_yields_valid_workers(fake_host):
 
 
 def test_zero_cpu_fallback(fake_host, monkeypatch):
-    # os.cpu_count() returns None on some exotic environments.
-    monkeypatch.setattr(autotune_mod.os, "cpu_count", lambda: None)
+    # available_cpus() floors at 1, even on a quota smaller than one core.
+    monkeypatch.setattr(autotune_mod, "available_cpus", lambda: 1)
     monkeypatch.setattr(
         autotune_mod,
         "_memory_budget_bytes",

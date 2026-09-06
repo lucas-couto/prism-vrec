@@ -3,19 +3,36 @@
 import fcntl
 import hashlib
 import json
+import math
+import numbers
 import time
 from pathlib import Path
 
 import torch
 
 from src.evaluation.protocol import Evaluator
+from src.recommenders.hp_budget import SELECTION_K_VALUES, resolve_hp_budget
 from src.utils import flops, telemetry
 from src.utils.amp_compat import cuda_autocast, get_grad_scaler
 from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import (
+    BestCheckpointError,
     CheckpointManager,
+    ResumeStateError,
     capture_rng_states,
+    file_digest,
+    load_best_checkpoint,
     restore_rng_states,
+    validate_best_ref,
+    validate_resume_envelope,
+)
+from src.utils.diagnostics import TrainingDiagnostics
+from src.utils.identity import (
+    canonical_digest,
+    condition_of,
+    experiment_identity,
+    implementation_digest,
+    selection_scope_digest,
 )
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
@@ -141,6 +158,45 @@ def _best_effort_resume_checkpoint(checkpoint_mgr, logger, **kwargs) -> None:
         )
 
 
+class SelectionMetricError(RuntimeError):
+    """The selection metric could not be observed as a finite scalar.
+
+    Raised when the configured early-stopping key is absent from the
+    evaluator output, is not a real scalar, is NaN/Inf, or when the
+    epoch schedule produced no validation at all.  Zero is a legitimate
+    observation; an absent or non-finite one is a failed run and must
+    never be mistaken for zero (Q06).
+    """
+
+
+def _require_selection_metric(metrics: dict, es_metric: str) -> float:
+    """Return ``metrics[es_metric]`` as a finite float or raise.
+
+    ``bool`` is rejected explicitly (it is an ``int`` subclass); 0-d
+    tensors / NumPy scalars are accepted through ``numbers.Real`` after
+    ``.item()``.
+    """
+    if es_metric not in metrics:
+        raise SelectionMetricError(
+            f"selection metric {es_metric!r} is absent from the evaluator output "
+            f"(keys: {sorted(metrics)}); an absent metric is not zero."
+        )
+    value = metrics[es_metric]
+    if hasattr(value, "item") and not isinstance(value, numbers.Real):
+        try:
+            value = value.item()
+        except (ValueError, TypeError, RuntimeError):
+            value = None
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise SelectionMetricError(
+            f"selection metric {es_metric!r} must be a real scalar; got {value!r}."
+        )
+    value = float(value)
+    if not math.isfinite(value):
+        raise SelectionMetricError(f"selection metric {es_metric!r} is not finite: {value!r}.")
+    return value
+
+
 #: Version of the selection-protocol fingerprint payload.  Bump whenever
 #: a field is added, removed or changes meaning, so checkpoints saved
 #: under an older schema read as "different protocol" and are replaced.
@@ -190,6 +246,8 @@ def _save_best_model(
     embedding_name: str,
     fingerprint: str,
     results_root: str | Path = "results",
+    *,
+    identity: dict | None = None,
 ) -> None:
     """Save model weights only if metric beats the existing best on disk.
 
@@ -198,6 +256,13 @@ def _save_best_model(
     including legacy checkpoints saved before the field existed — is not
     comparable and is overwritten with a prominent warning rather than
     silently kept.
+
+    ``identity`` is the C02 payload of the run (E04).  Its *selection
+    scope* (everything but the hyperparameters — data digests, seed,
+    budget, protocol, condition, fold) is stored alongside; an existing
+    best from a different scope (other seed, other split, other feature
+    content, ...) is not comparable either and is overwritten with the
+    same warning.  A legacy best without a scope is identified as such.
     """
     best_model_path = (
         Path(results_root) / "models" / dataset_name / f"{model_name}_{embedding_name}_best.pt"
@@ -210,20 +275,24 @@ def _save_best_model(
         try:
             # Corrupted files left behind by SIGKILL during a prior save
             # are treated as absent (will be overwritten).
+            scope = selection_scope_digest(identity) if identity is not None else None
             if best_model_path.exists():
                 try:
                     existing = torch.load(best_model_path, map_location="cpu", weights_only=False)
                     existing_fp = existing.get("selection_fingerprint")
-                    if existing_fp != fingerprint:
+                    existing_scope = existing.get("selection_scope_digest")
+                    if existing_fp != fingerprint or existing_scope != scope:
                         logger.warning(
-                            "SELECTION PROTOCOL CHANGED: existing best model %s "
-                            "was selected under a different protocol "
-                            "(fingerprint %r != %r; legacy checkpoints have "
-                            "none). Its best_metric=%.4f is NOT comparable to "
-                            "the current run — overwriting it.",
+                            "SELECTION SCOPE CHANGED: existing best model %s "
+                            "was selected under a different protocol or identity "
+                            "(fingerprint %r != %r, scope %r != %r; legacy "
+                            "checkpoints have none). Its best_metric=%.4f is NOT "
+                            "comparable to the current run — overwriting it.",
                             best_model_path,
                             existing_fp,
                             fingerprint,
+                            _short(existing_scope),
+                            _short(scope),
                             float(existing.get("best_metric", 0.0)),
                         )
                     elif existing.get("best_metric", 0.0) >= metric:
@@ -242,12 +311,28 @@ def _save_best_model(
                 "n_users": n_users,
                 "n_items": n_items,
                 "selection_fingerprint": fingerprint,
+                **_identity_fields(identity),
             }
             # atomic_write adds fsync + retried replace on top of the
             # tmp+rename pattern (networked-FS dirent lag).
             atomic_write(lambda tmp, p=payload: torch.save(p, tmp), best_model_path)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _short(digest: str | None) -> str | None:
+    return digest[:12] if isinstance(digest, str) else digest
+
+
+def _identity_fields(identity: dict | None) -> dict:
+    """Additive checkpoint fields binding a payload to its C02 identity."""
+    if identity is None:
+        return {}
+    return {
+        "identity": identity,
+        "identity_digest": canonical_digest(identity),
+        "selection_scope_digest": selection_scope_digest(identity),
+    }
 
 
 def _trial_best_path(
@@ -274,7 +359,8 @@ def _save_trial_best(
     n_users: int,
     n_items: int,
     fingerprint: str,
-) -> None:
+    identity: dict | None = None,
+) -> str:
     """Persist the trial's own best epoch to its TRIAL-LOCAL path.
 
     Intermediate evaluations never touch ``_best.pt`` directly: a trial
@@ -282,6 +368,9 @@ def _save_trial_best(
     invisible to Optuna's ``best_params``, diverging checkpoint and
     study — audit D2).  Promotion happens once, at normal trial
     completion, via :func:`_promote_trial_best`.
+
+    Returns the SHA-256 digest of the committed file so the resume
+    envelope written afterwards can bind itself to exactly these bytes.
     """
     payload = {
         "model_state": model.state_dict(),
@@ -290,9 +379,11 @@ def _save_trial_best(
         "n_users": n_users,
         "n_items": n_items,
         "selection_fingerprint": fingerprint,
+        **_identity_fields(identity),
     }
     trial_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(lambda tmp, p=payload: torch.save(p, tmp), trial_path)
+    return file_digest(trial_path)
 
 
 def _promote_trial_best(
@@ -304,6 +395,8 @@ def _promote_trial_best(
     embedding_name: str,
     results_root: str | Path,
     log,
+    expected_fingerprint: str | None = None,
+    identity: dict | None = None,
 ) -> None:
     """Promote the trial-local best epoch to ``_best.pt``, if it wins.
 
@@ -311,19 +404,27 @@ def _promote_trial_best(
     completed or early-stopped normally); an :class:`optuna.TrialPruned`
     raise skips this call, so ``_best.pt`` can only hold weights of
     trials the study also counts as COMPLETE.
+
+    The trial file is validated before promotion: it must exist, load,
+    carry every payload key, and agree with the in-memory ``best_metric``
+    and (when given) the run's selection fingerprint.  A best value with
+    no usable file is a :class:`BestCheckpointError`, never a silent
+    no-op — the cell would otherwise disappear from the evaluation.
     """
-    if not trial_path.exists():
-        if best_metric > 0.0:
-            # Resume after a kill can restore best_metric from the resume
-            # checkpoint while the trial-local weights were lost with it.
-            log.warning(
-                "trial-local best checkpoint %s missing at promotion time "
-                "(best_metric=%.4f); leaving _best.pt untouched.",
-                trial_path,
-                best_metric,
-            )
-        return
-    payload = torch.load(trial_path, map_location="cpu", weights_only=False)
+    payload = load_best_checkpoint(trial_path)
+    if payload["best_metric"] != best_metric:
+        raise BestCheckpointError(
+            f"trial-local best {trial_path} carries best_metric="
+            f"{payload['best_metric']!r} but the run observed {best_metric!r}."
+        )
+    if (
+        expected_fingerprint is not None
+        and payload["selection_fingerprint"] != expected_fingerprint
+    ):
+        raise BestCheckpointError(
+            f"trial-local best {trial_path} was written under selection fingerprint "
+            f"{payload['selection_fingerprint']!r}, not this run's {expected_fingerprint!r}."
+        )
     _save_best_model(
         payload["model_state"],
         payload["hyperparams"],
@@ -335,6 +436,7 @@ def _promote_trial_best(
         embedding_name,
         payload["selection_fingerprint"],
         results_root=results_root,
+        identity=identity,
     )
 
 
@@ -391,6 +493,218 @@ def bpr_step(
     return loss.detach()
 
 
+def resolve_training_identity(
+    *,
+    model_cls,
+    model_name: str,
+    dataset_name: str,
+    embedding_name: str,
+    hyperparams: dict,
+    config: dict,
+    identity_context: dict | None = None,
+) -> dict:
+    """The C02 identity payload of one training run (E04).
+
+    Everything that makes two trainings the same experiment: the data
+    (dataset, item mapping, split and feature content from
+    ``identity_context["data"]``, or explicitly ``unresolved``), the
+    registered model and its implementation, the effective
+    hyperparameters, the selection budget, the seed, the selection
+    protocol (full-ranking validation, cutoff, metric, sampling and
+    tie-break seeds) and the condition / fold.  Placement details
+    (block sizes, worker count, device, paths) are excluded.  Shared by
+    :func:`train_single_run`, the grid worker and the checkpoint
+    readers so all of them derive one digest from the same inputs.
+    """
+    common = config.get("common", {})
+    base_seed = int(config.get("seed", 42))
+    context = identity_context or {}
+    es_metric = common.get("early_stopping_metric", "ndcg@10")
+    return experiment_identity(
+        data=context.get("data"),
+        model_name=model_name,
+        implementation=implementation_digest(model_cls),
+        hyperparams=hyperparams,
+        selection_budget={
+            "epochs": int(common.get("epochs", 100)),
+            "batch_size": int(common.get("batch_size", 4096)),
+            "patience": int(common.get("early_stopping_patience", 20)),
+            "eval_every_epochs": int(common.get("eval_every_epochs", 10)),
+            "metric": es_metric,
+            "eval_sample_size": common.get("eval_sample_size"),
+            "eval_sample_seed": base_seed,
+        },
+        seed=base_seed,
+        protocol={
+            "candidates": "full_ranking",
+            "k_values": [10],
+            "tiebreak_seed": base_seed,
+            "fingerprint_schema": SELECTION_FINGERPRINT_SCHEMA,
+        },
+        condition=context.get("condition") or condition_of(embedding_name),
+        fold=context.get("fold"),
+    )
+
+
+def _training_resume_identity(
+    identity: dict,
+    *,
+    run_id: str,
+    model_cls_name: str,
+    n_users: int,
+    n_items: int,
+    job_seed: int,
+    fingerprint: str,
+    use_cuda: bool,
+) -> str:
+    """Digest of everything a resume envelope must agree on (Q13).
+
+    The C02 identity plus the resume binding: the run id, the catalogue
+    dimensions, the derived job seed, the selection fingerprint and the
+    AMP regime (a CPU envelope carries no scaler state a CUDA run could
+    restore).
+    """
+    return canonical_digest(
+        {
+            "identity": identity,
+            "resume_binding": {
+                "schema": 2,
+                "run_id": run_id,
+                "model_cls": model_cls_name,
+                "n_users": n_users,
+                "n_items": n_items,
+                "job_seed": job_seed,
+                "selection_fingerprint": fingerprint,
+                "amp": use_cuda,
+            },
+        }
+    )
+
+
+class _SelectionState:
+    """Mutable selection bookkeeping of one trial (current + historical best).
+
+    ``has_valid_observation`` is the explicit "nothing observed yet"
+    marker: ``best_metric`` is only meaningful when it is ``True``, so a
+    legitimate first observation of ``0.0`` becomes the winner instead
+    of being confused with the ``0.0`` placeholder.
+    """
+
+    __slots__ = (
+        "best_epoch",
+        "best_metric",
+        "best_ref",
+        "epochs_without_improvement",
+        "has_valid_observation",
+        "start_epoch",
+    )
+
+    def __init__(self) -> None:
+        self.start_epoch = 0
+        self.best_metric = 0.0
+        self.best_epoch: int | None = None
+        self.best_ref: dict | None = None
+        self.has_valid_observation = False
+        self.epochs_without_improvement = 0
+
+    def is_new_best(self, metric: float) -> bool:
+        """First finite observation wins; afterwards strict improvement."""
+        return not self.has_valid_observation or metric > self.best_metric
+
+    def record_best(self, metric: float, epoch: int, trial_path: Path, digest: str) -> None:
+        self.has_valid_observation = True
+        self.best_metric = metric
+        self.best_epoch = epoch
+        self.best_ref = {"path": str(trial_path), "digest": digest}
+        self.epochs_without_improvement = 0
+
+
+def _restore_training_state(
+    ckpt: dict,
+    *,
+    identity: str,
+    run_id: str,
+    model,
+    optimizer,
+    scaler,
+    trial_best_path: Path,
+    log,
+) -> _SelectionState:
+    """Validate a resume envelope and load it into the live objects.
+
+    Nothing is mutated before the envelope, its identity and (when a best
+    exists) the referenced trial-best file pass validation; the current
+    weights are NEVER used to fabricate a missing best.  The referenced
+    best file must be the run's own trial-local path, so a later
+    promotion reads exactly the bytes the envelope was bound to.
+    """
+    source = f"resume checkpoint {run_id}"
+    validate_resume_envelope(ckpt, expected_identity=identity, source=source)
+    state = _SelectionState()
+    if ckpt["has_valid_observation"]:
+        best_path = validate_best_ref(ckpt["best_ref"], source=source)
+        if best_path.resolve() != trial_best_path.resolve():
+            raise ResumeStateError(
+                f"{source}: best_ref points at {best_path}, not this trial's {trial_best_path}."
+            )
+        state.has_valid_observation = True
+        state.best_metric = float(ckpt["best_metric"])
+        state.best_epoch = ckpt["best_epoch"]
+        state.best_ref = dict(ckpt["best_ref"])
+    model.load_state_dict(ckpt["model_state"])
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    if scaler.is_enabled():
+        scaler.load_state_dict(ckpt["scaler_state"])
+    restore_rng_states(ckpt["rng_states"])
+    state.start_epoch = int(ckpt["epoch"]) + 1
+    state.epochs_without_improvement = int(ckpt.get("epochs_without_improvement", 0))
+    log.info(
+        "resumed %s at epoch %d (has_valid_observation=%s, best_metric=%.6f, best_epoch=%s)",
+        run_id,
+        state.start_epoch,
+        state.has_valid_observation,
+        state.best_metric,
+        state.best_epoch,
+    )
+    return state
+
+
+def _diagnostics_identity(
+    run_id: str,
+    dataset_name: str,
+    model_name: str,
+    embedding_name: str,
+    hyperparams: dict,
+    base_seed: int,
+    job_seed: int,
+    visual_embeddings,
+) -> dict:
+    """Identity block of the S04 diagnostics JSON (recipe attributes when present)."""
+    feature: dict = {}
+    if visual_embeddings is not None:
+        feature["shape"] = [int(s) for s in getattr(visual_embeddings, "shape", ())]
+        for attr in (
+            "normalize",
+            "recipe_version",
+            "sidecar_recipe_version",
+            "strategy",
+            "source_dims",
+            "aligned_dim",
+        ):
+            if hasattr(visual_embeddings, attr):
+                feature[attr] = getattr(visual_embeddings, attr)
+    return {
+        "run_id": run_id,
+        "dataset": dataset_name,
+        "model": model_name,
+        "embedding": embedding_name,
+        "hyperparams": dict(hyperparams),
+        "base_seed": int(base_seed),
+        "job_seed": int(job_seed),
+        "feature": feature,
+    }
+
+
 def train_single_run(
     model_cls,
     model_name: str,
@@ -410,6 +724,7 @@ def train_single_run(
     ranking_budget_bytes: int | None = None,
     *,
     log_context: str = "",
+    identity_context: dict | None = None,
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -417,6 +732,14 @@ def train_single_run(
 
     Parameters
     ----------
+    identity_context:
+        ``{"data": DataIdentity payload | None, "condition": str,
+        "fold": dict | None}`` from
+        :func:`src.utils.identity.build_identity_context`.  Binds the
+        resume envelope, the trial-local best and the promoted
+        ``_best.pt`` to the content identity of the dataset, split and
+        feature artifact (E04).  ``None`` records the data identity as
+        unresolved; it is never guessed.
     log_context:
         Free-form tag appended to every per-epoch ``timing`` log line
         (e.g. ``"fold=2/5"`` from the K-fold runner) so a run that
@@ -450,16 +773,24 @@ def train_single_run(
     )
 
     run_id = checkpoint_mgr.get_run_id(dataset_name, embedding_name, model_name, hyperparams)
-    epochs = config.get("common", {}).get("epochs", 100)
+    # The selection budget is resolved ONCE per dataset (R03): epochs,
+    # patience, metric and validation user sample come from
+    # ``resolve_hp_budget`` — ``common:`` plus the ``hp_budget[<dataset>]``
+    # override — so every entry path (CLI cell, grid worker, Optuna trial,
+    # battery replay, fold) consumes the same effective values.  The
+    # resolver also refuses a metric the selection evaluator does not
+    # produce, before any model is built.  Batch size and evaluation
+    # cadence are not budget fields and stay in ``common:``.
+    budget = resolve_hp_budget(config, dataset_name)
+    epochs = budget["epochs"]
     batch_size = config.get("common", {}).get("batch_size", 4096)
     # Patience is measured in EPOCHS (the counter advances by
     # eval_every_epochs per evaluation): patience=20 with eval_every=10
-    # stops after 2 consecutive non-improving evaluations.  Default
-    # matches the shipped configs/recommenders.yaml (F10).
-    patience = config.get("common", {}).get("early_stopping_patience", 20)
-    es_metric = config.get("common", {}).get("early_stopping_metric", "ndcg@10")
+    # stops after 2 consecutive non-improving evaluations.
+    patience = budget["early_stopping_patience"]
+    es_metric = budget["early_stopping_metric"]
     eval_every_epochs = config.get("common", {}).get("eval_every_epochs", 10)
-    eval_sample_size = config.get("common", {}).get("eval_sample_size")
+    eval_sample_size = budget["eval_sample_size"]
     base_seed = config.get("seed", 42)
     eval_sample_seed = base_seed
 
@@ -505,47 +836,12 @@ def train_single_run(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hyperparams["learning_rate"])
 
-    start_epoch = 0
-    best_metric = 0.0
-    epochs_without_improvement = 0
-
-    ckpt = checkpoint_mgr.load_training_checkpoint(run_id)
-    if ckpt is not None:
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        start_epoch = ckpt["epoch"] + 1
-        best_metric = ckpt["best_metric"]
-        epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
-        if "rng_states" in ckpt:
-            restore_rng_states(ckpt["rng_states"])
-
     use_cuda = device != "cpu" and torch.cuda.is_available()
-    # In-process vectorized sampler: no DataLoader workers to spawn, no
-    # per-sample Python rejection loop.  Seeded from the job seed so the
-    # negative sequence is deterministic and independent of parallel
-    # execution order (each epoch draws from Generator(seed, epoch)).
-    sampler = BPRBatchSampler(train_interactions, n_items, batch_size, seed=job_seed)
-
     scaler = get_grad_scaler(enabled=use_cuda)
-    # NB: the Evaluator's second positional arg is its generic held-out
-    # slot; here it carries the VALIDATION interactions (selection), not
-    # the test set — hence the neutral parameter name above.
-    evaluator = Evaluator(
-        train_interactions,
-        selection_interactions,
-        n_items,
-        k_values=[10],
-        sample_size=eval_sample_size,
-        sample_seed=eval_sample_seed,
-        tiebreak_seed=base_seed,
-        ranking_budget_bytes=ranking_budget_bytes,
-    )
-
-    loss_device = torch.device(device) if use_cuda else torch.device("cpu")
 
     # D3: everything that gives the validation metric its meaning, stamped
     # into every checkpoint so a protocol change never silently keeps a
-    # stale winner. Mirrors the Evaluator construction above (k_values,
+    # stale winner. Mirrors the Evaluator construction below (k_values,
     # sampling and tie-break seeds).
     results_root = config.get("paths", {}).get("results", "results")
     fingerprint = selection_protocol_fingerprint(
@@ -554,18 +850,102 @@ def train_single_run(
         eval_sample_size=eval_sample_size,
         eval_sample_seed=eval_sample_seed,
         tiebreak_seed=base_seed,
-        k_values=[10],
+        k_values=list(SELECTION_K_VALUES),
     )
     trial_best_path = _trial_best_path(
         results_root, dataset_name, model_name, embedding_name, run_id
     )
-    if ckpt is None:
+    experiment = resolve_training_identity(
+        model_cls=model_cls,
+        model_name=model_name,
+        dataset_name=dataset_name,
+        embedding_name=embedding_name,
+        hyperparams=hyperparams,
+        config=config,
+        identity_context=identity_context,
+    )
+    identity = _training_resume_identity(
+        experiment,
+        run_id=run_id,
+        model_cls_name=model_cls.__name__,
+        n_users=n_users,
+        n_items=n_items,
+        job_seed=job_seed,
+        fingerprint=fingerprint,
+        use_cuda=use_cuda,
+    )
+
+    ckpt = checkpoint_mgr.load_training_checkpoint(run_id)
+    if ckpt is not None:
+        # Envelope, identity and the referenced best file are validated
+        # BEFORE the model is touched; a legacy or foreign envelope raises.
+        state = _restore_training_state(
+            ckpt,
+            identity=identity,
+            run_id=run_id,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            trial_best_path=trial_best_path,
+            log=logger,
+        )
+    else:
+        state = _SelectionState()
         # Fresh start: discard any trial-local file orphaned by a SIGKILL
         # of a previous attempt (its epochs will be re-run anyway).
         trial_best_path.unlink(missing_ok=True)
 
+    # In-process vectorized sampler: no DataLoader workers to spawn, no
+    # per-sample Python rejection loop.  Seeded from the job seed so the
+    # negative sequence is deterministic and independent of parallel
+    # execution order (each epoch draws from Generator(seed, epoch)) —
+    # which is also why a resume needs no sampler cursor: the epoch
+    # index restored from the envelope fully determines the next draw.
+    sampler = BPRBatchSampler(train_interactions, n_items, batch_size, seed=job_seed)
+
+    # SDD S04: opt-in bounded probe diagnostics (``diagnostics.enabled``),
+    # ``None`` by default.  Every measurement runs under a forked RNG on
+    # detached copies, so the trajectory is identical with it on or off.
+    diagnostics = TrainingDiagnostics.for_run(
+        model,
+        config=config,
+        train_interactions=train_interactions,
+        n_users=n_users,
+        n_items=n_items,
+        identity=_diagnostics_identity(
+            run_id,
+            dataset_name,
+            model_name,
+            embedding_name,
+            hyperparams,
+            base_seed,
+            job_seed,
+            visual_embeddings,
+        ),
+        device=device,
+    )
+    global_step = state.start_epoch * sampler.n_batches()
+    if diagnostics is not None and state.start_epoch == 0:
+        diagnostics.record_init()
+
+    # NB: the Evaluator's second positional arg is its generic held-out
+    # slot; here it carries the VALIDATION interactions (selection), not
+    # the test set — hence the neutral parameter name above.
+    evaluator = Evaluator(
+        train_interactions,
+        selection_interactions,
+        n_items,
+        k_values=list(SELECTION_K_VALUES),
+        sample_size=eval_sample_size,
+        sample_seed=eval_sample_seed,
+        tiebreak_seed=base_seed,
+        ranking_budget_bytes=ranking_budget_bytes,
+    )
+
+    loss_device = torch.device(device) if use_cuda else torch.device("cpu")
+
     try:
-        for epoch in range(start_epoch, epochs):
+        for epoch in range(state.start_epoch, epochs):
             model.train()
             # Accumulate loss as a GPU tensor and sync to CPU only once per
             # epoch to avoid per-batch GPU↔CPU stalls from .item() calls.
@@ -594,6 +974,15 @@ def train_single_run(
                 # eval-mode probe and ``record`` is a counter, so running
                 # it after the optimiser step is equivalent to before.
                 _account_flops(model, users, pos_items, neg_items)
+                global_step += 1
+                if diagnostics is not None and diagnostics.wants_step(global_step):
+                    diagnostics.record_step(
+                        step=global_step,
+                        epoch=epoch,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        steps_attempted=global_step,
+                    )
 
                 total_loss += loss
                 n_batches += 1
@@ -618,14 +1007,14 @@ def train_single_run(
                     eval_seconds,
                     f" {log_context}" if log_context else "",
                 )
-                current_metric = metrics.get(es_metric, 0.0)
+                # Absent / non-scalar / non-finite raises here: the trial
+                # fails with no success marker instead of "scoring zero".
+                current_metric = _require_selection_metric(metrics, es_metric)
 
-                if current_metric > best_metric:
-                    best_metric = current_metric
-                    epochs_without_improvement = 0
+                if state.is_new_best(current_metric):
                     # D2: never promote mid-trial — a later prune would
                     # leave a winner Optuna's best_params cannot see.
-                    _save_trial_best(
+                    digest = _save_trial_best(
                         trial_best_path,
                         model,
                         hyperparams,
@@ -633,9 +1022,22 @@ def train_single_run(
                         n_users,
                         n_items,
                         fingerprint,
+                        identity=experiment,
                     )
+                    state.record_best(current_metric, epoch, trial_best_path, digest)
                 else:
-                    epochs_without_improvement += eval_every_epochs
+                    # Ties keep the earlier winner and advance patience.
+                    state.epochs_without_improvement += eval_every_epochs
+
+                if diagnostics is not None:
+                    diagnostics.record_validation(
+                        epoch=epoch,
+                        step=global_step,
+                        metrics=metrics,
+                        es_metric=es_metric,
+                        checkpoint_exists=trial_best_path.exists(),
+                        has_valid_observation=state.has_valid_observation,
+                    )
 
                 if optuna_trial is not None:
                     optuna_trial.report(current_metric, step=epoch)
@@ -644,9 +1046,12 @@ def train_single_run(
 
                         raise optuna.TrialPruned()
 
-                if epochs_without_improvement >= patience:
+                if state.epochs_without_improvement >= patience:
                     break
 
+            # Durable boundary: the trial-best file (if any) is already
+            # committed and digest-bound, so the envelope written here
+            # can only reference bytes that exist.
             _best_effort_resume_checkpoint(
                 checkpoint_mgr,
                 logger,
@@ -654,9 +1059,25 @@ def train_single_run(
                 epoch=epoch,
                 model_state=model.state_dict(),
                 optimizer_state=optimizer.state_dict(),
-                best_metric=best_metric,
-                epochs_without_improvement=epochs_without_improvement,
+                best_metric=state.best_metric,
+                epochs_without_improvement=state.epochs_without_improvement,
                 rng_states=capture_rng_states(),
+                identity=identity,
+                has_valid_observation=state.has_valid_observation,
+                best_epoch=state.best_epoch,
+                best_ref=state.best_ref,
+                scaler_state=scaler.state_dict(),
+            )
+
+        if not state.has_valid_observation:
+            # e.g. ``epochs <= start_epoch``: the schedule never validated.
+            # Forcing a final validation would change the selection
+            # cadence, so this fails explicitly instead.
+            raise SelectionMetricError(
+                f"{dataset_name}/{model_name}/{embedding_name}: no validation "
+                f"observation was produced (epochs={epochs}, start_epoch="
+                f"{state.start_epoch}, eval_every_epochs={eval_every_epochs}); "
+                "a run without evidence cannot succeed."
             )
 
         # D2: promotion to _best.pt happens exactly once, after the epoch
@@ -666,15 +1087,19 @@ def train_single_run(
         # ones best_params (and thus the battery replay seeds) can see.
         _promote_trial_best(
             trial_best_path,
-            best_metric=best_metric,
+            best_metric=state.best_metric,
             dataset_name=dataset_name,
             model_name=model_name,
             embedding_name=embedding_name,
             results_root=results_root,
             log=logger,
+            expected_fingerprint=fingerprint,
+            identity=experiment,
         )
-        return best_metric
+        return state.best_metric
     finally:
+        if diagnostics is not None:
+            diagnostics.write()
         # Trial-local best weights are dead after the trial ends on ANY
         # path: promoted already (normal exit) or intentionally dropped
         # (prune / exception).

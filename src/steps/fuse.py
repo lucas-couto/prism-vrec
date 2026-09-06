@@ -31,8 +31,8 @@ Two conditions are supported:
 from __future__ import annotations
 
 import json
-import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +44,7 @@ from src.fusions import (
     iter_specs,
     registered_fusion_strategies,
 )
+from src.fusions.online import SIDECAR_RECIPE_VERSION
 from src.fusions.streaming import (
     CHUNK_ROWS,
     is_streamable,
@@ -52,13 +53,28 @@ from src.fusions.streaming import (
 )
 from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
+from src.utils.identity import (
+    check_provenance,
+    feature_recipe,
+    fit_set_digest,
+    write_provenance,
+)
 from src.utils.logging import get_logger
-from src.utils.memory import plan_pool_workers
+from src.utils.memory import available_cpus, plan_pool_workers
 from src.utils.splits import train_item_indices
 
 logger = get_logger(__name__)
 
 _PCA_STRATEGIES = {"pca", "pca_per_model"}
+
+#: Hard ceiling on the fusion pool, set by the researcher on 2026-09-06
+#: after two PCA workers were OOM-killed inside the 16 GB container.
+#: Fusion is memory-bound, not CPU-bound: the PCA fits already use
+#: every core through BLAS, so one worker loses little wall-clock and
+#: keeps the whole container budget for the one fit matrix.  The
+#: memory-aware planner below still runs, so the log records what a
+#: larger pool *would* have been sized at.
+MAX_FUSION_WORKERS = 1
 
 #: Peak RSS of an *in-memory* fusion worker as a multiple of its source
 #: bytes.  Such a worker holds the loaded sources, the fused output
@@ -74,8 +90,13 @@ _FUSION_PEAK_FACTOR = 3.5
 _STREAM_CHUNK_FACTOR = 3.0
 
 #: And for the one allocation streaming cannot avoid — the PCA fit
-#: matrix.  ``copy=False`` lets scikit-learn centre it in place, so the
-#: matrix itself plus a single source's training rows is the peak.
+#: matrix.  ``copy=False`` lets scikit-learn centre it in place and the
+#: matrix is gathered in row blocks (``_gather_rows``), so the matrix
+#: itself plus the randomized-SVD workspace is the peak; the half on top
+#: is margin.  Before 3.0.0rc1 the gather materialised a whole source's
+#: training rows twice on top of the matrix (~8 GB for tradesy instead
+#: of ~3.5 GB) and two such workers were OOM-killed inside a 16 GB
+#: container that this estimate had admitted.
 _STREAM_FIT_FACTOR = 1.5
 
 #: Interpreter, numpy/scikit-learn and the memmap page cache a worker
@@ -152,19 +173,70 @@ def _plan_fusion_workers(pending: list[dict]) -> int:
     """Size the fusion pool from the memory budget, not just the CPU count.
 
     A worker fusing two native matrices for a 350K-item catalogue peaks
-    at several GB.  Sizing the pool at ``os.cpu_count()`` therefore asks
+    at several GB.  Sizing the pool at the host's core count asks
     for tens of GB at once and, on a host whose container has no memory
     limit, triggers a *global* OOM that kills processes outside the
     container.  The CPU count stays the upper bound; the memory budget
     lowers it whenever the sources do not fit.
     """
-    cpu_cap = min(len(pending), os.cpu_count() or 4)
+    cpu_cap = min(len(pending), available_cpus())
     per_worker = max((_task_peak_bytes(t) for t in pending), default=0)
-    return plan_pool_workers(
+    planned = plan_pool_workers(
         per_worker_bytes=per_worker,
         hard_cap=cpu_cap,
         label="fusion pool",
     )
+    if planned > MAX_FUSION_WORKERS:
+        logger.info(
+            "fusion pool: pinned to %d worker(s) (MAX_FUSION_WORKERS); the memory plan allowed %d",
+            MAX_FUSION_WORKERS,
+            planned,
+        )
+    return max(1, min(planned, MAX_FUSION_WORKERS))
+
+
+def task_provenance(task: dict) -> dict:
+    """Ingredients a fusion output is reused against (E05).
+
+    Source content (recursive recipe of every input, in order), the
+    strategy and its keyword arguments, the normalisation flag, the
+    alignment declared by an online sidecar and the fit-set digest for
+    the PCA strategies.  Output paths and worker layout are excluded.
+    """
+    reserved = {
+        "strategy_name",
+        "output_path",
+        "emb_list_paths",
+        "normalize",
+        "train_items",
+        "sidecar_payload",
+        "provenance",
+    }
+    kwargs = {k: v for k, v in task.items() if k not in reserved}
+    sidecar = task.get("sidecar_payload")
+    return {
+        "kind": "fusion",
+        "strategy": task["strategy_name"],
+        "normalize": bool(task["normalize"]),
+        "kwargs": kwargs,
+        "sources": [feature_recipe(p) for p in task["emb_list_paths"]],
+        "fit_set_digest": fit_set_digest(task.get("train_items")),
+        "sidecar": {k: v for k, v in sidecar.items() if k != "components"} if sidecar else None,
+    }
+
+
+def _reusable(task: dict) -> bool:
+    """Whether the task's output exists AND was built from these ingredients.
+
+    A missing output is not reusable; a matching provenance record is;
+    a legacy output without a record is reused unverified (warned); a
+    differing record raises :class:`ArtifactProvenanceError`.
+    """
+    out = Path(task["output_path"])
+    if not out.exists():
+        return False
+    check_provenance(out, task["provenance"], label=str(out))
+    return True
 
 
 def _fuse_single(
@@ -174,19 +246,25 @@ def _fuse_single(
     normalize: bool,
     train_items: list[int] | None = None,
     sidecar_payload: dict | None = None,
+    provenance: dict | None = None,
     **kwargs,
 ) -> str | None:
     """Execute a single fusion and save the result. Pickled by ProcessPool.
 
     When ``sidecar_payload`` is given, no offline fusion runs — the JSON
     sidecar is written for the training step to build the online module
-    (learned alignment or adaptive_gated).
+    (learned alignment or adaptive_gated).  ``provenance`` (see
+    :func:`task_provenance`) is written next to the output BEFORE the
+    output itself, so an artifact on disk always has the record of its
+    ingredients or is recognisably legacy.
     """
     out = Path(output_path)
     if out.exists():
         return None
 
     out.parent.mkdir(parents=True, exist_ok=True)
+    if provenance is not None:
+        write_provenance(out, provenance)
 
     if sidecar_payload is not None:
         payload = json.dumps(sidecar_payload, indent=2)
@@ -235,12 +313,19 @@ def _ensure_pca_aligned_sources(
         return None
 
     aligned_paths = [dataset_dir / f"{ext}{suffix}_pcaD{dim}.npy" for ext in extractors]
-    if all(p.exists() for p in aligned_paths):
-        return aligned_paths
-
     # Streamed one source at a time: loading every native matrix at once
     # put several GB in the *parent* process before any worker started.
     for native, path in zip(native_paths, aligned_paths, strict=True):
+        expected = {
+            "kind": "pca_align",
+            "source": feature_recipe(native),
+            "dim": int(dim),
+            "fit_set_digest": fit_set_digest(train_items),
+        }
+        if path.exists():
+            check_provenance(path, expected, label=str(path))
+            continue
+        write_provenance(path, expected)
         shape = stream_pca_align(native, path, dim, np.asarray(train_items))
         logger.info("  pca-aligned source written: %s %s", path.name, shape)
     return aligned_paths
@@ -344,6 +429,7 @@ def _collect_fusion_tasks(
                             "alignment": "none",
                             "components": [p.name for p in native_paths],
                             "normalize": normalize,
+                            "recipe_version": SIDECAR_RECIPE_VERSION,
                         },
                     }
                 )
@@ -374,6 +460,7 @@ def _collect_fusion_tasks(
                     "dim": alignment_dim,
                     "components": [p.name for p in native_paths],
                     "normalize": normalize,
+                    "recipe_version": SIDECAR_RECIPE_VERSION,
                     "fusion_kwargs": fn_kwargs,
                 }
                 tasks.append(
@@ -400,6 +487,7 @@ def _collect_fusion_tasks(
                 "alignment": "pca",
                 "components": [p.name for p in aligned_paths],
                 "normalize": normalize,
+                "recipe_version": SIDECAR_RECIPE_VERSION,
             }
             tasks.append(
                 {
@@ -580,7 +668,12 @@ def run(condition: str = "frozen") -> None:
             )
             all_tasks.extend(tasks)
 
-    pending = [t for t in all_tasks if not Path(t["output_path"]).exists()]
+    for task in all_tasks:
+        task["provenance"] = task_provenance(task)
+    # Reuse requires the output AND a matching provenance record (E05):
+    # a fusion built from other source content, fit set, recipe or
+    # normalisation must not pass as this run's artifact.
+    pending = [t for t in all_tasks if not _reusable(t)]
     skipped = len(all_tasks) - len(pending)
     if skipped:
         logger.info("Skipping %d already existing fusions.", skipped)
@@ -592,13 +685,59 @@ def run(condition: str = "frozen") -> None:
     n_workers = _plan_fusion_workers(pending)
     logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
 
-    completed = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_fuse_single, **task): task for task in pending}
-        for future in as_completed(futures):
-            result = future.result()
-            completed += 1
-            if result:
-                logger.info("  [%d/%d] %s", completed, len(pending), result)
-
+    _run_fusion_pool(pending, n_workers)
     logger.info("Embedding fusion complete.")
+
+
+class FusionWorkerLostError(RuntimeError):
+    """A fusion worker died without returning (usually killed by the cgroup)."""
+
+
+def _cgroup_oom_kills() -> int | None:
+    """``oom_kill`` counter of this container's cgroup (v2), if readable."""
+    try:
+        text = Path("/sys/fs/cgroup/memory.events").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "oom_kill" and value.strip().isdigit():
+            return int(value)
+    return None
+
+
+def _run_fusion_pool(pending: list[dict], n_workers: int, worker=_fuse_single) -> int:
+    """Run *pending* fusions on a process pool; return how many completed.
+
+    A worker that vanishes mid-task (the kernel's OOM killer is the
+    usual cause: the container hit ``mem_limit``) surfaces as
+    :class:`BrokenProcessPool` with no hint of *why*.  It is re-raised
+    as :class:`FusionWorkerLostError` naming the completed count, the
+    pool size and the cgroup's ``oom_kill`` counter, so the operator can
+    tell a memory kill from a crash.  Finished outputs stay on disk and
+    are reused by the next run (E05 provenance), so the retry only
+    redoes the lost tasks.
+    """
+    completed = 0
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(worker, **task): task for task in pending}
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                if result:
+                    logger.info("  [%d/%d] %s", completed, len(pending), result)
+    except BrokenProcessPool as exc:
+        oom = _cgroup_oom_kills()
+        cause = (
+            f"the container cgroup reports oom_kill={oom}"
+            if oom
+            else f"no cgroup OOM kill recorded (oom_kill={oom})"
+        )
+        raise FusionWorkerLostError(
+            f"A fusion worker was terminated before returning: {completed}/{len(pending)} "
+            f"fusions completed on {n_workers} worker(s); {cause}. Completed outputs are "
+            "kept and reused on the next run. If memory was the cause, lower the worker "
+            "count (PRISM_CPUS) or raise PRISM_MEM_LIMIT."
+        ) from exc
+    return completed

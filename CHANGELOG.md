@@ -8,6 +8,579 @@ Dates are UTC.
 
 ## [Unreleased]
 
+## [3.0.0rc1] - 2026-09-06
+
+**Release candidate.** This version carries the 27 tasks of the
+reliability and scientific-integrity specification (2026-09-05); one
+task record per task lives under `docs/reliability-sdd/`, indexed by
+`docs/reliability-sdd/README.md`.
+3.0.0 final — with the Zenodo DOI, the updated `CITATION.cff` and the
+"Reproducing the dissertation" section of the README — is cut only after
+the real battery completes on this candidate. Until then `CITATION.cff`
+and the README's BibTeX stay at 2.12.1, the last archived release.
+
+**Why a major bump.** Three things a 2.x reader relied on are gone:
+(1) in-flight resume envelopes and extraction progress files written by
+2.12.1 or earlier are refused, never guessed (delete them by hand; the
+trial or cell restarts cleanly); (2) the statistical step's output
+filenames are partitioned by condition and population policy
+(`{dataset}_{condition}[_restricted]_{kind}.csv` instead of
+`{dataset}_{kind}.csv`); (3) the recipe identity of every non-learned
+online fusion sidecar changed (`recipe_version: 2`), so results trained
+from `hybrid_adaptive_gated_*` sidecars under 2.x are not comparable
+with results trained under 3.x. Nothing is deleted automatically.
+
+**What is NOT certified by this candidate.** Every task was verified on
+CPU in the container with CUDA disabled (`pytest tests/ -m "not slow"`:
+1729 passed, 1 xfailed — the strict `xfail` in
+`tests/test_environment_lock.py` documents the stale `uv.lock`, see
+V01 below). No GPU or AMP path was exercised: the GradScaler
+save/restore on resume, the CUDA OOM retry on a real card and the
+`optimizer.steps_skipped` diagnostic are implemented but unmeasured.
+No resource peak was measured on a real catalogue: the memory ledger
+is analytic, the lazy feature path is bit-identical by test but its
+page-cache residency and throughput are unmeasured, and no cgroup-
+limited run was made (task V02, open). The Docker image was not
+rebuilt from the lock-backed Dockerfile. The cause of the historical
+VNPR × hybrid collapse is still unresolved (S04 below).
+
+### Fixed
+
+- **First run of the candidate (2026-09-06): four defects found on real
+  data, all fixed before the tag.** (1) The E05 provenance sidecar
+  `<artifact>.provenance.json` was matched by the embedding discovery
+  glob `hybrid_*.json` (`get_embedding_files`, `src/steps/train.py`),
+  which created phantom embeddings such as
+  `hybrid_adaptive_gated_learned_D128.json.provenance`; 92 battery jobs
+  failed on "sidecar lists no components". Discovery now skips the
+  `PROVENANCE_SUFFIX` (`tests/test_embedding_discovery.py`). (2) In
+  dense mode `_map_visual` and `_resolve_visual`
+  (`src/recommenders/base.py`) handed the whole catalogue to the online
+  fusion in one call: indexing the resident buffer copies it (3.9 GB
+  for amazon_women's learned-fusion concat) before the fusion adds its
+  own temporaries, so under the new 8 GB VRAM cap every user batch --
+  down to a single user -- hit CUDA OOM and the evaluator fell back to
+  per-user item-block scoring on CPU: `eval_s` went from 0.7 s to
+  414-482 s per pass. Catalogue-sized requests are now processed in
+  `_LAZY_ITEM_BLOCK` rows for the dense buffer as well (the lazy path
+  already was); scores are unchanged
+  (`test_dense_catalogue_requests_are_blocked_and_unchanged`). (3) The
+  fusion pool planner charged 5.6 GB per PCA worker while
+  `_assemble_fit_matrix` (`src/fusions/streaming.py`) fancy-indexed a
+  whole source with the training index and normalised the copy --
+  about 8.3 GB for tradesy -- and two workers were OOM-killed inside the
+  16 GB container (`docker events` showed `oom` then `die 1`;
+  `BrokenProcessPool` named no cause). The fit matrix and the
+  per-model blocks are now gathered in `CHUNK_ROWS` slices
+  (`_gather_rows`; tracemalloc peak above the fit matrix 31.4 MB ->
+  2.0 MB on the 20K x 256 fixture, `tests/test_fuse_fit_assembly.py`),
+  a lost worker raises `FusionWorkerLostError` naming the completed
+  count and the cgroup's `oom_kill` counter, and by the researcher's
+  decision the pool is pinned to `MAX_FUSION_WORKERS = 1`. (4) Two CI
+  failures outside the container: the lazy/dense equivalence tolerance
+  was below one float32 ulp (`atol` 1e-7 -> 1e-6, justified in the
+  test) and the grid-budget warning test listened on the root logger
+  that the project's loggers do not propagate to.
+
+- **A valid all-zero training run vanished from the experiment (F03;
+  tasks I01, I02).** `train_single_run` (`src/utils/training.py`)
+  started `best_metric` at `0.0`, saved a winner only on strict
+  improvement and read the selection metric with `metrics.get(key,
+  0.0)`, so a run whose `ndcg@10` stayed at exactly zero — the
+  documented VNPR collapse — never wrote `_best.pt`; `find_best_models`
+  then did not list the cell and the battery silently lost it. An
+  absent key and a NaN metric were indistinguishable from that zero.
+  The first finite observation now wins (even `0.0`; ties keep the
+  earlier winner and advance patience), a missing, non-scalar or
+  non-finite selection metric raises `SelectionMetricError` and leaves
+  no success marker, and a schedule that never validates raises
+  instead of returning `0.0`. Promotion of the trial-local best
+  (`_promote_trial_best`) validates the file through the single
+  reader `load_best_checkpoint` (`src/utils/checkpoint.py`: exists,
+  deserialises, required keys, finite metric equal to the observed
+  best, own selection fingerprint) and raises `BestCheckpointError`
+  instead of warning. `_evaluate_cell` (`src/steps/evaluate.py`) uses
+  the same reader; the legacy flat-state_dict fallback that fabricated
+  `latent_dim=64, l2_reg=1e-4` is identified as a legacy format and
+  refused. An all-zero cell is now evaluated end to end with the real
+  full-ranking `Evaluator` and recorded in the battery CSVs
+  (`tests/test_zero_winner_evaluation.py`).
+- **Resume returned the wrong weights and accepted foreign state (F03,
+  F07; tasks I03, I04).** `FineTuner.train` (`src/finetuning/trainer.py`)
+  restored the current weights and `best_acc` but not the weights that
+  produced it; when no later epoch improved, the resumed run reported
+  the earlier accuracy while returning later weights (reproduced with
+  an injected interruption). The training resume envelope
+  (`checkpoints/training/*.pt`) carried no identity, no reference to
+  the trial-local best and no GradScaler state, so the same `run_id`
+  resumed under another seed or budget silently. Both envelopes are now
+  **v2**: the historical best is committed to its own digested file
+  before the envelope that references it (`best_ref = {path, digest}`),
+  the envelope carries `envelope_version`, an identity digest,
+  `has_valid_observation`, `best_metric`, `best_epoch` and the scaler
+  state, and the reader validates version, keys, identity and the
+  referenced best (existence + digest) before touching the model
+  (`validate_resume_envelope`, `validate_best_ref`,
+  `src/finetuning/checkpoint.py`). A genuine `os._exit` kill after the
+  epoch-two envelope resumes bit-identically to the continuous CPU run
+  (`tests/test_training_resume_integrity.py`). Legacy envelopes raise
+  `ResumeStateError`. The sampler needs no cursor: `BPRBatchSampler`
+  is seeded by `(job_seed, epoch)`.
+- **A training job could fail or disappear without failing the run
+  (F04; tasks E01, E02).** `_run_sequential` (`src/utils/parallel.py`)
+  drained an `mp.Queue` with `queue.empty()` before the feeder thread
+  had flushed, returning zero outcomes for one submitted job; the
+  parallel loop counted `completed` messages, so a worker that died
+  before publishing left its job absent forever; OOM retries differed
+  between the two paths. A parent-side `_JobRegistry` now gives every
+  submitted job exactly one terminal `JobOutcome` (`succeeded` /
+  `failed` / `cancelled`, with `attempt_count` and `error_type`); dead
+  workers are reaped from a shared last-assignment table
+  (`error_type=WorkerExit`), duplicate or stale messages are ignored,
+  only `torch.cuda.OutOfMemoryError` is retried and both paths run a
+  job at most `MAX_OOM_RETRIES + 1 = 3` times. `_run_grid` and the
+  parallel `_run_optuna` reconcile results against the submitted ids
+  and raise `TrainingJobsFailedError` (`src/steps/train.py`) naming the
+  failed and unaccounted units; completed jobs keep their artifacts.
+  `main.py` gained `run_cli(argv) -> int` — the process now exits with
+  the real code (`1` on failure, `130` on interrupt) instead of the
+  unconditional `os._exit(0)` — and `--battery` / `--folds` raise
+  `IncompleteRunError` when any manifest cell is not `done`; the run
+  manifest records `exit_status = "error"`.
+- **Spawned workers reloaded the configuration from disk and reused
+  another run's work (F05; tasks E03, E04).** `_WorkerContext` called
+  `load_config()` in the child, so `--config-dir`, the multi-seed
+  override and every CLI override were dropped on a spawned pool, and
+  the grid-progress writer hard-coded `checkpoints/grid_search/` while
+  the reader used `paths.checkpoints`. The resolved parent snapshot
+  now travels with the pool (`TrainingOrchestrator(config=...)`), all
+  roots come from it (`checkpoint_root`, `grid_progress_path`), and
+  the global `clear_all_training_checkpoints()` call at `train.run`
+  startup — which deleted every other run's resume envelope — is
+  gone. Reuse is bound to **scientific identity v2**
+  (`src/utils/identity.py`, contract proposal C02 implemented as an
+  internal module): dataset / item-mapping / split / feature content
+  digests, model name and implementation digest, effective
+  hyperparameters, selection budget, seed, protocol, condition and
+  fold, hashed over canonical JSON. Grid-progress entries carry the
+  digest and are reused only on equality (legacy entries are counted,
+  warned about and never reused); `_best.pt` carries `identity`,
+  `identity_digest` and `selection_scope_digest` (a best from another
+  seed, split or feature content is not comparable and is replaced
+  with a warning); the evaluate done table stores `checkpoint_digest`
+  and `identity_digest` and a cell is skipped only when both match.
+  Block sizes, worker counts, devices, paths and wall-clock time are
+  execution metadata, not identity.
+- **Derived artifacts were reused on file existence alone (F06; task
+  E05).** `ensure_projected` (`src/extractors/projection.py`) and the
+  fuse step (`src/steps/fuse.py`) reused `<extractor>_p<dim>.npy`,
+  `<ext>_pcaD<dim>.npy` and every fused output whenever the file
+  existed, without checking the source content, the train-item fit
+  set, the method / strategy / normalisation / online recipe, the
+  dimensions or the seed. Each artifact now gets a
+  `<artifact>.provenance.json` (schema 1) written atomically before the
+  artifact; reuse requires an equal provenance digest
+  (`check_provenance`), a differing one raises
+  `ArtifactProvenanceError` naming the keys, and an artifact without a
+  record is reused with an explicit UNVERIFIED warning and never
+  relabelled. Recipes carry file names, shapes, dtypes and content
+  digests but no directories, so identical content under another root
+  is still reused.
+- **Per-cell artifacts, the battery manifest and the evaluate tables
+  could be torn or duplicated by an interruption (F12; tasks E06,
+  E07).** `write_cell_artifact` (`src/evaluation/persistence.py`)
+  wrote the records and the metadata in two non-atomic steps with no
+  digest linking them, and every reader accepted whatever pair existed;
+  `evaluate.run` appended per-user rows and done triples, so a
+  re-evaluated cell produced duplicates; `BatteryManifest.save` was a
+  plain `write_text`. Publication now writes an immutable generation
+  (`<dataset>/.generations/<key>/<stamp>-<uuid>/` with the payload, a
+  `meta.json` carrying `row_count`, `expected_user_digest` and a
+  `completion` block with the payload SHA-256, and a `manifest.json`),
+  fsyncs it, then replaces the canonical `<key>.csv.gz` and the
+  completion pointer `<key>.meta.json` by rename; a per-cell lock
+  rejects concurrent publishers. Readers validate the pointer against
+  the payload digest and row count (`ArtifactIntegrityError` on a torn
+  pair); a legacy artifact without a completion block is readable,
+  warned about and NOT complete. The battery CSVs are upserted per
+  `(model_name, embedding_name)` and the done table rewritten
+  atomically with one row per triple. The battery manifest is written
+  atomically; a `done` entry now carries an `artifact` binding
+  (payload digest, generation, row count, identity digest,
+  provenance), and on resume a cell is skipped only when its validated
+  artifact equals the binding and names the cell — otherwise it goes
+  back to `pending` with a note. Folds: `fold_plan_digest`
+  (`src/folds/runner.py`: k, partition seed, `min_profile`, the exact
+  user→fold assignment, split and mapping digests) is the concatenated
+  artifact's `config_hash`, and a cell is complete only when its
+  artifact validates and carries that digest; changing `folds.k` re-runs
+  every cell. Generations are never pruned (`list_generations`).
+- **Feature rows were written in `item2idx` insertion order, not by
+  index, and missing images silently compacted the matrix (F08; task
+  S01).** `get_item_ids` (`src/steps/extract.py`) returned
+  `list(item2idx.keys())`, so a mapping `{b: 1, a: 0}` put item `b` in
+  row 0, and `ImageDataset` dropped items without an image file,
+  shifting every later row; `validate_features` checked only the row
+  count. `canonical_item_order` (`src/utils/item_order.py`) now derives
+  row `i` = the item mapped to `i` (holes, duplicates and non-integer
+  indices raise `ItemOrderError`), `ImageDataset` raises
+  `MissingImageError` naming the missing items, the extractor asserts
+  the written order before saving, and every pooled/component/projected
+  sidecar carries an `item_order` block (`schema_version 1`, `n_items`,
+  digest) that `validate_features` compares against the current
+  `item2idx.json` (`alignment: verified` / `unverified` for legacy
+  sidecars / error on mismatch). Built-in providers emit identity
+  mappings, so their existing artifacts are content-identical; they
+  are reported `unverified` until re-extracted.
+- **Extraction resume misread a completed-but-unfinalised part file and
+  trusted incompatible progress (F11; task S03).** A part file with
+  `rows_done == N` and `last_batch_index == -1` (crash between the
+  final progress save and the rename) was resumed from batch zero and
+  crashed with a broadcast error; a batch-size change mapped
+  `last_batch_index + 1` to a different row offset; a part file from a
+  reversed input order or other weights was resumed as compatible.
+  `src/extractors/resume.py` writes `.progress.json` **v2** (input
+  digest over the ordered `item_ids`, recipe digest over the extractor
+  metadata + kind + dtype + `component_grid`, batch size, dtype, shape,
+  `complete`), finalises a complete part file without a forward pass,
+  rewinds to the last boundary of the current batch size and restarts
+  from row 0 with an explicit reason whenever anything is unverifiable.
+  Progress files of schema v1 are recognised and not trusted (restart).
+- **The non-learned online fusion sidecar ignored `normalize` (F10;
+  task S02).** `load_embedding` (`src/fusions/online.py`) stacked the
+  equal-dim `adaptive_gated` sources as stored; the sidecar's
+  `normalize: true` was read only by the learned-alignment branch, so
+  the higher-norm source dominated exactly the additive fusions §10.3
+  of `docs/protocol.md` says are normalised (sources `[3,3,3]` /
+  `[1,1,1]` loaded with norms `5.196` / `1.732`). Each source is now
+  L2-normalised once, at load, before the online module
+  (`l2_normalize`, zero rows stay zero), in the eager array
+  (`StackedSources`) and in the lazy `StackedFeatureSource` alike;
+  `SIDECAR_RECIPE_VERSION = 2` is stamped into every new sidecar and
+  exposed by the loaded object (`recipe_version`,
+  `sidecar_recipe_version`; a sidecar without the field is legacy).
+  **Every historical result trained from a `hybrid_adaptive_gated_*`
+  sidecar (`hybrid_adaptive_gated_pca_*.json`,
+  `hybrid_adaptive_gated_p*.json`) is non-comparable with results
+  produced by this loader** and must be regenerated in its own
+  namespace; learned-alignment cells (`*_learned_D*.json`) and every
+  offline `.npy` fusion are unaffected. The legacy assertion in
+  `tests/test_adaptive_gated.py` that pinned the buggy behaviour was
+  corrected.
+- **The battery executor sent every non-fixed strategy to Optuna and
+  replayed raw suggestions (F09; tasks R01, R02).** `execute_cell`
+  (`src/battery/execute.py`) had one route for `fixed` and one for
+  everything else, so `hp_search.strategy: grid` created an Optuna
+  study, and replay cells trained `study.best_params` — a raw
+  `{total_dim, learning_rate}` without the per-paper dimension split
+  (`KeyError: 'latent_dim'`). Dispatch is now per strategy: `fixed` →
+  one `train_replay`; `grid` search → every grid point through
+  `train_replay` under the primary seed, no study; `optuna` search →
+  `_optimize_one_cell`, and a study without a COMPLETE trial raises
+  `SearchOutcomeError`; replay → `resolve_replay_hyperparams`
+  (`src/recommenders/hp_source.py`) of the primary seed's `_best.pt`,
+  cross-checked against the existing study under `optuna`
+  (`load_existing_study` never creates one; a disagreement raises
+  `WinnerResolutionError`). `effective_hyperparams`
+  (`src/recommenders/hp_search.py`) is the one canonical, idempotent
+  expansion (single-valued defaults filled, `total_dim` split via
+  `resolve_dimensions`, contradictory direct dimensions refused) used by
+  the grid, fixed and Optuna producers and by every winner consumer;
+  `HyperparamOrigin` records the raw `suggestion` and a per-key
+  `provenance` (`suggested` / `default` / `derived`). Replay-seed
+  resume checkpoints live under `checkpoints_seed<N>`.
+- **The per-dataset budget reached only Optuna's trial count (F16;
+  task R03).** `resolve_hp_budget` (`src/recommenders/hp_budget.py`)
+  supported `hp_budget.<dataset>` overrides of epochs, patience, metric
+  and validation sample, but `train_single_run` read `config["common"]`
+  directly, so an override changed `n_trials` and nothing else
+  (`hp_budget.synthetic.epochs=2` still ran six evaluations). Every
+  training path — CLI cell, grid worker, Optuna trial, battery replay,
+  folds — now consumes the resolved budget; `train.run()` resolves every
+  dataset before any cell trains; `SELECTION_K_VALUES = (10,)` is the
+  single declaration of the selection cut-off and a metric the
+  selection evaluator does not produce raises
+  `UnsupportedSelectionMetricError` before any model or data is built.
+  Cadence (`eval_every_epochs`) and `batch_size` stay outside the
+  budget. Default patience when `common.early_stopping_patience` is
+  absent is now the schema default 10 (the loop used 20; production
+  configs always set it).
+- **Paired statistics dropped conflicting duplicates and inner-joined
+  missing users (F15; task R04).** `_ensure_config`
+  (`src/evaluation/statistical.py`) ran `drop_duplicates` on `(user_id,
+  config)`, keeping the first of two conflicting rows silently;
+  `pairwise_significance` and `friedman_test` `dropna`'d users missing
+  from one side; the bootstrap depended on caller row order; non-finite
+  values were dropped. `src/evaluation/paired_validation.py` defines the
+  observation key (provenance columns + config identity columns +
+  `(config, user_id)`), raises `ObservationConflictError` on a
+  conflicting duplicate, `DuplicateObservationError` on an identical
+  duplicate of a visual cell (the shared `embedding_name == "none"`
+  baseline across condition files is the one accepted duplicate),
+  `UserPopulationMismatchError` under the default `strict` policy and
+  `InvalidMetricValueError` on non-finite values; frames are sorted so
+  bootstrap draws are order-invariant. `load_paired`
+  (`src/evaluation/paired_loader.py`) validates each cell
+  (`validate_cell_records`: unique users, finite ranks, manifest
+  `row_count` / `expected_user_digest` when present) and cross-cell
+  provenance (`split`, `eval_protocol_version`, `n_items`).
+- **Report outputs overwrote each other and counted rows as seeds
+  (task R05).** `src/steps/statistical.py` wrote `{dataset}_{kind}.csv`
+  regardless of `--condition`; nothing reconciled the tested cells
+  against the evaluate step's completion record; `aggregate_seeds`
+  counted rows as `n_seeds`; `folds/aggregate.py` located partials by
+  filename only. Outputs are now partitioned
+  (`{dataset}_{condition}[_restricted]_{summary|friedman|pairwise}.csv`),
+  a `{stem}_integrity.json` is written BEFORE any test (seed and
+  `n_seeds_distinct`, shared provenance, expected / completed / missing
+  cells, `cells_excluded` with reasons, `n_users_per_cell`), missing
+  cells always fail, `n_seeds = nunique(seed)` with conflicting rows
+  for one seed raising `ObservationConflictError`, and partials must
+  match the requested identity with distinct fold seeds
+  (`FoldAggregate.n_distinct_fold_seeds`). Legacy unpartitioned files
+  still classify as `report_condition = "unpartitioned"`.
+- **Ranking kept device-resident catalogue ids and masks outside the
+  OOM guard and had no host budget (F01 residual; task M04).**
+  `_per_user_frame` allocated `arange(n_items)` on the device and
+  `_ensure_train_idx_cache` built every test user's train-index tensor
+  there before any guard. Catalogue ids are host-resident and
+  transferred inside the guarded `_rank_user_chunk`; train masks are
+  assembled per chunk on the host (`_ensure_train_idx_host`,
+  `_chunk_train_mask`) and applied with one advanced-index assignment
+  (same `-inf` cells as the old `index_fill_`); the CPU score / sort
+  workspace is admitted against `host_ranking_bytes(n_items) = 40 B/item`
+  (`Evaluator(host_budget_bytes=...)`, default = `available_host_bytes()`,
+  `HostMemoryBudgetError` on refusal). Candidate set, masks, seeded
+  ties and the retry-same-offset logic are unchanged
+  (`tests/test_ranking_golden_fixture.py`: identical records under
+  dense, user-batch reduction, offset-0 and mid-pass item OOM).
+- **Feature validation materialised the whole catalogue and pools were
+  sized against unlimited host memory (task M06).** `validate_matrix`
+  (`src/steps/validate_features.py`) `np.load`ed the matrix and built a
+  full `(N, D)` finiteness mask; `detect_max_workers(per_worker_bytes=0)`
+  sized the GPU pool from VRAM alone. Validation now reduces per block
+  of `block_rows` (65 536) over a memmap with identical verdicts and
+  stats (`n_blocks`, `block_rows` recorded); an unknown footprint is
+  charged `UNKNOWN_WORKER_FOOTPRINT_BYTES` (2 GiB), and
+  `TrainingOrchestrator(admission=...)` clamps a pinned worker count
+  above the admitted one and raises `AdmissionError` when nothing is
+  admitted.
+- **The image installed from ranges, CI pinned a torch outside the
+  package's range, and the build context leaked `.cache/` and `.env`
+  (F14; task V01).** `Dockerfile` copied only `pyproject.toml`; the
+  running image (built 2026-08-21) differs from `uv.lock` on 20
+  packages, among them **timm 1.0.28 vs 1.0.27**. The dependency layer
+  now copies `uv.lock`, runs `uv export --frozen --no-dev
+  --no-emit-project` and `pip install --no-deps --require-hashes`, then
+  `pip check`; the `telemetry` extra is installed from its ranges in a
+  separate `RUN` because the lock predates it. `.github/workflows/ci.yml`
+  pins `torch==2.8.0` / `torchvision==0.23.0` from the CPU index;
+  `.dockerignore` excludes `.cache/` and `.env`.
+  `tests/test_environment_lock.py` guards all of it, with a strict
+  `xfail` documenting that `uv.lock` is stale (three-line diff pending
+  approval: `prism-vrec → (dynamic)`, `psutil 7.2.2 → 6.1.1`,
+  `nvidia-ml-py 13.610.43 → 12.575.51`). `docs/environment.md` records
+  the inventory. The image was NOT rebuilt.
+
+### Changed
+
+- **Run resource share 65% -> 50%** (`docker-compose.yml`,
+  `src/utils/device.py`, `src/utils/parallel.py`). The 65% share (20g,
+  10.4 cores, 0.65 of VRAM) still pushed the desktop into swap once the
+  browser, IDE and another project's containers were counted (6 GB of
+  swap in use with the machine idle on 2026-09-06). Every service now
+  takes `16g` / `8` cores plus a soft `cpu_shares: 512`, so the
+  desktop's default weight wins under contention while idle cores stay
+  available to the run; `RUN_RESOURCE_SHARE = 0.5` and
+  `_RANKING_VRAM_SHARE = 0.125` keep ranking kernels short on the shared
+  card. Override per host with `PRISM_MEM_LIMIT` / `PRISM_CPUS`.
+- **`scripts/stamp_item_order.py`** adds the `item_order` digest (S01)
+  to pre-3.0 extractor sidecars without re-extracting, but only when the
+  extraction's own `<stem>_ids.json` record equals the canonical order
+  and the matrix has exactly that many rows; anything else is left
+  unstamped and reported. Fused and projected artifacts are not
+  migrated: regenerate them so they carry `recipe_version` and
+  provenance.
+
+- **Raw features can be gathered per forward from a bounded source
+  instead of living in a module buffer (F02; tasks M01–M03).**
+  `src/data/feature_source.py` introduces the `FeatureSource` Protocol
+  (contract proposal C01, implemented as an internal adapter) with
+  `NpyFeatureSource` (header at construction, read-only memmap opened
+  per reading process, dropped from pickle state so spawned children
+  reopen), `ConcatFeatureSource` and `StackedFeatureSource` (per-row
+  concatenation / stacking of a sidecar's components, same recipe
+  attributes as `RaggedSources`) and `ArrayFeatureSource`.
+  `load_embedding(path, *, lazy=False)` is an opt-in keyword; the
+  default return forms are unchanged. `BaseRecommender` accepts a
+  `FeatureSource` in place of the array, registers no buffer, gathers
+  the unique ids of each batch once (`_raw_visual_rows`) and applies
+  the online fusion inside the graph; catalogue-sized requests are
+  served per `_LAZY_ITEM_BLOCK` (8192) rows (`_map_visual`, VNPR
+  `_predict_batch_blocked`). ACF's catalogue projection cache is
+  admitted only under `DERIVED_CACHE_MAX_BYTES` (1 GiB dense, 0 lazy)
+  and keyed on the projection weight's `_version`, so an optimiser step
+  invalidates it without `train()`; VNPR's dense catalogue "cache" is a
+  zero-copy alias. Dense vs lazy scores, losses and every gradient
+  agree for VBPR, AVBPR, DeepStyle, VNPR and ACF
+  (`tests/recommenders/test_lazy_feature_equivalence.py`), and a
+  `train_single_run` through both paths promotes bit-identical weights.
+  **The default residency stays `dense`**: the lazy path's page-cache
+  residency and throughput on production catalogues are unmeasured.
+- **Training jobs are admitted against a resolved host budget with a
+  per-job ledger (tasks M05, M06).** `_estimate_worker_bytes` charged
+  the sidecar's JSON size (a few hundred bytes) for a job that loads
+  gigabytes of components, and `plan_pool_workers` always admitted at
+  least one worker. `resolve_host_budget` (`src/utils/memory.py`)
+  resolves `config → cgroup v2 → cgroup v1 → host RAM → 4 GiB
+  fallback` (never unlimited); `estimate_job_bytes`
+  (`src/steps/train.py`) sums the worker base (1.5 GiB), the feature
+  payload from `.npy` headers (a sidecar = the sum of its components;
+  lazy jobs are charged two staging blocks), model + gradient + two
+  Adam moments, the interaction dicts and `host_ranking_bytes`;
+  `plan_training_admission` refuses a job whose total exceeds
+  `budget − headroom` with a reason naming every term — the job is
+  recorded as a `failed` outcome (`error_type=AdmissionRefused`, 0
+  attempts), never launched, and the run fails through E02's
+  reconciliation — and sizes the pool so the aggregate commitment fits.
+  The estimates are analytic, not measured.
+- **New `resources:` configuration block (contract proposal C06,
+  key names PROVISIONAL, awaiting approval).** `host_budget_bytes`
+  (null = resolve as above), `headroom_bytes` (default `RESERVED_BYTES`
+  = 4 GiB), `max_workers` (null = the CPU/VRAM caps; `0` admits
+  nothing) and `feature_residency` (`dense` | `lazy` | `auto`, where
+  `auto` goes lazy when the dense payload exceeds half the usable
+  budget). Negative, non-finite, boolean or unknown values raise
+  `ValueError`. Absent, the block resolves to today's behaviour; it is
+  documented as a commented block in `configs/default.yaml`.
+- **`statistical.population` (`configs/evaluation.yaml`).** `strict`
+  (default) requires one shared user population across the cells of a
+  comparison and fails otherwise; `declared_intersection` restricts to
+  the intersection explicitly, writes to the `_restricted` partition
+  and reports `n_excluded_a` / `n_excluded_b` (`n_users_excluded` for
+  Friedman) on every row. Nothing intersects automatically.
+- **Selection semantics.** The first finite validation observation is
+  the winner even at `0.0` (I01, and the same rule in `FineTuner`;
+  patience now resets at that first observation, so an all-zero
+  fine-tuning stops one epoch later than before). Ties keep the
+  earlier winner.
+- **Battery `done` is a validated artifact, not a flag.** A pre-3.0
+  battery manifest (none exists after the 2026-09-04 wipe) would have
+  every `done` cell re-run once, its artifacts kept and re-published
+  as new generations.
+- `HyperparamOrigin.to_dict()` (battery and folds manifests) carries
+  two additive keys, `suggestion` and `provenance`. An Optuna trial
+  sampled from an `hp_space` that omits `l2_reg` now receives the
+  pinned default explicitly, so its `hyperparams` dict — hence
+  `run_id`, job seed and `_best.pt.hyperparams` — differs from a
+  pre-3.0 Optuna run of the same config (none exists; the frozen
+  battery uses `grid`).
+- The evaluate done CSV gains `checkpoint_digest` / `identity_digest`
+  columns; `.meta.json` gains `row_count`, `expected_user_digest` and
+  `completion`; `contract_fields(meta)` strips them for callers that
+  rebuild a `CellMetadata`. The concatenated fold artifact's
+  `config_hash` is the fold-plan digest (was `None`).
+- `execute_cell` returns additive keys (`strategy`, `budget`, `search`,
+  `n_configs`, `grid`, `best_metric`); `TrainingOrchestrator.run`
+  results carry `outcome`, `attempts`, `error_type` and the new status
+  value `cancelled`.
+
+### Added
+
+- **Opt-in bounded training diagnostics and the VNPR collapse driver
+  (F13; task S04).** `diagnostics:` in `configs/default.yaml` (off by
+  default, inert when off) makes `train_single_run` record, on a fixed
+  seeded probe at init, at listed optimizer steps and at every
+  validation, feature norm quantiles per source, pre-ReLU branch
+  statistics (`VNPR.diagnostic_branches`), score spread and tie
+  fractions, loss components, gradient and parameter-delta norms,
+  optimizer steps applied / skipped, and per-validation `zero_metric`,
+  `tie_frequency`, `checkpoint_exists` and `has_valid_observation`
+  as separate fields, to `<output_dir>/<run_id>.json`
+  (`src/utils/diagnostics.py`). Measurements run under a forked RNG on
+  detached copies; the trajectory is bit-identical on or off.
+  `scripts/vnpr_collapse_diagnostic.py` runs seven visual-input
+  conditions (`native_a`, `native_b`, `native_a_unit`, `learned_mean`,
+  `learned_sum`, `learned_mean_nonorm`, `stacked_adaptive_gated`)
+  × ≥ 3 seeds × 2 learning rates with the same split, sampler, budget
+  and init, and writes `summary.json` and a `report.md` with the
+  SPEC's decision table. On synthetic data (42/42 runs) no hypothesis
+  was observed — no dead ReLU, no skipped step, no scale-induced
+  collapse, no zero metric. **The cause of the historical VNPR × hybrid
+  collapse (35.6 % of VNPR × hybrid jobs at exactly 0.0000 in the
+  2026-09 battery) is still unresolved**; the discriminating experiment
+  is the same driver on amazon_women / tradesy, and no activation,
+  regularisation or normalisation change is proposed.
+- `src/utils/identity.py`: `canonical_json`, `canonical_digest`,
+  `stream_digest`, `mapping_digest`, `split_digest`, `feature_recipe` /
+  `feature_digest`, `resolve_data_identity`, `experiment_identity`,
+  `selection_scope_digest`, `implementation_digest`, and the provenance
+  primitives (`write_provenance`, `read_provenance`,
+  `check_provenance`, `ArtifactProvenanceError`).
+- `src/evaluation/persistence.py`: `validate_cell_artifact`,
+  `read_completion`, `contract_fields`, `list_generations`,
+  `user_digest`, `ArtifactIntegrityError`, `ConcurrentPublicationError`;
+  `src/battery/manifest.py`: `artifact_binding`, `done_entry_valid`,
+  `present_artifact_binding`, `ManifestError`; `src/folds/runner.py`:
+  `fold_plan_digest`.
+- `src/evaluation/paired_validation.py`, `src/steps/statistical_integrity.py`,
+  `src/extractors/resume.py`, `src/utils/item_order.py`,
+  `src/data/feature_source.py`, `src/utils/diagnostics.py` (new modules).
+- `docs/environment.md` (image inventory, lock mismatches, build
+  recipe, CPU-vs-GPU metadata), `docs/reliability-sdd/` (27 task
+  records + index).
+- Tests (all CPU, container): `test_selection_zero_winner`,
+  `test_zero_winner_evaluation`, `test_best_checkpoint_promotion`,
+  `test_finetuning_best_state_resume`, `test_training_resume_integrity`,
+  `test_parallel_job_outcomes`, `test_train_failure_propagation`,
+  `test_identity`, `test_worker_config_snapshot`,
+  `test_identity_reuse_binding`, `test_artifact_provenance`,
+  `test_cell_publication`, `test_manifest_completion`,
+  `test_item_order_alignment`, `test_extraction_resume`,
+  `test_online_normalization_parity`, `test_training_diagnostics`,
+  `test_vnpr_collapse_diagnostic`, `test_battery_dispatch`,
+  `test_battery_strategies_integration`, `test_effective_hyperparams`,
+  `test_budget_consumption`, `test_paired_validation`,
+  `test_statistical_step_integrity`, `test_feature_source`,
+  `recommenders/test_lazy_feature_equivalence`,
+  `test_lazy_feature_scaling`, `test_ranking_golden_fixture`,
+  `test_training_admission`, `test_blocked_feature_validation`,
+  `test_environment_lock`.
+
+### Migration
+
+- **Delete in-flight resume state by hand before resuming with this
+  build**: `checkpoints/training/*.pt` and
+  `checkpoints/finetuning/*_ckpt.pt` written by 2.12.1 or earlier are
+  refused with `ResumeStateError`; the trial / fine-tuning restarts
+  cleanly. Nothing is deleted automatically. `.progress.json` files of
+  schema v1 under `data/embeddings/` are not resumed: the cell
+  restarts from row 0 with a warning; finished `.npy` artifacts are
+  unaffected.
+- **Statistical outputs moved**: read
+  `results/tables/{dataset}_{condition}[_restricted]_{summary|friedman|pairwise}_{metric}.csv`
+  and `{stem}_integrity.json`; `main.py --report` finds them by suffix.
+- **Non-learned online fusion results are a new lineage**: regenerate
+  any model or result trained from a `hybrid_adaptive_gated_*` sidecar
+  under 2.x in a separate namespace; do not mix them in a paired table.
+  The sidecar bytes on disk are not rewritten (the loader reports
+  `sidecar_recipe_version=None` for them and builds recipe 2).
+- Artifacts extracted before 3.0 have no `item_order` block
+  (`alignment: unverified`); projected / fused artifacts without a
+  `.provenance.json` are reused with an UNVERIFIED warning. Re-extract
+  or move them aside to obtain verified records. `src/steps/finetune.py`
+  does not yet write the `item_order` block for `<extractor>_finetuned.npy`
+  (open follow-up), so fine-tuned artifacts validate as `unverified`.
+- A `strict` population mismatch now fails the statistical step; set
+  `statistical.population: declared_intersection` to restrict
+  explicitly (reported, partitioned `_restricted`).
+- Pending developer decisions (not applied here): regenerate `uv.lock`
+  (three-line diff above; then drop the `xfail` and fold the
+  `telemetry` extra into the Dockerfile's `uv export`), rebuild the
+  image (expect timm 1.0.27 — read timm's 1.0.27 → 1.0.28 changelog
+  before treating pre- and post-rebuild features as identical), approve
+  the C06 `resources:` key names.
+
 ## [2.12.1] - 2026-09-04
 
 ### Fixed

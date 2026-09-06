@@ -230,6 +230,7 @@ class TestExecuteCellSeedIsolation:
         proc, emb = _fixture(tmp_path)
         config = {
             "seed": 1,
+            "hp_search": {"strategy": "optuna"},
             "device": "cpu",
             "paths": {
                 "data_processed": proc,
@@ -241,7 +242,10 @@ class TestExecuteCellSeedIsolation:
         monkeypatch.setattr(
             train_mod,
             "_optimize_one_cell",
-            lambda *a, **k: seen.__setitem__("train_results", k["config"]["paths"]["results"]),
+            lambda *a, **k: (
+                seen.__setitem__("train_results", k["config"]["paths"]["results"])
+                or {"completed": 1, "pruned": 0}
+            ),
         )
         monkeypatch.setattr(
             ex,

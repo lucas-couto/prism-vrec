@@ -30,13 +30,17 @@ Pure pandas (no torch / no ML deps); safe to run on a laptop.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from src.evaluation.paired_validation import ObservationConflictError
+
 logger = logging.getLogger(__name__)
 
+_SEED_DIR_PATTERN = re.compile(r"_seed(\d+)$")
 
 _GROUP_KEYS_EVAL = [
     "dataset",
@@ -51,8 +55,12 @@ _GROUP_KEYS_EVAL = [
     "k",
 ]
 
+# ``report_condition`` is the partition a statistical file came from
+# (``frozen`` / ``all`` / ``frozen_restricted`` ...); the same pair tested
+# in two partitions is two comparisons, never twice the seeds (R05).
 _GROUP_KEYS_CI = [
     "dataset",
+    "report_condition",
     "recommender",
     "extractor",
     "fusion",
@@ -70,6 +78,8 @@ _GROUP_KEYS_CI = [
 # into one group, making ``n_seeds`` count seeds × dims (R2).
 _GROUP_KEYS_TESTS = [
     "dataset",
+    "report_condition",
+    "population_policy",
     "family",
     "group",
     "config_a",
@@ -96,11 +106,14 @@ def _read_per_seed(
 
     A missing file in a particular seed dir is skipped with a warning;
     callers should check ``len(df)`` before aggregating.  Each frame is
-    tagged with a ``seed`` column so the caller can drop duplicates or
-    audit which seeds contributed to a given cell.
+    tagged with a ``seed`` column (given, or parsed from a
+    ``..._seed<N>`` directory name) so the aggregation counts DISTINCT
+    seeds: the same seed read twice (a duplicated source file) is one
+    observation, and two files that disagree about one seed are a
+    conflict, never two seeds (R05).
     """
     frames: list[pd.DataFrame] = []
-    seeds_tag = seeds or [None] * len(seed_dirs)
+    seeds_tag = seeds or [_seed_from_dir(d) for d in seed_dirs]
     for seed_dir, seed in zip(seed_dirs, seeds_tag, strict=False):
         path = Path(seed_dir) / "tables" / filename
         if not path.exists():
@@ -114,7 +127,78 @@ def _read_per_seed(
         frames.append(df)
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    return _distinct_seed_rows(pd.concat(frames, ignore_index=True), filename)
+
+
+def _seed_from_dir(seed_dir: Path) -> int | None:
+    match = _SEED_DIR_PATTERN.search(Path(seed_dir).name)
+    return int(match.group(1)) if match else None
+
+
+def _distinct_seed_rows(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    """One row per (identity, seed): drop identical repeats, fail on conflicts."""
+    if "seed" not in df.columns:
+        logger.warning(
+            "%s: no seed identity (seeds not given and directory names carry no "
+            "_seed<N> suffix); n_seeds will count rows, not distinct seeds.",
+            filename,
+        )
+        return df
+    value_columns = [c for c in df.columns if c in _VALUE_COLUMNS]
+    key_columns = [c for c in df.columns if c not in value_columns]
+    identical = df.duplicated(keep="first")
+    conflicting = df[~identical].duplicated(subset=key_columns, keep=False)
+    if conflicting.any():
+        rows = df[~identical][conflicting]
+        seeds = sorted(int(s) for s in rows["seed"].unique())
+        raise ObservationConflictError(
+            f"{filename}: {int(conflicting.sum())} row(s) disagree about the same cell under "
+            f"seed {', '.join(str(s) for s in seeds)}; two sources claim one seed with "
+            "different values. Refusing to count them as separate seeds."
+        )
+    if identical.any():
+        logger.warning(
+            "%s: %d identical duplicate row(s) across the seed sources ignored.",
+            filename,
+            int(identical.sum()),
+        )
+    return df[~identical].reset_index(drop=True)
+
+
+#: Columns that carry measured values; every other column is identity.
+_VALUE_COLUMNS = frozenset(
+    {
+        "mean",
+        "n_users",
+        "ci_lower",
+        "ci_upper",
+        "ci_width",
+        "statistic",
+        "p_value",
+        "corrected_p",
+        "significant",
+        "n_pairs",
+        "n_nonzero_pairs",
+        "n_excluded_a",
+        "n_excluded_b",
+        "mean_a",
+        "mean_b",
+        "diff_mean",
+        "diff_ci_lower",
+        "diff_ci_upper",
+        "cohens_d",
+        "cliffs_delta",
+        "n_wins",
+        "n_losses",
+        "n_ties",
+        "pct_wins",
+        "pct_losses",
+        "pct_ties",
+        "omnibus_significant",
+        "n_configs",
+        "note",
+    }
+)
 
 
 def _aggregate(df: pd.DataFrame, group_keys: list[str], value_col: str) -> pd.DataFrame:
@@ -124,12 +208,13 @@ def _aggregate(df: pd.DataFrame, group_keys: list[str], value_col: str) -> pd.Da
     ``median_across_seeds``, ``min_across_seeds``,
     ``max_across_seeds``, ``n_seeds``.  ``std`` uses the sample
     convention (ddof=1) and is ``NaN`` when only one seed contributed.
+    ``n_seeds`` counts distinct seeds (see :func:`_read_per_seed`).
     """
     if df.empty:
         return df
     keys = [k for k in group_keys if k in df.columns]
-    grouped = df.groupby(keys, dropna=False)[value_col]
-    return grouped.agg(
+    grouped = df.groupby(keys, dropna=False)
+    stats = grouped[value_col].agg(
         # "std" already uses ddof=1 (NaN for a single seed) and takes the
         # fast cython path, unlike a per-group python lambda.
         mean_across_seeds="mean",
@@ -137,8 +222,16 @@ def _aggregate(df: pd.DataFrame, group_keys: list[str], value_col: str) -> pd.Da
         median_across_seeds="median",
         min_across_seeds="min",
         max_across_seeds="max",
-        n_seeds="count",
-    ).reset_index()
+    )
+    stats["n_seeds"] = _n_distinct_seeds(grouped, value_col)
+    return stats.reset_index()
+
+
+def _n_distinct_seeds(grouped, value_col: str) -> pd.Series:
+    """Distinct ``seed`` values per group, or the row count without seed identity."""
+    if "seed" in grouped.obj.columns:
+        return grouped["seed"].nunique()
+    return grouped[value_col].count()
 
 
 def aggregate_evaluation(seed_dirs: list[Path], seeds: list[int] | None) -> pd.DataFrame:
@@ -208,15 +301,16 @@ def aggregate_statistical_tests(seed_dirs: list[Path], seeds: list[int] | None) 
 
     keys = [k for k in _GROUP_KEYS_TESTS if k in df.columns]
     grouped = df.groupby(keys, dropna=False)
-    return grouped.agg(
-        n_seeds=("significant", "size"),
+    out = grouped.agg(
         n_seeds_significant=("significant", "sum"),
         median_diff_mean=("diff_mean", "median"),
         sign_agreement=("diff_mean", _sign_agreement),
         p_holm_min=("corrected_p", "min"),
         p_holm_median=("corrected_p", "median"),
         p_holm_max=("corrected_p", "max"),
-    ).reset_index()
+    )
+    out.insert(0, "n_seeds", _n_distinct_seeds(grouped, "significant"))
+    return out.reset_index()
 
 
 def write_cross_seed_aggregates(

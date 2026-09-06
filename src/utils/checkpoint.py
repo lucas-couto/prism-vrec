@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import pickle
 import random
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,47 @@ import numpy as np
 import torch
 
 from src.utils.atomic_io import atomic_write
+
+#: Version of the resume-envelope schema written by
+#: :meth:`CheckpointManager.save_training_checkpoint` when an ``identity``
+#: is supplied (and by the fine-tuning trainer).  Version 1 is the
+#: implicit legacy shape without the field: it carries neither identity
+#: nor a reference to the historical best weights, so it cannot be
+#: resumed faithfully and is refused rather than guessed.
+RESUME_ENVELOPE_VERSION = 2
+
+#: Keys every v2 resume envelope must carry.
+RESUME_ENVELOPE_REQUIRED_KEYS: tuple[str, ...] = (
+    "envelope_version",
+    "identity",
+    "epoch",
+    "model_state",
+    "optimizer_state",
+    "rng_states",
+    "has_valid_observation",
+    "best_metric",
+    "best_epoch",
+    "best_ref",
+)
+
+
+class ResumeStateError(RuntimeError):
+    """A resume checkpoint cannot be trusted to continue the run.
+
+    Raised for a legacy envelope (no version / no identity), an identity
+    that does not match the run about to resume, a truncated payload or
+    a referenced best-weights file that is missing or altered.  The
+    caller must rerun the trial cleanly; the state is never patched
+    from the current weights.
+    """
+
+
+class BestCheckpointError(RuntimeError):
+    """A ``_best``/trial-best checkpoint is absent, unreadable or invalid.
+
+    A selection winner that cannot be loaded is a failed run, never a
+    silent skip: the cell would otherwise vanish from the expected set.
+    """
 
 
 class CheckpointManager:
@@ -125,6 +168,12 @@ class CheckpointManager:
         best_metric: float,
         rng_states: dict,
         epochs_without_improvement: int = 0,
+        *,
+        identity: str | None = None,
+        has_valid_observation: bool = False,
+        best_epoch: int | None = None,
+        best_ref: dict | None = None,
+        scaler_state: dict | None = None,
     ) -> None:
         """Save a training checkpoint that can be used to resume later.
 
@@ -147,6 +196,21 @@ class CheckpointManager:
             ``cuda`` states for full reproducibility.
         epochs_without_improvement:
             Early stopping counter to restore on resume.
+        identity:
+            Digest of the scientific identity of the run (see
+            :func:`identity_digest`).  When given, the file is written as
+            a versioned v2 envelope carrying the remaining keyword fields;
+            when ``None`` the legacy shape is written unchanged.
+        has_valid_observation:
+            Whether a finite selection metric has been observed yet.
+            Distinguishes "no observation" from a legitimate ``0.0``.
+        best_epoch:
+            Epoch of the historical best observation (``None`` if none).
+        best_ref:
+            ``{"path": str, "digest": str}`` of the best-weights file,
+            which must be committed BEFORE this envelope references it.
+        scaler_state:
+            AMP ``GradScaler`` state (empty dict when disabled).
         """
         ckpt_path = self._training_dir() / f"{run_id}.pt"
         state = {
@@ -158,6 +222,15 @@ class CheckpointManager:
             "epochs_without_improvement": epochs_without_improvement,
             "rng_states": rng_states,
         }
+        if identity is not None:
+            state.update(
+                envelope_version=RESUME_ENVELOPE_VERSION,
+                identity=identity,
+                has_valid_observation=bool(has_valid_observation),
+                best_epoch=best_epoch,
+                best_ref=best_ref,
+                scaler_state=scaler_state if scaler_state is not None else {},
+            )
         self._atomic_save_torch(state, ckpt_path)
 
     def load_training_checkpoint(self, run_id: str) -> dict | None:
@@ -269,3 +342,120 @@ def restore_rng_states(rng_states: dict) -> None:
         torch.random.set_rng_state(rng_states["torch"])
     if "cuda" in rng_states and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(rng_states["cuda"])
+
+
+def identity_digest(payload: dict) -> str:
+    """SHA-256 of the canonical JSON form of *payload* (sorted keys).
+
+    Non-JSON values (e.g. ``Path``) are stringified.  Used to bind resume
+    envelopes and best-weight files to the run that produced them.
+    """
+    key = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def file_digest(path: str | Path, chunk_size: int = 1 << 20) -> str:
+    """SHA-256 of the bytes of *path*, streamed in ``chunk_size`` blocks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_resume_envelope(ckpt: Any, *, expected_identity: str, source: str) -> dict:
+    """Check that *ckpt* is a v2 envelope bound to ``expected_identity``.
+
+    Returns the envelope.  Raises :class:`ResumeStateError` for a legacy
+    shape (no ``envelope_version``), an unsupported version, a missing
+    required key or an identity mismatch.  A legacy envelope's historical
+    best state is unknown, so it is refused rather than reconstructed.
+    """
+    if not isinstance(ckpt, dict) or "envelope_version" not in ckpt:
+        raise ResumeStateError(
+            f"{source}: legacy resume checkpoint without envelope_version; its "
+            "historical best state is unknown. Delete it and rerun the trial cleanly."
+        )
+    version = ckpt["envelope_version"]
+    if version != RESUME_ENVELOPE_VERSION:
+        raise ResumeStateError(
+            f"{source}: unsupported resume envelope version {version!r} "
+            f"(expected {RESUME_ENVELOPE_VERSION})."
+        )
+    missing = [k for k in RESUME_ENVELOPE_REQUIRED_KEYS if k not in ckpt]
+    if missing:
+        raise ResumeStateError(f"{source}: resume envelope is missing {missing}.")
+    if ckpt["identity"] != expected_identity:
+        raise ResumeStateError(
+            f"{source}: resume envelope identity {ckpt['identity'][:12]}... does not "
+            f"match this run ({expected_identity[:12]}...); refusing to reuse it."
+        )
+    return ckpt
+
+
+def validate_best_ref(best_ref: Any, *, source: str) -> Path:
+    """Check that a ``best_ref`` names an existing, unaltered file.
+
+    Returns its path.  Raises :class:`ResumeStateError` when the reference
+    is malformed, the file is missing or its digest differs from the one
+    recorded when the envelope was written.
+    """
+    if not isinstance(best_ref, dict) or "path" not in best_ref or "digest" not in best_ref:
+        raise ResumeStateError(f"{source}: resume envelope has a malformed best_ref {best_ref!r}.")
+    path = Path(best_ref["path"])
+    if not path.exists():
+        raise ResumeStateError(
+            f"{source}: referenced best-weights file {path} is missing; the "
+            "historical best cannot be recovered from the current weights."
+        )
+    actual = file_digest(path)
+    if actual != best_ref["digest"]:
+        raise ResumeStateError(
+            f"{source}: referenced best-weights file {path} was altered "
+            f"(digest {actual[:12]}... != {best_ref['digest'][:12]}...)."
+        )
+    return path
+
+
+#: Keys a promoted / promotable best checkpoint must carry.
+BEST_PAYLOAD_REQUIRED_KEYS: tuple[str, ...] = (
+    "model_state",
+    "hyperparams",
+    "best_metric",
+    "n_users",
+    "n_items",
+    "selection_fingerprint",
+)
+
+
+def load_best_checkpoint(path: str | Path, *, map_location: str = "cpu") -> dict:
+    """Load and validate a best checkpoint written by the training step.
+
+    Raises :class:`BestCheckpointError` when the file is absent, cannot
+    be deserialised, lacks a required key or carries a non-finite
+    ``best_metric``.  A finite ``0.0`` is a legitimate winner.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise BestCheckpointError(f"best checkpoint {path} does not exist.")
+    try:
+        payload = torch.load(path, map_location=map_location, weights_only=False)
+    except (RuntimeError, EOFError, OSError, ValueError, KeyError, pickle.UnpicklingError) as exc:
+        raise BestCheckpointError(f"best checkpoint {path} is unreadable: {exc!r}") from exc
+    if not isinstance(payload, dict):
+        raise BestCheckpointError(f"best checkpoint {path} is not a payload dict.")
+    if "model_state" not in payload and all(isinstance(v, torch.Tensor) for v in payload.values()):
+        # Identified explicitly, never guessed: a flat state_dict carries
+        # neither hyperparameters nor selection identity, so the model it
+        # belongs to cannot be reconstructed with any confidence.
+        raise BestCheckpointError(
+            f"best checkpoint {path} is a legacy flat state_dict without hyperparams "
+            "or selection identity; retrain the cell instead of guessing its dimensions."
+        )
+    missing = [k for k in BEST_PAYLOAD_REQUIRED_KEYS if k not in payload]
+    if missing:
+        raise BestCheckpointError(f"best checkpoint {path} is missing {missing}.")
+    metric = payload["best_metric"]
+    if isinstance(metric, bool) or not isinstance(metric, int | float) or not math.isfinite(metric):
+        raise BestCheckpointError(f"best checkpoint {path} has invalid best_metric {metric!r}.")
+    return payload
