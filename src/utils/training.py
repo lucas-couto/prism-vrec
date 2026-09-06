@@ -21,13 +21,19 @@ from src.utils.checkpoint import (
     ResumeStateError,
     capture_rng_states,
     file_digest,
-    identity_digest,
     load_best_checkpoint,
     restore_rng_states,
     validate_best_ref,
     validate_resume_envelope,
 )
 from src.utils.diagnostics import TrainingDiagnostics
+from src.utils.identity import (
+    canonical_digest,
+    condition_of,
+    experiment_identity,
+    implementation_digest,
+    selection_scope_digest,
+)
 from src.utils.logging import get_logger
 from src.utils.seed import set_seed
 from src.utils.splits import assert_holdout_disjoint
@@ -240,6 +246,8 @@ def _save_best_model(
     embedding_name: str,
     fingerprint: str,
     results_root: str | Path = "results",
+    *,
+    identity: dict | None = None,
 ) -> None:
     """Save model weights only if metric beats the existing best on disk.
 
@@ -248,6 +256,13 @@ def _save_best_model(
     including legacy checkpoints saved before the field existed — is not
     comparable and is overwritten with a prominent warning rather than
     silently kept.
+
+    ``identity`` is the C02 payload of the run (E04).  Its *selection
+    scope* (everything but the hyperparameters — data digests, seed,
+    budget, protocol, condition, fold) is stored alongside; an existing
+    best from a different scope (other seed, other split, other feature
+    content, ...) is not comparable either and is overwritten with the
+    same warning.  A legacy best without a scope is identified as such.
     """
     best_model_path = (
         Path(results_root) / "models" / dataset_name / f"{model_name}_{embedding_name}_best.pt"
@@ -260,20 +275,24 @@ def _save_best_model(
         try:
             # Corrupted files left behind by SIGKILL during a prior save
             # are treated as absent (will be overwritten).
+            scope = selection_scope_digest(identity) if identity is not None else None
             if best_model_path.exists():
                 try:
                     existing = torch.load(best_model_path, map_location="cpu", weights_only=False)
                     existing_fp = existing.get("selection_fingerprint")
-                    if existing_fp != fingerprint:
+                    existing_scope = existing.get("selection_scope_digest")
+                    if existing_fp != fingerprint or existing_scope != scope:
                         logger.warning(
-                            "SELECTION PROTOCOL CHANGED: existing best model %s "
-                            "was selected under a different protocol "
-                            "(fingerprint %r != %r; legacy checkpoints have "
-                            "none). Its best_metric=%.4f is NOT comparable to "
-                            "the current run — overwriting it.",
+                            "SELECTION SCOPE CHANGED: existing best model %s "
+                            "was selected under a different protocol or identity "
+                            "(fingerprint %r != %r, scope %r != %r; legacy "
+                            "checkpoints have none). Its best_metric=%.4f is NOT "
+                            "comparable to the current run — overwriting it.",
                             best_model_path,
                             existing_fp,
                             fingerprint,
+                            _short(existing_scope),
+                            _short(scope),
                             float(existing.get("best_metric", 0.0)),
                         )
                     elif existing.get("best_metric", 0.0) >= metric:
@@ -292,12 +311,28 @@ def _save_best_model(
                 "n_users": n_users,
                 "n_items": n_items,
                 "selection_fingerprint": fingerprint,
+                **_identity_fields(identity),
             }
             # atomic_write adds fsync + retried replace on top of the
             # tmp+rename pattern (networked-FS dirent lag).
             atomic_write(lambda tmp, p=payload: torch.save(p, tmp), best_model_path)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _short(digest: str | None) -> str | None:
+    return digest[:12] if isinstance(digest, str) else digest
+
+
+def _identity_fields(identity: dict | None) -> dict:
+    """Additive checkpoint fields binding a payload to its C02 identity."""
+    if identity is None:
+        return {}
+    return {
+        "identity": identity,
+        "identity_digest": canonical_digest(identity),
+        "selection_scope_digest": selection_scope_digest(identity),
+    }
 
 
 def _trial_best_path(
@@ -324,6 +359,7 @@ def _save_trial_best(
     n_users: int,
     n_items: int,
     fingerprint: str,
+    identity: dict | None = None,
 ) -> str:
     """Persist the trial's own best epoch to its TRIAL-LOCAL path.
 
@@ -343,6 +379,7 @@ def _save_trial_best(
         "n_users": n_users,
         "n_items": n_items,
         "selection_fingerprint": fingerprint,
+        **_identity_fields(identity),
     }
     trial_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(lambda tmp, p=payload: torch.save(p, tmp), trial_path)
@@ -359,6 +396,7 @@ def _promote_trial_best(
     results_root: str | Path,
     log,
     expected_fingerprint: str | None = None,
+    identity: dict | None = None,
 ) -> None:
     """Promote the trial-local best epoch to ``_best.pt``, if it wins.
 
@@ -398,6 +436,7 @@ def _promote_trial_best(
         embedding_name,
         payload["selection_fingerprint"],
         results_root=results_root,
+        identity=identity,
     )
 
 
@@ -454,54 +493,90 @@ def bpr_step(
     return loss.detach()
 
 
+def resolve_training_identity(
+    *,
+    model_cls,
+    model_name: str,
+    dataset_name: str,
+    embedding_name: str,
+    hyperparams: dict,
+    config: dict,
+    identity_context: dict | None = None,
+) -> dict:
+    """The C02 identity payload of one training run (E04).
+
+    Everything that makes two trainings the same experiment: the data
+    (dataset, item mapping, split and feature content from
+    ``identity_context["data"]``, or explicitly ``unresolved``), the
+    registered model and its implementation, the effective
+    hyperparameters, the selection budget, the seed, the selection
+    protocol (full-ranking validation, cutoff, metric, sampling and
+    tie-break seeds) and the condition / fold.  Placement details
+    (block sizes, worker count, device, paths) are excluded.  Shared by
+    :func:`train_single_run`, the grid worker and the checkpoint
+    readers so all of them derive one digest from the same inputs.
+    """
+    common = config.get("common", {})
+    base_seed = int(config.get("seed", 42))
+    context = identity_context or {}
+    es_metric = common.get("early_stopping_metric", "ndcg@10")
+    return experiment_identity(
+        data=context.get("data"),
+        model_name=model_name,
+        implementation=implementation_digest(model_cls),
+        hyperparams=hyperparams,
+        selection_budget={
+            "epochs": int(common.get("epochs", 100)),
+            "batch_size": int(common.get("batch_size", 4096)),
+            "patience": int(common.get("early_stopping_patience", 20)),
+            "eval_every_epochs": int(common.get("eval_every_epochs", 10)),
+            "metric": es_metric,
+            "eval_sample_size": common.get("eval_sample_size"),
+            "eval_sample_seed": base_seed,
+        },
+        seed=base_seed,
+        protocol={
+            "candidates": "full_ranking",
+            "k_values": [10],
+            "tiebreak_seed": base_seed,
+            "fingerprint_schema": SELECTION_FINGERPRINT_SCHEMA,
+        },
+        condition=context.get("condition") or condition_of(embedding_name),
+        fold=context.get("fold"),
+    )
+
+
 def _training_resume_identity(
+    identity: dict,
     *,
     run_id: str,
-    dataset_name: str,
-    model_name: str,
-    embedding_name: str,
     model_cls_name: str,
-    hyperparams: dict,
     n_users: int,
     n_items: int,
-    base_seed: int,
     job_seed: int,
     fingerprint: str,
-    epochs: int,
-    batch_size: int,
-    patience: int,
-    eval_every_epochs: int,
     use_cuda: bool,
 ) -> str:
     """Digest of everything a resume envelope must agree on (Q13).
 
-    Scientific identity (dataset, model, embedding, hyperparameters,
-    seeds, selection protocol, selection budget) plus the AMP regime,
-    because a CPU envelope carries no scaler state a CUDA run could
-    restore.  Placement details (block sizes, worker count, paths) are
-    deliberately excluded.
+    The C02 identity plus the resume binding: the run id, the catalogue
+    dimensions, the derived job seed, the selection fingerprint and the
+    AMP regime (a CPU envelope carries no scaler state a CUDA run could
+    restore).
     """
-    return identity_digest(
+    return canonical_digest(
         {
-            "schema": 1,
-            "run_id": run_id,
-            "dataset": dataset_name,
-            "model": model_name,
-            "model_cls": model_cls_name,
-            "embedding": embedding_name,
-            "hyperparams": hyperparams,
-            "n_users": n_users,
-            "n_items": n_items,
-            "seed": base_seed,
-            "job_seed": job_seed,
-            "selection_fingerprint": fingerprint,
-            "selection_budget": {
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "patience": patience,
-                "eval_every_epochs": eval_every_epochs,
+            "identity": identity,
+            "resume_binding": {
+                "schema": 2,
+                "run_id": run_id,
+                "model_cls": model_cls_name,
+                "n_users": n_users,
+                "n_items": n_items,
+                "job_seed": job_seed,
+                "selection_fingerprint": fingerprint,
+                "amp": use_cuda,
             },
-            "amp": use_cuda,
         }
     )
 
@@ -649,6 +724,7 @@ def train_single_run(
     ranking_budget_bytes: int | None = None,
     *,
     log_context: str = "",
+    identity_context: dict | None = None,
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -656,6 +732,14 @@ def train_single_run(
 
     Parameters
     ----------
+    identity_context:
+        ``{"data": DataIdentity payload | None, "condition": str,
+        "fold": dict | None}`` from
+        :func:`src.utils.identity.build_identity_context`.  Binds the
+        resume envelope, the trial-local best and the promoted
+        ``_best.pt`` to the content identity of the dataset, split and
+        feature artifact (E04).  ``None`` records the data identity as
+        unresolved; it is never guessed.
     log_context:
         Free-form tag appended to every per-epoch ``timing`` log line
         (e.g. ``"fold=2/5"`` from the K-fold runner) so a run that
@@ -771,22 +855,23 @@ def train_single_run(
     trial_best_path = _trial_best_path(
         results_root, dataset_name, model_name, embedding_name, run_id
     )
-    identity = _training_resume_identity(
-        run_id=run_id,
-        dataset_name=dataset_name,
+    experiment = resolve_training_identity(
+        model_cls=model_cls,
         model_name=model_name,
+        dataset_name=dataset_name,
         embedding_name=embedding_name,
-        model_cls_name=model_cls.__name__,
         hyperparams=hyperparams,
+        config=config,
+        identity_context=identity_context,
+    )
+    identity = _training_resume_identity(
+        experiment,
+        run_id=run_id,
+        model_cls_name=model_cls.__name__,
         n_users=n_users,
         n_items=n_items,
-        base_seed=base_seed,
         job_seed=job_seed,
         fingerprint=fingerprint,
-        epochs=epochs,
-        batch_size=batch_size,
-        patience=patience,
-        eval_every_epochs=eval_every_epochs,
         use_cuda=use_cuda,
     )
 
@@ -937,6 +1022,7 @@ def train_single_run(
                         n_users,
                         n_items,
                         fingerprint,
+                        identity=experiment,
                     )
                     state.record_best(current_metric, epoch, trial_best_path, digest)
                 else:
@@ -1008,6 +1094,7 @@ def train_single_run(
             results_root=results_root,
             log=logger,
             expected_fingerprint=fingerprint,
+            identity=experiment,
         )
         return state.best_metric
     finally:

@@ -56,6 +56,12 @@ import numpy as np
 
 from src.utils.artifact_names import FINETUNED_MARKER
 from src.utils.atomic_io import atomic_np_memmap_save, atomic_write
+from src.utils.identity import (
+    check_provenance,
+    feature_recipe,
+    fit_set_digest,
+    write_provenance,
+)
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -237,6 +243,27 @@ def _write_projector(path: Path, matrix: np.ndarray, mean: np.ndarray | None, cf
     )
 
 
+def projection_provenance(
+    source_npy: Path,
+    cfg: ProjectionConfig,
+    train_items: np.ndarray | list[int] | None,
+) -> dict[str, Any]:
+    """Ingredients a projected artifact is reused against (E05).
+
+    Source content (recursive recipe: shape, dtype, digest), method,
+    target dimension, seed (only meaningful for ``random``, recorded
+    for every method) and the fit-set digest (PCA methods only).
+    """
+    return {
+        "kind": "projection",
+        "source": feature_recipe(source_npy),
+        "method": cfg.method,
+        "dim": int(cfg.dim),
+        "seed": int(cfg.seed),
+        "fit_set_digest": fit_set_digest(train_items) if cfg.needs_fit else None,
+    }
+
+
 def projected_path(source_npy: Path, dim: int) -> Path:
     """Destination of the projected artifact for *source_npy*.
 
@@ -265,9 +292,11 @@ def ensure_projected(
 ) -> Path | None:
     """Project *source_npy* to ``cfg.dim``, writing the artifact if absent.
 
-    Idempotent: an existing projected artifact is left alone, so the
-    projection of an already-extracted catalogue costs one no-op check
-    rather than a re-extraction.
+    Idempotent: an existing projected artifact is left alone when its
+    provenance sidecar (source content, fit set, method, dimensions,
+    seed) matches what this call would produce (E05); a differing
+    record raises :class:`~src.utils.identity.ArtifactProvenanceError`
+    and a legacy artifact without a record is reused with a warning.
 
     The source is read through a memory map and transformed in chunks of
     *chunk_rows*, so peak memory is a function of the chunk, not of the
@@ -281,10 +310,14 @@ def ensure_projected(
     :returns: The path written, or ``None`` when it already existed.
     :raises ValueError: When a PCA method is configured without a fit
         set, or when the source is narrower than the requested dim.
+    :raises ArtifactProvenanceError: When the existing artifact was built
+        from other ingredients.
     """
     source_npy = Path(source_npy)
     output = projected_path(source_npy, cfg.dim)
+    expected = projection_provenance(source_npy, cfg, train_items)
     if output.exists():
+        check_provenance(output, expected, label=str(output))
         return None
 
     source = np.load(source_npy, mmap_mode="r")
@@ -320,6 +353,9 @@ def ensure_projected(
         )
 
     shape = (int(source.shape[0]), int(matrix.shape[1]))
+    # Provenance first, artifact second: a sidecar without its artifact is
+    # recomputed; an artifact without a sidecar could only pass as legacy.
+    write_provenance(output, expected)
 
     def _fill(out: np.memmap) -> None:
         for start in range(0, shape[0], chunk_rows):

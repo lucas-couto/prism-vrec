@@ -10,7 +10,12 @@ import pandas as pd
 import pytest
 
 from src.evaluation.paired_loader import load_paired
-from src.evaluation.persistence import CellMetadata, artifact_paths, read_cell_artifact
+from src.evaluation.persistence import (
+    CellMetadata,
+    artifact_paths,
+    contract_fields,
+    read_cell_artifact,
+)
 from src.folds import FoldAggregate, concatenate_fold_artifacts, fold_dir, write_fold_artifact
 
 _K_VALUES = [5, 10]
@@ -80,7 +85,7 @@ class TestWriteFoldArtifact:
         assert not path.with_name(path.name.replace(".csv.gz", ".fold.json")).exists()
         meta, records = read_cell_artifact(path)
         assert meta["fold"] == {"index": 2, "k": 3, "seed": 7, "n_users": 2}
-        assert {k: v for k, v in meta.items() if k != "fold"} == {
+        assert {k: v for k, v in contract_fields(meta).items() if k != "fold"} == {
             k: v for k, v in metadata.to_dict().items() if k != "fold"
         }
         assert records["user_idx"].tolist() == [0, 3]
@@ -123,7 +128,7 @@ class TestConcatenateFoldArtifacts:
         assert path == records_path
         written = json.loads(meta_path.read_text())
         assert written["fold"] == {"k": 3, "seeds": [100, 101, 102], "n_users_per_fold": [3, 3, 3]}
-        assert {k: v for k, v in written.items() if k != "fold"} == {
+        assert {k: v for k, v in contract_fields(written).items() if k != "fold"} == {
             k: v for k, v in metadata.to_dict().items() if k != "fold"
         }
         assert metadata.fold is None

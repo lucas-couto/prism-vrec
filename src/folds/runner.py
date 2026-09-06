@@ -35,13 +35,24 @@ import torch
 
 from src.battery.cells import BatteryCell, enumerate_cells
 from src.battery.manifest import BatteryManifest
-from src.evaluation.persistence import CellMetadata, artifact_paths
+from src.evaluation.persistence import (
+    ArtifactIntegrityError,
+    CellMetadata,
+    artifact_paths,
+    validate_cell_artifact,
+)
 from src.folds.aggregate import concatenate_fold_artifacts, write_fold_artifact
 from src.folds.foldin import FoldInConfig, fold_in_users
 from src.folds.partition import FoldPlan, FoldSplit, build_fold_plan, fold_split
 from src.folds.splits_io import load_split_frames
 from src.recommenders.hp_search import assert_dimension_parity
 from src.recommenders.hp_source import HyperparamOrigin, resolve_cell_hyperparams
+from src.utils.identity import (
+    EVALUATION_SPLITS,
+    IdentityError,
+    canonical_digest,
+    resolve_data_identity,
+)
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -74,6 +85,33 @@ def _fold_config(config: dict, fold_index: int) -> dict:
     return cfg
 
 
+def fold_plan_digest(plan: FoldPlan, dataset: str, processed_dir: str) -> str:
+    """Identity of a fold plan: k, partition seed, profile rule, the exact
+    user assignment and the split / item-mapping content it was built from (E07).
+
+    Recorded as the cell artifact's ``config_hash``; a concatenated fold
+    artifact is complete for the current configuration only when its
+    recorded digest equals this one.
+    """
+    try:
+        data = resolve_data_identity(processed_dir, dataset, None, splits=EVALUATION_SPLITS)
+        split, mapping = data.split_digest, data.item_mapping_digest
+    except IdentityError as exc:
+        logger.warning("%s: split identity unresolved for the fold plan (%s).", dataset, exc)
+        split, mapping = None, None
+    return canonical_digest(
+        {
+            "schema_version": 1,
+            "k": int(plan.k),
+            "seed": int(plan.seed),
+            "min_profile": int(plan.min_profile),
+            "assignment": sorted((int(u), int(f)) for u, f in plan.assignment.items()),
+            "split_digest": split,
+            "item_mapping_digest": mapping,
+        }
+    )
+
+
 def _dataset_plan(config: dict, dataset: str, processed_dir: str) -> tuple[FoldPlan, tuple]:
     train, val, test, n_users, n_items = load_split_frames(processed_dir, dataset)
     folds_cfg = config["folds"]
@@ -95,12 +133,12 @@ def _embedding_path(embeddings_dir: str, dataset: str, visual_config: str) -> st
     return resolve(embeddings_dir, dataset, visual_config)
 
 
-def _load_visual(emb_path: str | None):
+def _load_visual(emb_path: str | None, *, lazy: bool = False):
     if emb_path is None:
         return None
     from src.fusions import load_embedding
 
-    return load_embedding(emb_path)
+    return load_embedding(emb_path, lazy=lazy)
 
 
 def _ctor_kwargs(model_cls: type, split: FoldSplit, dataset: str, processed_dir: str) -> dict:
@@ -129,11 +167,19 @@ def _train_fold_model(
 ) -> float:
     """Train the cell on the fold's training users with frozen hyperparameters."""
     from src.recommenders import get_recommender_class
+    from src.steps.train import identity_context_for
     from src.utils.checkpoint import CheckpointManager
     from src.utils.training import train_single_run
 
     model_cls = get_recommender_class(cell.recommender)
-    kwargs = _ctor_kwargs(model_cls, split, cell.dataset, cfg["paths"]["data_processed"])
+    processed_dir = cfg["paths"]["data_processed"]
+    kwargs = _ctor_kwargs(model_cls, split, cell.dataset, processed_dir)
+    fold = {
+        "index": int(fold_index),
+        "k": int(k),
+        "partition_seed": int(cfg["folds"]["seed"]),
+        "min_profile": int(cfg["folds"]["min_profile"]),
+    }
     return train_single_run(
         model_cls=model_cls,
         model_name=cell.recommender,
@@ -150,6 +196,13 @@ def _train_fold_model(
         device=device,
         item_categories=kwargs.get("item_categories"),
         log_context=f"fold={fold_index + 1}/{k}",
+        identity_context=identity_context_for(
+            processed_dir,
+            cell.dataset,
+            cell.visual_config,
+            _embedding_path(cfg["paths"]["embeddings"], cell.dataset, cell.visual_config),
+            fold=fold,
+        ),
     )
 
 
@@ -165,6 +218,7 @@ def _load_best_model(
 ):
     """Rebuild the fold's best checkpoint as a live model."""
     from src.recommenders import get_recommender_class
+    from src.utils.checkpoint import load_best_checkpoint
 
     model_cls = get_recommender_class(cell.recommender)
     path = (
@@ -173,7 +227,9 @@ def _load_best_model(
         / cell.dataset
         / f"{cell.recommender}_{cell.visual_config}_best.pt"
     )
-    saved = torch.load(path, map_location=device, weights_only=False)
+    # Validating reader (I02): an absent / truncated / legacy winner raises
+    # BestCheckpointError instead of surfacing from deep inside torch.
+    saved = load_best_checkpoint(path, map_location=device)
     model_config = {**saved["hyperparams"], "history_seed": int(cfg["seed"])}
     model_config.setdefault("l2_reg", 0.0001)
     kwargs = _ctor_kwargs(model_cls, split, cell.dataset, cfg["paths"]["data_processed"])
@@ -243,8 +299,10 @@ def run_cell_folds(
         embedding_name=cell.visual_config,
         results_root=results_dir,
     )
+    from src.steps.train import lazy_features_for
+
     emb_path = _embedding_path(config["paths"]["embeddings"], cell.dataset, cell.visual_config)
-    visual = _load_visual(emb_path)
+    visual = _load_visual(emb_path, lazy=lazy_features_for(config, emb_path))
     artifact_root = Path(results_dir)  # artifact_paths appends per_user/<dataset>
     metadata = CellMetadata(
         dataset=cell.dataset,
@@ -255,6 +313,7 @@ def run_cell_folds(
         split="test",
         n_users=n_users,
         n_items=n_items,
+        config_hash=fold_plan_digest(plan, cell.dataset, config["paths"]["data_processed"]),
     )
 
     fold_entries: list[dict] = []
@@ -319,7 +378,23 @@ def run_cell_folds(
     }
 
 
-def _cell_done(cell: BatteryCell, metadata_seed: int, results_dir: Path) -> bool:
+def _cell_done(
+    cell: BatteryCell,
+    metadata_seed: int,
+    results_dir: Path,
+    *,
+    k: int | None = None,
+    plan_digest: str | None = None,
+) -> bool:
+    """Whether the cell's concatenated fold artifact is complete for THIS plan (E07).
+
+    Requires a validated generation (payload matches its completion
+    pointer), K-fold provenance of the concatenated shape, and — when
+    given — the requested ``k``, the fold seeds ``seed + i`` and the fold
+    plan digest (partition seed, profile rule, assignment, split content).
+    Existence alone, a legacy artifact or a leave-one-out artifact at the
+    same path never count.
+    """
     meta = CellMetadata(
         dataset=cell.dataset,
         visual_config=cell.visual_config,
@@ -333,15 +408,35 @@ def _cell_done(cell: BatteryCell, metadata_seed: int, results_dir: Path) -> bool
     records_path, meta_path = artifact_paths(results_dir, meta)
     if not (records_path.exists() and meta_path.exists()):
         return False
-    # The concatenated fold artifact shares its canonical path with the
-    # leave-one-out artifact of the same seed (the paired loader consumes
-    # both unchanged), so existence alone cannot tell them apart: only
-    # an artifact carrying K-fold provenance counts as done.
     try:
-        provenance = json.loads(meta_path.read_text(encoding="utf-8")).get("fold")
-    except (OSError, ValueError):
+        if validate_cell_artifact(records_path) is None:
+            return False
+        written = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (ArtifactIntegrityError, OSError, ValueError) as exc:
+        logger.warning("%s: fold artifact not accepted (%s).", cell.key(), exc)
         return False
-    return isinstance(provenance, dict) and "k" in provenance and "index" not in provenance
+    reason = _fold_provenance_mismatch(written, metadata_seed, k=k, plan_digest=plan_digest)
+    if reason:
+        logger.warning("%s: fold artifact present but %s; re-running.", cell.key(), reason)
+        return False
+    return True
+
+
+def _fold_provenance_mismatch(
+    written: dict, metadata_seed: int, *, k: int | None, plan_digest: str | None
+) -> str | None:
+    provenance = written.get("fold")
+    if not isinstance(provenance, dict) or "k" not in provenance or "index" in provenance:
+        return "it carries no concatenated K-fold provenance"
+    if k is not None and int(provenance["k"]) != int(k):
+        return f"it was built with k={provenance['k']}, not k={k}"
+    if k is not None and [int(s) for s in provenance.get("seeds", [])] != [
+        metadata_seed + i for i in range(int(k))
+    ]:
+        return f"its fold seeds {provenance.get('seeds')} differ from seed {metadata_seed} + i"
+    if plan_digest is not None and written.get("config_hash") != plan_digest:
+        return "its fold plan (partition seed / profile rule / splits) differs"
+    return None
 
 
 def run_folds(
@@ -384,17 +479,29 @@ def run_folds(
     manifest.save()
 
     plans: dict[str, tuple[FoldPlan, tuple]] = {}
+    digests: dict[str, str] = {}
     for cell in cells:
         if cell.dataset not in plans:
             plans[cell.dataset] = _dataset_plan(config, cell.dataset, processed_dir)
+            digests[cell.dataset] = fold_plan_digest(
+                plans[cell.dataset][0], cell.dataset, processed_dir
+            )
             logger.info("Fold plan %s: %s", cell.dataset, plans[cell.dataset][0].summary())
         key = cell.key()
-        if manifest.state_of(key) == "done" or _cell_done(
-            cell, int(folds_cfg["seed"]), results_dir
+        # A ``done`` manifest state is not enough: the artifact itself must
+        # validate for the CURRENT k / partition seed / profile rule / splits.
+        if _cell_done(
+            cell,
+            int(folds_cfg["seed"]),
+            results_dir,
+            k=int(folds_cfg["k"]),
+            plan_digest=digests[cell.dataset],
         ):
             manifest.set_state(key, "done", note="fold artifact already present")
             manifest.save()
             continue
+        if manifest.state_of(key) == "done":
+            logger.warning("%s: manifest says done but no valid fold artifact; re-running.", key)
         manifest.set_state(key, "running")
         manifest.save()
         started = time.perf_counter()
@@ -417,5 +524,9 @@ def run_folds(
                 error=str(exc),
             )
         manifest.save()
-    logger.info("K-fold run finished: %s", manifest.summary())
+    summary = manifest.summary()
+    if any(v for k, v in summary.items() if k != "done"):
+        logger.error("K-fold run INCOMPLETE: %s", summary)
+    else:
+        logger.info("K-fold run finished: %s", summary)
     return manifest

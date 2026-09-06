@@ -159,9 +159,14 @@ class TestRunResume:
         monkeypatch.setattr(ev, "load_data", lambda p, d: (2, 5, {}, {}, {}))
 
         class _Eval:
+            protocol, k_values, n_negatives = "full_ranking", [10], 100
+
             def __init__(self, *a, **k) -> None: ...
 
         monkeypatch.setattr(ev, "Evaluator", _Eval)
+        # E04: completion is bound to the checkpoint bytes, so the fake
+        # winner must exist on disk for the second run to be a reuse.
+        (tmp_path / "x.pt").write_bytes(b"winner")
         monkeypatch.setattr(
             ev,
             "find_best_models",
@@ -169,7 +174,7 @@ class TestRunResume:
                 {
                     "model_name": "vbpr",
                     "embedding_name": "resnet50_finetuned_D128",
-                    "path": "x.pt",
+                    "path": str(tmp_path / "x.pt"),
                 }
             ],
         )
