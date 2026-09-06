@@ -36,3 +36,6 @@ Thumbs.db
 
 # Model weight cache (torch hub / HuggingFace), populated on first extract.
 .cache/
+
+# Session hand-off notes live outside version control.
+HANDOFF.md
