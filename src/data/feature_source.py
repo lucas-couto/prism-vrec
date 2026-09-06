@@ -272,10 +272,22 @@ class StackedFeatureSource(_MultiSource):
 
     ``read_rows`` returns ``(B, M, *trailing)`` exactly as
     ``np.stack(all_sources, axis=1)[ids]`` would, without ever building
-    the full stack.
+    the full stack.  With ``normalize=True`` every gathered row of every
+    source is L2-normalised first (SDD S02: the non-learned online
+    sidecar's pre-fusion normalisation, mirroring the eager
+    :class:`src.fusions.online.StackedSources`), with the offline
+    :func:`~src.fusions.strategies.l2_normalize` rule for zero rows.
+    ``recipe_version`` / ``sidecar_recipe_version`` carry the same recipe
+    identity as the eager array.
     """
 
-    def __init__(self, sources: list[FeatureSource]) -> None:
+    def __init__(
+        self,
+        sources: list[FeatureSource],
+        *,
+        normalize: bool = False,
+        sidecar_recipe_version: int | None = None,
+    ) -> None:
         super().__init__(sources)
         first = tuple(self._sources[0].shape)
         for source in self._sources[1:]:
@@ -283,6 +295,21 @@ class StackedFeatureSource(_MultiSource):
                 raise ValueError(
                     f"stacked sources must share a shape: {tuple(source.shape)} != {first}."
                 )
+        if normalize and len(first) != 2:
+            raise ValueError(
+                f"per-source normalisation needs 2-D sources, got shape {first} "
+                "(component stacks are consumed raw)."
+            )
+        self.normalize = bool(normalize)
+        self.sidecar_recipe_version = (
+            None if sidecar_recipe_version is None else int(sidecar_recipe_version)
+        )
+
+    @property
+    def recipe_version(self) -> int:
+        from src.fusions.online import SIDECAR_RECIPE_VERSION  # avoid cycle
+
+        return SIDECAR_RECIPE_VERSION
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -292,6 +319,10 @@ class StackedFeatureSource(_MultiSource):
     def read_rows(self, item_ids: np.ndarray) -> np.ndarray:
         ids = _validate_ids(item_ids, self.shape[0])
         parts = [s.read_rows(ids).astype(self._dtype, copy=False) for s in self._sources]
+        if self.normalize:
+            from src.fusions.strategies import l2_normalize  # avoid cycle
+
+            parts = [l2_normalize(part) for part in parts]
         return np.stack(parts, axis=1)
 
 

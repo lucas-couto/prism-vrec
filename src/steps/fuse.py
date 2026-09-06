@@ -43,6 +43,7 @@ from src.fusions import (
     iter_specs,
     registered_fusion_strategies,
 )
+from src.fusions.online import SIDECAR_RECIPE_VERSION
 from src.fusions.streaming import (
     CHUNK_ROWS,
     is_streamable,
@@ -343,6 +344,7 @@ def _collect_fusion_tasks(
                             "alignment": "none",
                             "components": [p.name for p in native_paths],
                             "normalize": normalize,
+                            "recipe_version": SIDECAR_RECIPE_VERSION,
                         },
                     }
                 )
@@ -373,6 +375,7 @@ def _collect_fusion_tasks(
                     "dim": alignment_dim,
                     "components": [p.name for p in native_paths],
                     "normalize": normalize,
+                    "recipe_version": SIDECAR_RECIPE_VERSION,
                     "fusion_kwargs": fn_kwargs,
                 }
                 tasks.append(
@@ -399,6 +402,7 @@ def _collect_fusion_tasks(
                 "alignment": "pca",
                 "components": [p.name for p in aligned_paths],
                 "normalize": normalize,
+                "recipe_version": SIDECAR_RECIPE_VERSION,
             }
             tasks.append(
                 {

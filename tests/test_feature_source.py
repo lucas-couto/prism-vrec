@@ -300,7 +300,12 @@ class TestLoadEmbeddingLazy:
         a, b = _pooled(seed=8), _pooled(seed=9)
         np.save(tmp_path / "a.npy", a)
         np.save(tmp_path / "b.npy", b)
-        payload = {"strategy": "adaptive_gated", "online": True, "components": ["a.npy", "b.npy"]}
+        payload = {
+            "strategy": "adaptive_gated",
+            "online": True,
+            "components": ["a.npy", "b.npy"],
+            "normalize": False,
+        }
         path = self._write_sidecar(tmp_path, payload, "hybrid_adaptive_gated_pca_D5.json")
 
         source = load_embedding(path, lazy=True)

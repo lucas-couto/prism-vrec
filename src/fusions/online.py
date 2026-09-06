@@ -42,7 +42,26 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.fusions.strategies import l2_normalize
 from src.utils.artifact_names import is_component_artifact
+
+#: Recipe version of the online-fusion sidecar loader (SDD S02).
+#:
+#: * ``1`` (implicit — sidecars written before the fix carry no
+#:   ``recipe_version`` key): the equal-dim stack returned rows exactly
+#:   as stored, ignoring the sidecar's ``normalize`` flag (finding F10).
+#: * ``2``: each source of an equal-dim sidecar is L2-normalised once,
+#:   per row, before the online fusion — the point at which every
+#:   offline equal-dim strategy normalises (protocol §10.3).  The
+#:   learned-alignment path is unchanged between the two versions (it
+#:   normalises after its linear map).
+#:
+#: The fuse step stamps this value into new sidecars; the loader reports
+#: what it applied (:attr:`StackedSources.recipe_version`) separately
+#: from what the file declares (:attr:`StackedSources.sidecar_recipe_version`,
+#: ``None`` for a legacy file) so historical representations stay
+#: distinguishable without guessing their identity.
+SIDECAR_RECIPE_VERSION = 2
 
 
 class RaggedSources(np.ndarray):
@@ -90,6 +109,52 @@ class RaggedSources(np.ndarray):
         self.aligned_dim = getattr(obj, "aligned_dim", 0)
         self.normalize = getattr(obj, "normalize", True)
         self.fusion_kwargs = getattr(obj, "fusion_kwargs", {})
+
+
+class StackedSources(np.ndarray):
+    """Equal-dim online sidecar stack ``(n_items, M, D)`` + recipe identity.
+
+    Produced by :func:`load_embedding` for the non-learned online sidecar
+    (``adaptive_gated`` over PCA-aligned or pre-aligned sources).  Behaves
+    exactly like the plain ``np.stack`` array the recommender consumed
+    before SDD S02; the attributes only record the recipe:
+
+    * ``normalize`` — whether each source was L2-normalised per row
+      before stacking (the sidecar's ``normalize`` flag).
+    * ``recipe_version`` — the loader recipe that built this array
+      (:data:`SIDECAR_RECIPE_VERSION`).
+    * ``sidecar_recipe_version`` — the version the sidecar file declares;
+      ``None`` for a file written before the field existed (legacy,
+      identified explicitly, never inferred).
+    """
+
+    def __new__(
+        cls,
+        arr: np.ndarray,
+        *,
+        normalize: bool,
+        sidecar_recipe_version: int | None,
+    ) -> StackedSources:
+        obj = np.asarray(arr).view(cls)
+        obj.normalize = bool(normalize)
+        obj.recipe_version = SIDECAR_RECIPE_VERSION
+        obj.sidecar_recipe_version = (
+            None if sidecar_recipe_version is None else int(sidecar_recipe_version)
+        )
+        return obj
+
+    def __array_finalize__(self, obj) -> None:
+        if obj is None:
+            return
+        self.normalize = getattr(obj, "normalize", True)
+        self.recipe_version = getattr(obj, "recipe_version", SIDECAR_RECIPE_VERSION)
+        self.sidecar_recipe_version = getattr(obj, "sidecar_recipe_version", None)
+
+
+def _sidecar_recipe_version(sidecar: dict) -> int | None:
+    """Declared recipe version of a sidecar, ``None`` when the file predates it."""
+    declared = sidecar.get("recipe_version")
+    return None if declared is None else int(declared)
 
 
 class LearnedAlignmentFusion(nn.Module):
@@ -434,7 +499,19 @@ def load_embedding(path: str | Path, *, lazy: bool = False):
                     f"sidecar {p}: component {fname} has shape "
                     f"{arr.shape}, expected {first_shape}.",
                 )
-        return np.stack(loaded, axis=1)  # (n_items, M, D)
+        # SDD S02 (F10): the configured pre-fusion normalisation is applied
+        # here, once per source, exactly where the offline equal-dim
+        # strategies apply it (``_maybe_normalize``); zero rows stay zero.
+        # Nothing downstream normalises again (the recommender feeds the
+        # slices straight to the online module).
+        normalize = bool(sidecar.get("normalize", True))
+        if normalize:
+            loaded = [l2_normalize(arr) for arr in loaded]
+        return StackedSources(  # (n_items, M, D)
+            np.stack(loaded, axis=1),
+            normalize=normalize,
+            sidecar_recipe_version=_sidecar_recipe_version(sidecar),
+        )
 
     # Component artifacts (``<extractor>_comp.npy``, fp16, 3-D) are read
     # through a memmap: the consumer keeps them in fp16 and materialises
@@ -477,8 +554,8 @@ def _load_embedding_lazy(p: Path):
     Mirrors the eager branches one to one: the learned sidecar keeps its
     sources' native widths in declared order, the equal-dim sidecar
     requires identical component shapes, and a plain ``.npy`` is checked
-    against its ``.meta.json``.  Non-learned sidecar rows are returned as
-    stored (no normalisation), exactly as the eager stack does today.
+    against its ``.meta.json``.  Non-learned sidecar rows are L2-normalised per
+    source when the sidecar says so (SDD S02), exactly as the eager stack.
     """
     from src.data.feature_source import (
         ConcatFeatureSource,
@@ -508,7 +585,11 @@ def _load_embedding_lazy(p: Path):
                 f"sidecar {p}: component {path.name} has shape "
                 f"{source.shape}, expected {first_shape}."
             )
-    return StackedFeatureSource(sources)
+    return StackedFeatureSource(
+        sources,
+        normalize=bool(sidecar.get("normalize", True)),
+        sidecar_recipe_version=_sidecar_recipe_version(sidecar),
+    )
 
 
 def _validate_against_meta(npy_path, arr) -> None:
@@ -543,9 +624,11 @@ def _validate_against_meta(npy_path, arr) -> None:
 
 
 __all__ = [
+    "SIDECAR_RECIPE_VERSION",
     "AdaptiveGatedFusion",
     "LearnedAlignmentFusion",
     "RaggedSources",
+    "StackedSources",
     "load_embedding",
     "online_module_for",
 ]

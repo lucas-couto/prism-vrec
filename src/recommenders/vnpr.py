@@ -238,8 +238,42 @@ class VNPR(BaseRecommender):
         f: torch.Tensor,
     ) -> torch.Tensor:
         """``ReLU(w^T [p ∘ q, v ∘ f] + b)`` for aligned ``(B, ·)`` tensors."""
+        return torch.relu(self._preactivation(p, q, v, f))
+
+    def _preactivation(
+        self,
+        p: torch.Tensor,
+        q: torch.Tensor,
+        v: torch.Tensor,
+        f: torch.Tensor,
+    ) -> torch.Tensor:
+        """``w^T [p ∘ q, v ∘ f] + b`` — the branch before its ReLU (Eq. 3)."""
         merged = torch.cat([p * q, v * f], dim=-1)
-        return torch.relu(self.dense(merged)).squeeze(-1)
+        return self.dense(merged).squeeze(-1)
+
+    def diagnostic_branches(
+        self,
+        user_ids: torch.Tensor,
+        pos_item_ids: torch.Tensor,
+        neg_item_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Pre-ReLU branch values of :meth:`forward` (SDD S04 diagnostics).
+
+        Same computation as :meth:`forward` up to the ReLU — dropout
+        follows the module's current mode, so the training view is
+        obtained in ``train()`` and the inference view ``(u, i, i)`` in
+        ``eval()``.  Read-only: no parameter, cache or buffer changes.
+        """
+        p = self.dropout(self.user_embedding(user_ids))
+        v = self.dropout(self.visual_user_embedding(user_ids))
+        q_pos = self.dropout(self.item_embedding(pos_item_ids))
+        q_neg = self.dropout(self.item_embedding_neg(neg_item_ids))
+        f_pos = self._resolve_visual(pos_item_ids)
+        f_neg = self._resolve_visual(neg_item_ids)
+        return {
+            "pos": self._preactivation(p, q_pos, v, f_pos),
+            "neg": self._preactivation(p, q_neg, v, f_neg),
+        }
 
     def forward(
         self,
