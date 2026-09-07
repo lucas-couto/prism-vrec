@@ -209,7 +209,7 @@ user's own val/test positives are eligible to be drawn as negatives
 standard protocol, with negligible metric deflation given catalogue
 sizes.
 
-## 3b. User-level K-fold cross-validation (`python main.py --folds`)
+## 3b. User-level K-fold cross-validation (`folds.enabled`, the evaluate step)
 
 Precedent: Rendle et al. (UAI 2009, §6.2) evaluate BPR with
 leave-one-out, repeat the experiment 10 times over freshly drawn splits,
@@ -217,7 +217,15 @@ and run the hyperparameter grid search **once, on the first round**,
 keeping the winners constant afterwards. Section 2 of the same paper
 notes that the fold-in strategy known for MF applies to BPR. The
 `folds:` block of `configs/default.yaml` reproduces that procedure with
-users as the partition unit:
+users as the partition unit. `folds.enabled` selects the protocol of the
+`evaluate` step (researcher decision, 2026-09-07): `true` — the shipped
+default, so a plain run evaluates by K-fold — runs the procedure below
+over every battery cell; `false` runs the single leave-one-out split of
+§3. Exactly one of the two scores the winners in a run and writes the
+canonical per-user artifact; the resolved choice is printed by
+`--show-plan` and recorded in the run manifest (`evaluation_protocol`)
+as execution metadata, outside the scientific identity. The former
+`--folds` mode was removed.
 
 - Users are split into `k` mutually exclusive, balanced folds
   (`src/folds/partition.py`, seeded). A user is eligible when it has
@@ -260,6 +268,14 @@ users as the partition unit:
   seed or the split re-runs every cell. Each fold's training carries
   `fold={index, k, partition_seed, min_profile}` in its scientific
   identity, so its resume envelope and winner are bound to the fold.
+- **Battery tables.** After every cell is `done`, the step derives the
+  per-user rows of `results/tables/{dataset}_evaluation_{frozen|finetuned}.csv`
+  from the concatenated artifacts' held-out ranks (the same five metric
+  families the single-split evaluator writes, routed by embedding,
+  tagged `fold_policy: kfold_k<K>`), writes the completion record
+  `{dataset}_evaluation_done.csv` the statistical step reconciles its
+  expected cells against (§5, R05) and the mean tables. A failed cell
+  fails the step before any table exists.
 
 ## 3c. Scientific identity (v2) versus execution metadata
 

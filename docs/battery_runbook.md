@@ -147,11 +147,13 @@ Failure semantics since 3.0.0 (task records E01/E02, M05):
   returned by `run_cli`: `0` only when every required unit succeeded,
   `1` on any failure (with the traceback logged), `130` on Ctrl-C. The
   run manifest records `exit_status: "error"`.
-- `--battery` and `--folds` raise `IncompleteRunError` when any cell of
-  the manifest is not `done` (`failed`, `pending` or `running`), so a
-  battery that lost cells cannot end with a success marker; the
-  manifest is left as-is for `--retry-failed`. `run_battery` /
-  `run_folds` log `INCOMPLETE` at error level with the counts.
+- `--battery` and the `evaluate` step under `folds.enabled: true` raise
+  `IncompleteRunError` when any cell of their manifest is not `done`
+  (`failed`, `pending` or `running`), so a battery that lost cells
+  cannot end with a success marker; the manifest is left as-is for
+  `--retry-failed` (or the next `evaluate`, which re-runs exactly the
+  cells without a valid fold artifact). `run_battery` / `run_folds` log
+  `INCOMPLETE` at error level with the counts.
 - Every submitted training job has exactly one terminal outcome
   (`succeeded` / `failed` / `cancelled`, with `attempts` and
   `error_type`). A worker that dies before publishing is reaped from
@@ -248,26 +250,42 @@ documents that `uv.lock` predates the `telemetry` extra and is removed
 when the lock is regenerated. CUDA is disabled by the environment
 variable; a passing suite certifies the CPU path only.
 
-## K-fold cross-validation over the battery (`--folds`)
+## K-fold cross-validation over the battery (`folds.enabled`)
 
-After the hyperparameter search has finished (or with
-`hp_search.strategy: fixed`), enable `folds:` in `configs/default.yaml`
-and run:
+The `evaluate` step runs the K-fold protocol whenever `folds.enabled`
+is `true` in `configs/default.yaml` — the shipped default, so a plain
+`python main.py` (or `docker compose up -d --build`) evaluates by
+K-fold after the search step, with the frozen winners from
+`results/models` (or the fixed values under `hp_search.strategy:
+fixed`). Set `folds.enabled: false` for the single leave-one-out
+split; the two never run in one invocation. There is no flag: the
+former `--folds` mode was removed (3.0.0), passing it fails naming
+`folds.enabled`, and `--show-plan` prints the protocol a run will use:
 
 ```bash
-python main.py --folds
+python main.py --show-plan     # ... Evaluation protocol: kfold (k=10, ...)
+python main.py
 ```
 
 The runner (`src/folds/runner.py`) is resumable through
 `results/folds/manifest.json`: a cell whose concatenated per-user
-artifact already exists is skipped. Per fold it writes the trained
-checkpoint under `<results>_fold<i>/models/` and the partial artifact
-under `results/per_user/<dataset>/folds/fold<i>/`; the final artifact
-lands in the canonical `results/per_user/<dataset>/` location, so
-`--report` and the paired statistics consume it unchanged. The manifest
-entry of every cell records the hyperparameter origin (prior search,
-with the source cell reference, or fixed config values), the partition
+artifact validates for the current plan is skipped. Per fold it writes
+the trained checkpoint under `<results>_fold<i>/models/` and the
+partial artifact under `results/folds/fold<i>/per_user/<dataset>/`;
+the final artifact lands in the canonical `results/per_user/<dataset>/`
+location. The step then builds, from those artifacts, the same files
+the single-split evaluator writes — `results/tables/
+{dataset}_evaluation_{frozen|finetuned}.csv` (per-user rows, routed by
+embedding, tagged `fold_policy: kfold_k<K>`), the completion record
+`{dataset}_evaluation_done.csv` the statistical step reconciles
+against, and the mean tables — so `beyond_accuracy`, `statistical` and
+`--report` consume them unchanged. A cell that failed fails the step
+(`IncompleteRunError`) before any table is built. The manifest entry
+of every cell records the hyperparameter origin (prior search, with
+the source cell reference, or fixed config values), the partition
 summary (fold sizes, excluded users by reason), the per-fold seeds and
 fold-in reports, the between-fold mean/std of recall@k and ndcg@k, and
 the note that this variability is combined (partition + optimisation).
-See `docs/protocol.md` §3b.
+The run manifest records the choice under `evaluation_protocol`
+(`mode`, `k`, `seed`), outside the scientific identity. See
+`docs/protocol.md` §3b.

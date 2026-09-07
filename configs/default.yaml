@@ -95,7 +95,7 @@ pipeline:
 # the framework falls back to a long-lived `nvidia-smi` reader, and
 # finally to torch (memory only, no energy).
 # =============================================================================
-# User-level K-fold cross-validation (python main.py --folds)
+# User-level K-fold cross-validation (the evaluate step, while enabled)
 # =============================================================================
 # Users are split into k mutually exclusive folds.  In fold i the fold's
 # users leave the training set; the model trains on the other folds
@@ -108,6 +108,9 @@ pipeline:
 # per-user artifacts are concatenated so the paired statistics keep the
 # user as the unit.  Protocol precedent: Rendle et al. (2009, §6.2) —
 # repeated splits, hyperparameters searched once and kept constant.
+# `enabled` selects the protocol of the evaluate step: true = K-fold
+# (a plain run evaluates by K-fold), false = the single leave-one-out
+# split.  There is no CLI flag; --show-plan prints the resolved choice.
 folds:
   enabled: true
   k: 10

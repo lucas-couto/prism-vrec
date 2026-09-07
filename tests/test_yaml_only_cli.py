@@ -1,8 +1,9 @@
 """The YAML is the only control surface for run configuration (3.0.0).
 
-The step range, the condition, the search strategy, the protocol and the
-seeds come from ``configs/*.yaml`` alone; the flags that duplicated them
-were removed by the researcher's decision.  Passing one fails with
+The step range, the condition, the search strategy, the protocol, the
+seeds and the evaluation protocol (``folds.enabled``) come from
+``configs/*.yaml`` alone; the flags that duplicated them were removed by
+the researcher's decision.  Passing one fails with
 argparse's standard error plus the YAML key that replaced it; the
 resolved plan is printed by ``--show-plan`` and recorded in the run
 manifest.
@@ -30,6 +31,7 @@ import main
         (["--n-trials", "3"], "hp_search.optuna.n_trials"),
         (["--eval-protocol=sampled"], "evaluation.protocol"),
         (["--seeds", "1,2"], "seeds"),
+        (["--folds"], "folds.enabled"),
     ],
 )
 def test_removed_flags_fail_with_the_yaml_key(argv, hint, capsys) -> None:
@@ -46,7 +48,7 @@ def test_every_removed_flag_is_gone_from_the_parser() -> None:
     known = {opt for action in parser._actions for opt in action.option_strings}
 
     assert not known & set(main.REMOVED_FLAGS)
-    for kept in ("--battery", "--folds", "--show-plan", "--inspect-pending", "--config-dir"):
+    for kept in ("--battery", "--show-plan", "--inspect-pending", "--config-dir"):
         assert kept in known
 
 
@@ -67,6 +69,7 @@ def test_show_plan_prints_the_yaml_resolved_plan(monkeypatch, capsys) -> None:
     assert "condition='frozen' (3 steps)" in out
     assert "fuse" in out and "train" in out and "evaluate" in out
     assert "finetune" not in out.replace("evaluate_finetuning", "")
+    assert "Evaluation protocol: single_split" in out
 
 
 def test_run_all_true_ignores_the_range_and_both_expands_condition_steps() -> None:

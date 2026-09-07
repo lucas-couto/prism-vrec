@@ -38,6 +38,7 @@ from src import __version__
 from src.utils.atomic_io import atomic_write
 from src.utils.dataloader import describe as describe_dataloader_tune
 from src.utils.device import resolve_device
+from src.utils.evaluation_protocol import resolve_evaluation_protocol
 from src.utils.logging import get_logger
 from src.utils.resources import resolve_resources
 from src.utils.timing import step_timings as collect_step_timings
@@ -103,6 +104,10 @@ def start_run(
         # applied): how fast and how much memory, never what is computed,
         # so it is recorded here and kept out of the scientific identity.
         "resources": resolve_resources(config_snapshot).to_payload(),
+        # Which protocol the evaluate step runs (``folds.enabled``): how
+        # the winners are scored, recorded here and kept out of the
+        # scientific identity like ``resources``.
+        "evaluation_protocol": resolve_evaluation_protocol(config_snapshot).to_dict(),
         "dataloader_autotune": describe_dataloader_tune(config_snapshot),
         "package_versions": _package_versions(_TRACKED_PACKAGES),
         "config_snapshot": config_snapshot,
