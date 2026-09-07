@@ -8,6 +8,17 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The fusion item-order sidecar became a phantom embedding.** #39 made
+  offline fusions write `<stem>.meta.json`; the embedding discovery glob
+  `hybrid_*.json` (`get_embedding_files`) then listed
+  `hybrid_pca_nc128.meta` and `hybrid_pca_per_model_nc64.meta` as
+  embeddings (24 phantom jobs on amazon_fashion, failing on load), the
+  same defect class as the provenance phantom fixed in 3.0.0rc1.
+  Discovery now skips every JSON companion of an artifact
+  (`.provenance.json`, `.meta.json`, `_ids.json`).
+
 ### Added
 
 - **`configs/resources.yaml` is the single source of computational

@@ -114,6 +114,10 @@ def filter_by_variant(names: list[str], variant: str) -> list[str]:
     return [n for n in names if n == "none" or is_projected_artifact(n) == want_projected]
 
 
+#: JSON companions of an artifact that must never be listed as embeddings.
+_NON_EMBEDDING_JSON_SUFFIXES = (PROVENANCE_SUFFIX, ".meta.json", "_ids.json")
+
+
 def get_embedding_files(
     embeddings_dir: str,
     dataset_name: str,
@@ -134,14 +138,16 @@ def get_embedding_files(
     if not emb_dir.exists():
         return []
     names = [f.stem for f in sorted(emb_dir.glob("*.npy"))]
-    # ``<artifact>.provenance.json`` (E05) sits next to every fusion
-    # output, including the ``hybrid_*.json`` sidecars, so a bare glob
-    # would turn ``hybrid_x.json.provenance.json`` into a phantom
-    # embedding ``hybrid_x.json.provenance`` whose jobs can only fail.
+    # Every fusion output has JSON companions that are NOT embeddings:
+    # ``<artifact>.provenance.json`` (E05), ``<stem>.meta.json`` (the
+    # item-order sidecar an offline fusion inherits) and ``<stem>_ids.json``.
+    # A bare ``hybrid_*.json`` glob turns each into a phantom embedding
+    # (``hybrid_x.json.provenance``, ``hybrid_concat.meta``) whose jobs
+    # can only fail; only a sidecar with none of these suffixes is one.
     names.extend(
         f.stem
         for f in sorted(emb_dir.glob("hybrid_*.json"))
-        if not f.name.endswith(PROVENANCE_SUFFIX)
+        if not f.name.endswith(_NON_EMBEDDING_JSON_SUFFIXES)
     )
     names = sorted(set(names))
     if dim_filter:
