@@ -1,4 +1,4 @@
-"""Provenance sidecars are never mistaken for embeddings.
+"""Provenance, meta and ids sidecars are never mistaken for embeddings.
 
 ``<artifact>.provenance.json`` (E05) is written next to every fusion
 output, including the ``hybrid_*.json`` online sidecars.  On 2026-09-06
@@ -26,6 +26,9 @@ def _write(tmp_path, dataset: str) -> None:
     for artifact in ("hybrid_concat.npy", "hybrid_sum_learned_D128.json"):
         provenance_path(d / artifact).write_text(json.dumps({"kind": "fusion"}))
     (d / "resnet50.meta.json").write_text("{}")
+    # Offline fusions inherit an item-order sidecar (#39); it is not an embedding.
+    (d / "hybrid_concat.meta.json").write_text(json.dumps({"kind": "fusion"}))
+    (d / "hybrid_concat_ids.json").write_text("[]")
     (d / "resnet50_ids.json").write_text("[]")
 
 
@@ -35,4 +38,4 @@ def test_provenance_sidecars_are_not_embeddings(tmp_path):
     stems = get_embedding_files(str(tmp_path), "amazon_fashion")
 
     assert stems == ["hybrid_concat", "hybrid_sum_learned_D128", "resnet50"]
-    assert not any("provenance" in s for s in stems)
+    assert not any("provenance" in s or s.endswith(".meta") or s.endswith("_ids") for s in stems)
