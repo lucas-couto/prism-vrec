@@ -47,6 +47,7 @@ from src.evaluation.paired_loader import discover_cells
 from src.evaluation.persistence import read_cell_artifact
 from src.steps.evaluate import _route_targets, _write_mean_table
 from src.utils.config import load_config
+from src.utils.evaluation_protocol import artifact_seed
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -291,7 +292,9 @@ def run() -> None:
 
     reference = ba_cfg.get("reference_embedding", "resnet50")
     use_rank_relevance = bool(ba_cfg.get("use_rank_relevance", False))
-    seed = int(config.get("seed", 42))
+    # The artifacts are keyed by the partition seed under K-fold and by
+    # the run seed under the single split (``folds.enabled``).
+    seed = artifact_seed(config)
 
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]

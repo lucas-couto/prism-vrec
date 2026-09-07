@@ -1,4 +1,4 @@
-"""User-level K-fold cross-validation runner (``python main.py --folds``).
+"""User-level K-fold cross-validation runner (the ``evaluate`` step under ``folds.enabled``).
 
 Protocol (Rendle et al., UAI 2009, §6.2 — repeated splits with the
 hyperparameter search done once and kept constant):
@@ -55,6 +55,7 @@ from src.utils.identity import (
 )
 from src.utils.logging import get_logger
 from src.utils.resources import resolve_resources
+from src.utils.timing import note_skipped_cell, time_cell
 
 logger = get_logger(__name__)
 
@@ -457,7 +458,8 @@ def run_folds(
     folds_cfg = config.get("folds") or {}
     if not folds_cfg.get("enabled", False):
         raise RuntimeError(
-            "K-fold run requested but configs/default.yaml -> folds.enabled is false."
+            "K-fold run requested but configs/default.yaml -> folds.enabled is false; "
+            "the evaluate step runs the single split while it is false."
         )
     from src.recommenders.hp_budget import assert_uniform_budget
     from src.utils.device import resolve_device
@@ -501,6 +503,7 @@ def run_folds(
         ):
             manifest.set_state(key, "done", note="fold artifact already present")
             manifest.save()
+            note_skipped_cell()
             continue
         if manifest.state_of(key) == "done":
             logger.warning("%s: manifest says done but no valid fold artifact; re-running.", key)
@@ -508,8 +511,10 @@ def run_folds(
         manifest.save()
         started = time.perf_counter()
         plan, frames = plans[cell.dataset]
+        model_key = f"{cell.recommender}_{cell.visual_config}"
         try:
-            extra = runner(cell, config, plan, frames, results_dir=results_dir, device=device)
+            with time_cell("evaluate", dataset=cell.dataset, model_key=model_key, fold_k=plan.k):
+                extra = runner(cell, config, plan, frames, results_dir=results_dir, device=device)
             manifest.set_state(
                 key,
                 "done",

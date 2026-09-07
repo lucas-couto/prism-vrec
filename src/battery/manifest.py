@@ -102,6 +102,35 @@ class BatteryManifest:
         return counts
 
 
+class IncompleteRunError(RuntimeError):
+    """A battery / K-fold manifest still holds cells that did not finish.
+
+    The runners return their manifest even when cells failed; without
+    this check ``main.py`` exited zero on a battery with failed cells
+    (audit F04).  The manifest itself is untouched, so ``--battery
+    --retry-failed`` (or the next ``evaluate`` step under K-fold)
+    resumes exactly the cells listed here.
+    """
+
+
+def require_complete(manifest: BatteryManifest, *, label: str) -> None:
+    """Raise :class:`IncompleteRunError` unless every cell is ``done``.
+
+    :param manifest: The manifest a runner returned.
+    :param label: Human name of the run for the error message.
+    :raises IncompleteRunError: With the per-state breakdown of unfinished cells.
+    """
+    summary = manifest.summary()
+    unfinished = {state: n for state, n in summary.items() if state != "done" and n > 0}
+    if not unfinished:
+        return
+    breakdown = ", ".join(f"{n} {state}" for state, n in sorted(unfinished.items()))
+    raise IncompleteRunError(
+        f"{label} finished with unfinished cells ({breakdown}); "
+        f"{summary.get('done', 0)} done. See the manifest for the cell list."
+    )
+
+
 def cell_records_path(cell: BatteryCell, results_dir: str | Path) -> Path:
     """Canonical per-user records path of *cell* under *results_dir*."""
     key = _artifact_key(cell.dataset, cell.visual_config, cell.recommender, cell.seed)

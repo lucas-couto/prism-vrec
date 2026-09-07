@@ -59,6 +59,31 @@ Dates are UTC.
 
 ### Changed
 
+- **The `evaluate` step dispatches on `folds.enabled`** (by the
+  researcher's decision, 2026-09-07). With `true` — the shipped default,
+  so a plain run evaluates by K-fold — the step runs the user-level
+  K-fold protocol the `--folds` mode used to run (K trainings with the
+  frozen winners from `results/models` via `hp_source`, fold-in,
+  per-fold held-out ranking, concatenation into the canonical per-user
+  artifact, `results/folds/manifest.json`) and then builds the battery
+  tables from the concatenated artifacts
+  (`src/steps/evaluate_kfold.py`): `{dataset}_evaluation_{frozen|
+  finetuned}.csv` with the same metric families the single-split
+  evaluator writes, tagged `fold_policy: kfold_k<K>`, the completion
+  record `{dataset}_evaluation_done.csv` the statistical step's cell
+  reconciliation reads (R05) and the mean tables. With `false` the
+  single-split evaluation runs unchanged. The two never both run in one
+  invocation; one INFO line names the protocol and the key that chose
+  it; a fold cell that failed raises `IncompleteRunError` (now in
+  `src/battery/manifest.py`, shared with `--battery`) before any table
+  is built, and the next `evaluate` resumes exactly the cells without a
+  valid fold artifact. `beyond_accuracy` discovers the artifacts under
+  the seed the protocol keys them by (`folds.seed` under K-fold). The
+  run manifest records `evaluation_protocol: {mode, k, seed}` as
+  execution metadata, outside the scientific identity
+  (`tests/test_evaluate_dispatch.py` asserts the digest is invariant to
+  it); `--show-plan` prints the resolved protocol. The `--folds` mode
+  was removed: passing it fails naming `folds.enabled`.
 - **The YAML is the only control surface for run configuration** (by
   the researcher's decision, 2026-09-07). The flags that duplicated
   YAML keys were removed from `main.py`; passing one fails with
@@ -79,8 +104,9 @@ Dates are UTC.
   | `--n-trials` | `hp_search.optuna.n_trials` |
   | `--eval-protocol` | `evaluation.protocol` |
   | `--seeds` | `seeds: [...]` |
+  | `--folds` | `folds.enabled: true` (the `evaluate` step runs the K-fold protocol) |
 
-  Kept: `--battery`, `--folds`, `--battery-status`, `--retry-failed`,
+  Kept: `--battery`, `--battery-status`, `--retry-failed`,
   `--report`, `--report-metric`, `--report-top`, `--show-plan`,
   `--inspect-pending`, `--validate-dataset`, `--validate-features`,
   `--list-*`, `--config-dir`.

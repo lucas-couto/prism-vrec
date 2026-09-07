@@ -1,8 +1,13 @@
 """Step 06, Final evaluation on the test set.
 
-Loads the best model checkpoint produced during step 05 for every
-``(dataset, model, embedding)`` combination and computes
-precision/recall/F1/MAP/NDCG at the configured cut-offs.
+``folds.enabled`` (``configs/default.yaml``) selects the protocol:
+
+* ``true`` (default) — the user-level K-fold protocol of
+  :mod:`src.steps.evaluate_kfold` / :mod:`src.folds.runner`;
+* ``false`` — the single-split evaluation of this module: load the best
+  checkpoint produced during step 05 for every ``(dataset, model,
+  embedding)`` combination and compute precision/recall/F1/MAP/NDCG at
+  the configured cut-offs.
 
 Per-dataset partial CSVs are written incrementally so an interrupted
 run can resume; the final ``{dataset}_evaluation_{condition}.csv`` is
@@ -30,6 +35,7 @@ from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import load_best_checkpoint
 from src.utils.config import load_config
 from src.utils.device import cap_process_vram, resolve_device
+from src.utils.evaluation_protocol import MODE_KFOLD, resolve_evaluation_protocol
 from src.utils.identity import (
     EVALUATION_SPLITS,
     IdentityError,
@@ -522,34 +528,57 @@ def _evaluate_cell(
 
 
 def run(condition: str = "frozen") -> None:
-    """Evaluate every best model, writing per-user rows routed by embedding.
+    """Score the frozen winners under the protocol ``folds.enabled`` selects.
 
-    ``condition`` is accepted for backward compatibility with the
-    legacy ``--condition`` CLI flag but is no longer used: every cell
-    is auto-routed to the frozen and/or finetuned battery file based
-    on its embedding name (a ``_finetuned`` suffix marks the
-    finetuned battery).  ``main.py`` calls this step once per pipeline
-    invocation regardless of the configured condition.
+    ``folds.enabled: true`` (the default) runs the user-level K-fold
+    protocol (:mod:`src.steps.evaluate_kfold`); ``false`` runs the single
+    leave-one-out split below.  Exactly one of the two writes the
+    canonical per-user artifact in a run.  ``condition`` is accepted for
+    backward compatibility and is not used to select cells: every cell
+    is auto-routed to the frozen and/or finetuned battery file based on
+    its embedding name (a ``_finetuned`` suffix marks the finetuned
+    battery), and a second invocation finds its cells already done.
     """
     if condition not in {"frozen", "finetuned", "both"}:
         raise ValueError(f"condition must be 'frozen', 'finetuned' or 'both', got {condition!r}")
 
     config = load_config()
-    device = resolve_device(config["device"])
+    datasets = config.get("datasets", [])
+    if not datasets:
+        logger.info("evaluate step skipped: datasets list is empty in configs/default.yaml.")
+        return
     # Final evaluation is the heaviest ranking in the pipeline (every
     # test user against the whole catalogue), and it runs in its own
     # process -- the training workers' cap does not reach it.  Without
     # this, ``default_ranking_budget`` sizes the user-batch off the whole
     # card and the desktop freezes for the duration of the step.
     cap_process_vram(vram_share=resolve_resources(config).gpu.vram_share)
+    results_root = Path(config.get("paths", {}).get("results", "results"))
+
+    protocol = resolve_evaluation_protocol(config)
+    if protocol.mode == MODE_KFOLD:
+        logger.info(
+            "evaluate: protocol=%s -> the K-fold runner scores the frozen winners; "
+            "the single-split evaluator does not run.",
+            protocol.describe(),
+        )
+        from src.steps.evaluate_kfold import run_kfold
+
+        run_kfold(config, results_root)
+        return
+    logger.info(
+        "evaluate: protocol=%s -> single leave-one-out split over results/models.",
+        protocol.describe(),
+    )
+    _run_single_split(config, results_root)
+
+
+def _run_single_split(config: dict, results_root: Path) -> None:
+    """Evaluate every best model on the single split, routed by embedding."""
+    device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
     datasets = config.get("datasets", [])
-    if not datasets:
-        logger.info("evaluate step skipped: datasets list is empty in configs/default.yaml.")
-        return
-
-    results_root = Path(config.get("paths", {}).get("results", "results"))
     results_dir = results_root / "tables"
     results_dir.mkdir(parents=True, exist_ok=True)
 

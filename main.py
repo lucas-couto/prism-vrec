@@ -25,15 +25,18 @@ untracked ``configs/zz_local.yaml`` of the night.  Example::
         n_trials: 30
     evaluation:
       protocol: full_ranking  # configs/evaluation.yaml
+    folds:
+      enabled: true           # evaluate step: K-fold (true) | single split (false)
     seeds: [42, 99, 7]        # multi-seed run
 
 ``python main.py`` (and ``docker compose up -d --build``) runs that
-plan; ``python main.py --show-plan`` prints it without running.  The
-remaining flags are tools around the run (``--battery``, ``--folds``,
-``--report``, ``--inspect-pending``, ``--validate-*``, ``--list-*``,
-``--config-dir``).  The former step / condition / search / protocol /
-seed flags were removed (3.0.0, by the researcher's decision); passing
-one fails with the YAML key that replaced it.
+plan; ``python main.py --show-plan`` prints it, with the evaluation
+protocol ``folds.enabled`` selects, without running.  The remaining
+flags are tools around the run (``--battery``, ``--report``,
+``--inspect-pending``, ``--validate-*``, ``--list-*``, ``--config-dir``).
+The former step / condition / search / protocol / seed flags and the
+``--folds`` mode were removed (3.0.0, by the researcher's decision);
+passing one fails with the YAML key that replaced it.
 
 The script never re-orders steps: ``start_from`` / ``stop_at`` and the
 ordering enforced by :data:`STEP_ORDER` always reflect the natural
@@ -57,6 +60,7 @@ from typing import Any
 # returned and leaves the cursor parked on the warning text.
 os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
 
+from src.battery.manifest import IncompleteRunError, require_complete  # noqa: E402
 from src.steps import (  # noqa: E402
     beyond_accuracy,
     download,
@@ -72,6 +76,7 @@ from src.steps import (  # noqa: E402
     validate_features,
 )
 from src.utils.config import load_config  # noqa: E402
+from src.utils.evaluation_protocol import resolve_evaluation_protocol  # noqa: E402
 from src.utils.logging import get_logger  # noqa: E402
 from src.utils.memory import warn_if_budget_exceeds_cgroup  # noqa: E402
 from src.utils.resources import resolve_resources  # noqa: E402
@@ -290,6 +295,10 @@ REMOVED_FLAGS: dict[str, str] = {
     "--n-trials": "hp_search.optuna.n_trials (configs/recommenders.yaml)",
     "--eval-protocol": "evaluation.protocol (configs/evaluation.yaml)",
     "--seeds": "seeds: [...] (configs/default.yaml)",
+    "--folds": (
+        "folds.enabled: true (configs/default.yaml); the evaluate step then runs "
+        "the K-fold protocol, false runs the single split"
+    ),
 }
 
 
@@ -350,7 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Resolve the pipeline plan from the merged YAML and print which "
-            "steps would run (with condition filtering applied), then exit."
+            "steps would run (with condition filtering applied) and which "
+            "evaluation protocol folds.enabled selects, then exit."
         ),
     )
     selection.add_argument(
@@ -380,16 +390,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Run the full battery via the resumable runner: enumerate cells, "
             "skip completed ones (idempotent), track state in the manifest, "
             "and retry-safe after a spot-instance interruption."
-        ),
-    )
-    selection.add_argument(
-        "--folds",
-        action="store_true",
-        help=(
-            "Run the user-level K-fold cross-validation (configs/default.yaml "
-            "-> folds:) over every battery cell with frozen hyperparameters: "
-            "train on K-1 folds, fold the held-out users in, evaluate them on "
-            "their single target, concatenate the K per-user artifacts."
         ),
     )
     selection.add_argument(
@@ -542,6 +542,7 @@ def _show_plan() -> None:
             print(f"  {idx:2d}. {step:24s}  (condition='all')")
         else:
             print(f"  {idx:2d}. {step}")
+    print(f"Evaluation protocol: {resolve_evaluation_protocol(config).describe()}")
 
 
 def _inspect_pending(condition: str) -> None:
@@ -692,13 +693,6 @@ def main(argv: list[str] | None = None) -> None:
         cfg = load_config()
         battery_status(cfg["paths"]["results"])
         return
-    if args.folds:
-        from src.folds.runner import run_folds
-
-        cfg = load_config()
-        _log_resource_plan(cfg)
-        _require_complete(run_folds(cfg, cfg["paths"]["results"]), label="K-fold run")
-        return
     if args.battery:
         from src.battery.execute import execute_cell
         from src.battery.runner import run_battery
@@ -708,7 +702,7 @@ def main(argv: list[str] | None = None) -> None:
         manifest = run_battery(
             cfg, cfg["paths"]["results"], execute_cell, retry_failed=args.retry_failed
         )
-        _require_complete(manifest, label="battery")
+        require_complete(manifest, label="battery")
         return
     if args.report:
         from src.utils.report import write_report
@@ -753,27 +747,9 @@ def main(argv: list[str] | None = None) -> None:
         _run_single(config, steps, condition, run_both)
 
 
-class IncompleteRunError(RuntimeError):
-    """A battery / K-fold manifest still holds cells that did not finish.
-
-    The runners return their manifest even when cells failed; without
-    this check ``main.py`` exited zero on a battery with failed cells
-    (audit F04).  The manifest itself is untouched, so ``--battery
-    --retry-failed`` resumes exactly the cells listed here.
-    """
-
-
-def _require_complete(manifest: Any, *, label: str) -> None:
-    """Raise :class:`IncompleteRunError` unless every cell is ``done``."""
-    summary = manifest.summary()
-    unfinished = {state: n for state, n in summary.items() if state != "done" and n > 0}
-    if not unfinished:
-        return
-    breakdown = ", ".join(f"{n} {state}" for state, n in sorted(unfinished.items()))
-    raise IncompleteRunError(
-        f"{label} finished with unfinished cells ({breakdown}); "
-        f"{summary.get('done', 0)} done. See the manifest for the cell list."
-    )
+#: Re-exported: ``--battery`` and the K-fold evaluate step raise it
+#: (``src.battery.manifest``) when a manifest still holds unfinished cells.
+__all__ = ["IncompleteRunError", "build_parser", "main", "run_cli"]
 
 
 def run_cli(argv: list[str] | None = None) -> int:
