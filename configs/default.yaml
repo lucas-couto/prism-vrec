@@ -156,51 +156,10 @@ diagnostics:
   output_dir: "results/diagnostics"
 
 # =============================================================================
-# Host memory budget and feature residency (optional; 3.0.0, task
-# records M05/M06; src/utils/memory.py::resolve_resources)
+# Computational limits live in configs/resources.yaml
 # =============================================================================
-# KEY NAMES ARE PROVISIONAL (contract proposal C06, pending approval).
-# The block is optional and every key is optional; ABSENT means the
-# conservative behaviour described next to each key — never "unlimited".
-# Training jobs are admitted against `host_budget − headroom` with a
-# per-job ledger (worker base + feature payload from the .npy headers,
-# a sidecar counting the sum of its components + model, gradient and
-# Adam state + interaction dicts + the CPU ranking workspace); a job
-# that does not fit is recorded as failed (AdmissionRefused) and never
-# launched, and the pool is sized so the aggregate commitment fits.
-# The ledger is ANALYTIC: no peak has been measured on a real catalogue
-# and no minimum RAM/VRAM is advertised (task V02 open).
-# Negative, non-finite, boolean or unknown values fail at resolution.
-#
-# resources:
-#   host_budget_bytes: null     # explicit budget in bytes; null = cgroup v2
-#                               # -> cgroup v1 -> host RAM -> 4 GiB fallback
-#   headroom_bytes: 4294967296  # withheld from every pool for the parent,
-#                               # page cache and transfer buffers (4 GiB)
-#   max_workers: null           # hard cap on concurrent workers; 0 admits
-#                               # nothing; null leaves the CPU/VRAM caps
-#   feature_residency: dense    # dense | lazy | auto — auto gathers rows
-#                               # per forward (FeatureSource) only when the
-#                               # dense payload exceeds half the usable
-#                               # budget; dense keeps today's resident
-#                               # matrices (default: lazy residency is
-#                               # numerically identical by test but its
-#                               # page-cache behaviour is unmeasured)
-
-# =============================================================================
-# DataLoader sizing (optional)
-# =============================================================================
-# By default the framework picks num_workers, prefetch_factor and the
-# re-extract batch_size from the host's CPU count and cgroup memory
-# budget (see src/utils/dataloader.py and docs/observability.md).
-#
-# Uncomment any field below to pin a value instead of letting the
-# autotune decide.  Pinned values win over the autotune; fields left
-# commented fall through to the autotune.  The resolved values
-# (autotuned or pinned) and any active overrides are recorded under
-# ``manifest['dataloader_autotune']``.
-#
-dataloader:
-  num_workers: 10
-  prefetch_factor: 6
-  batch_size: 192
+# GPU share, host memory budget and headroom, worker counts (training,
+# fusion, DataLoader), DataLoader batch sizing and feature residency are
+# execution metadata and are declared ONLY there (resources: block).  A
+# `dataloader:` block here, or `hp_search.workers` in recommenders.yaml,
+# is rejected at load time with a message naming the new key.

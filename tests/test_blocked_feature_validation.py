@@ -117,12 +117,12 @@ class TestUnknownFootprintIsNotFree:
             return 1
 
         monkeypatch.setattr(parallel_mod, "plan_pool_workers", _plan)
-        detect_max_workers("cpu", 0)
+        detect_max_workers("cpu", 0, reserve_bytes=4 * 1024**3)
 
         assert seen["per_worker_bytes"] == UNKNOWN_WORKER_FOOTPRINT_BYTES > 0
 
     def test_known_footprint_is_passed_through(self, monkeypatch) -> None:
         seen: dict = {}
         monkeypatch.setattr(parallel_mod, "plan_pool_workers", lambda **kw: seen.update(kw) or 1)
-        detect_max_workers("cpu", 3 * 1024**3)
+        detect_max_workers("cpu", 3 * 1024**3, reserve_bytes=4 * 1024**3)
         assert seen["per_worker_bytes"] == 3 * 1024**3

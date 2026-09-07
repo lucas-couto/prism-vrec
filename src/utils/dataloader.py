@@ -10,9 +10,10 @@ gets the worker pool OOM-killed on a 16 GB laptop container.
 
 This module replaces the hardcoded defaults with a small heuristic
 that inspects the runtime environment once at startup and picks a
-tier that fits.  Researchers never have to set ``FT_NUM_WORKERS``,
-``FT_PREFETCH`` or ``EXTRACT_BATCH_SIZE`` by hand; the env vars are
-still honoured when set, but only as a power-user override.
+tier that fits.  A researcher who wants an exact value pins it in
+``configs/resources.yaml`` (``resources.workers.dataloader`` and
+``resources.dataloader.{prefetch_factor,batch_size}``); a pinned value
+wins over the tier, ``auto`` falls through to it.
 
 Tiers (memory budget refers to the cgroup limit when running in a
 container, the total host RAM otherwise):
@@ -43,6 +44,7 @@ from src.utils.logging import get_logger
 # module has always used so callers (and tests) keep one entry point.
 from src.utils.memory import available_cpus
 from src.utils.memory import memory_budget_bytes as _memory_budget_bytes
+from src.utils.resources import ResourcesConfig, resolve_resources
 
 logger = get_logger(__name__)
 
@@ -134,19 +136,15 @@ def describe(config: dict | None = None) -> dict:
     """Return a JSON-serialisable snapshot of the autotune decision.
 
     Consumed by :mod:`src.utils.manifest` to embed the DataLoader
-    sizing inputs and outputs in every run manifest.  When ``config``
-    is provided and carries a ``dataloader:`` block, the resolved
-    values reflect those overrides and the overridden keys appear
-    under ``yaml_overrides`` so a researcher reading the manifest
-    spots deliberate pinning at a glance.
+    sizing inputs and outputs in every run manifest.  The resolved
+    values reflect the pins in ``resources.workers.dataloader`` /
+    ``resources.dataloader``, and the pinned keys appear under
+    ``yaml_overrides`` so a researcher reading the manifest spots
+    deliberate pinning at a glance.
     """
     tune = autotune()
-    dl_cfg = (config or {}).get("dataloader") or {}
-    overrides = {
-        key: dl_cfg[key]
-        for key in ("num_workers", "prefetch_factor", "batch_size")
-        if dl_cfg.get(key) is not None
-    }
+    pinned = _pinned(resolve_resources(config))
+    overrides = {key: value for key, value in pinned.items() if value is not None}
     resolved = resolve_dataloader_settings(config)
     return {
         "cpu_count": tune.cpu_count,
@@ -166,22 +164,33 @@ def describe(config: dict | None = None) -> dict:
     }
 
 
+def _pinned(resources: ResourcesConfig) -> dict[str, int | None]:
+    """The three DataLoader pins of the resolved block (``None`` = auto)."""
+    return {
+        "num_workers": resources.workers.dataloader,
+        "prefetch_factor": resources.dataloader.prefetch_factor,
+        "batch_size": resources.dataloader.batch_size,
+    }
+
+
 def resolve_dataloader_settings(config: dict | None = None) -> DataLoaderSettings:
-    """Return the resolved settings: YAML overrides first, autotune as fallback.
+    """Return the resolved settings: ``resources`` pins first, autotune as fallback.
 
-    When ``config['dataloader']`` carries ``num_workers``,
-    ``prefetch_factor`` or ``batch_size``, the YAML value wins.  Any
-    field left unset (or set to ``None``) in the YAML falls through to
-    the autotune tier.
+    ``resources.workers.dataloader``, ``resources.dataloader.prefetch_factor``
+    and ``resources.dataloader.batch_size`` win when pinned to an
+    integer; ``auto`` (or an absent block) falls through to the autotune
+    tier.  ``num_workers`` is always clamped by the CPU quota.
 
-    The whole ``dataloader:`` block is optional, so a config that does
-    not mention it gets pure autotuned values.
+    :param config: The merged framework configuration, or ``None`` for pure autotune.
+    :returns: The settings every DataLoader in the pipeline is built with.
+    :raises ValueError: On an invalid ``resources`` block or a removed
+        top-level ``dataloader:`` block.
     """
     auto = autodetect()
-    dl_cfg = (config or {}).get("dataloader") or {}
+    pinned = _pinned(resolve_resources(config))
 
     def _pick(key: str, fallback: int) -> int:
-        value = dl_cfg.get(key)
+        value = pinned[key]
         return fallback if value is None else int(value)
 
     # A pinned num_workers states intent, not a licence to oversubscribe:

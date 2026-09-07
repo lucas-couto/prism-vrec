@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.utils.resources import FeatureResources
+
 
 def _record_bpr_batch(module: BaseRecommender, args: tuple) -> None:
     """Forward pre-hook: remember the (user, pos, neg) index batch.
@@ -259,7 +261,22 @@ class BaseRecommender(nn.Module, abc.ABC):
     #: learned-fusion concat) before the fusion adds its own temporaries,
     #: which is what pushed every user batch into the per-user fallback
     #: under an 8 GB VRAM cap on 2026-09-06.  The name is historical.
-    _LAZY_ITEM_BLOCK: int = 8192
+    #: The class value is the ``resources.features.item_block`` default;
+    #: :meth:`configure_item_block` installs the resolved value on an
+    #: instance, and tests that set the attribute directly keep working.
+    _LAZY_ITEM_BLOCK: int = FeatureResources.item_block
+
+    def configure_item_block(self, rows: int) -> None:
+        """Install ``resources.features.item_block`` on this instance.
+
+        :param rows: Items staged per block for catalogue-sized feature
+            requests (execution metadata: the concatenation of the blocks
+            equals one call, so metrics never depend on it).
+        :raises ValueError: When *rows* is not a positive integer.
+        """
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
+            raise ValueError(f"item_block must be a positive integer, got {rows!r}")
+        self._LAZY_ITEM_BLOCK = rows
 
     @property
     def has_visual_features(self) -> bool:

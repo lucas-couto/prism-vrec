@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.utils.logging import get_logger
+from src.utils.resources import ResourcesConfig, resolve_resources
 
 logger = get_logger(__name__)
 
@@ -35,12 +36,6 @@ logger = get_logger(__name__)
 _CGROUP_NO_LIMIT_THRESHOLD = 1 << 60
 
 _FALLBACK_MEMORY_GB = 4.0  # used when neither cgroup nor sysconf works
-
-#: Memory never handed to a worker pool: the parent process (which holds
-#: the config, the task list and, in fusion, the PCA-aligned sources),
-#: the page cache backing the ``.npy`` reads, and the host session when
-#: no cgroup limit confines this process.
-RESERVED_BYTES = 4 * 1024**3
 
 
 def memory_budget_bytes() -> int:
@@ -145,7 +140,7 @@ def plan_pool_workers(
     *,
     per_worker_bytes: int,
     hard_cap: int,
-    reserve_bytes: int = RESERVED_BYTES,
+    reserve_bytes: int,
     label: str = "pool",
 ) -> int:
     """Return how many workers of *per_worker_bytes* fit in the budget.
@@ -164,7 +159,7 @@ def plan_pool_workers(
         of pending tasks).
     :param reserve_bytes:
         Memory withheld from the pool for the parent process and the
-        host.  See :data:`RESERVED_BYTES`.
+        host (``resources.host.reserved_bytes``).
     :param label:
         Name used in the log line, so a reader of the run log can tell
         which pool was resized.
@@ -221,8 +216,6 @@ _ADAM_BYTES_PER_PARAM = 4 * 4
 #: Default latent width when a job declares none (``common.total_dim``).
 _DEFAULT_TOTAL_DIM = 128
 
-FEATURE_RESIDENCY_POLICIES = ("dense", "lazy", "auto")
-
 
 class AdmissionError(RuntimeError):
     """A job's declared minimum memory exceeds the resolved budget.
@@ -230,67 +223,6 @@ class AdmissionError(RuntimeError):
     Raised (or recorded as a failed outcome) *before* the job is
     launched, so a job that cannot fit is never started repeatedly.
     """
-
-
-@dataclass(frozen=True)
-class ResourcesConfig:
-    """Resolved ``resources:`` block (C06 proposal; every key optional).
-
-    ``host_budget_bytes`` — explicit host budget; ``None`` resolves the
-    container/host limit.  ``headroom_bytes`` — withheld from every pool
-    for the parent, page cache and transfer buffers (default
-    :data:`RESERVED_BYTES`).  ``max_workers`` — hard cap on concurrent
-    workers; ``None`` leaves the CPU/VRAM caps in charge.
-    ``feature_residency`` — ``dense`` (today's resident matrices),
-    ``lazy`` (bounded row reads, M01/M02) or ``auto`` (lazy only when the
-    dense payload does not fit the budget).  Zero or absent values never
-    mean "unlimited": an absent budget is resolved conservatively and an
-    explicit ``0`` admits nothing.
-    """
-
-    host_budget_bytes: int | None = None
-    headroom_bytes: int = RESERVED_BYTES
-    max_workers: int | None = None
-    feature_residency: str = "dense"
-
-
-def _non_negative_int(block: dict, key: str, default: int | None) -> int | None:
-    value = block.get(key, default)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int | float) or value != value:
-        raise ValueError(f"resources.{key} must be a finite non-negative integer, got {value!r}")
-    if value < 0 or value in (float("inf"), float("-inf")):
-        raise ValueError(f"resources.{key} must be a finite non-negative integer, got {value!r}")
-    return int(value)
-
-
-def resolve_resources(config: dict | None) -> ResourcesConfig:
-    """Validate and resolve the optional ``resources:`` block of *config*."""
-    block = (config or {}).get("resources") or {}
-    if not isinstance(block, dict):
-        raise ValueError(f"resources must be a mapping, got {type(block).__name__}")
-    unknown = set(block) - {
-        "host_budget_bytes",
-        "headroom_bytes",
-        "max_workers",
-        "feature_residency",
-    }
-    if unknown:
-        raise ValueError(f"resources has unknown keys: {sorted(unknown)}")
-    residency = str(block.get("feature_residency", "dense"))
-    if residency not in FEATURE_RESIDENCY_POLICIES:
-        raise ValueError(
-            f"resources.feature_residency must be one of {FEATURE_RESIDENCY_POLICIES}, "
-            f"got {residency!r}"
-        )
-    headroom = _non_negative_int(block, "headroom_bytes", RESERVED_BYTES)
-    return ResourcesConfig(
-        host_budget_bytes=_non_negative_int(block, "host_budget_bytes", None),
-        headroom_bytes=int(headroom if headroom is not None else RESERVED_BYTES),
-        max_workers=_non_negative_int(block, "max_workers", None),
-        feature_residency=residency,
-    )
 
 
 @dataclass(frozen=True)
@@ -305,12 +237,12 @@ class HostBudget:
 def resolve_host_budget(config: dict | None = None) -> HostBudget:
     """Resolve the host budget conservatively; never unlimited.
 
-    ``resources.host_budget_bytes`` wins when set; otherwise the cgroup v2
+    ``resources.host.budget_bytes`` wins when set; otherwise the cgroup v2
     limit, the cgroup v1 limit, the host's physical memory, and finally
     the 4 GiB fallback (source ``fallback``) when nothing is readable.
     The result also carries the current headroom (:func:`available_host_bytes`).
     """
-    explicit = resolve_resources(config).host_budget_bytes if config is not None else None
+    explicit = resolve_resources(config).host.budget_bytes if config is not None else None
     if explicit is not None:
         return HostBudget(explicit, "config", available_host_bytes())
     cgroup_v2 = _read_int_file(Path("/sys/fs/cgroup/memory.max"))
@@ -348,7 +280,7 @@ def admit_workers(
     *,
     hard_cap: int,
     budget: HostBudget,
-    headroom_bytes: int = RESERVED_BYTES,
+    headroom_bytes: int,
     max_workers: int | None = None,
     label: str = "pool",
 ) -> AdmissionPlan:
@@ -372,7 +304,7 @@ def admit_workers(
             headroom_bytes,
             budget.source,
             False,
-            "resources.max_workers is 0: nothing admitted",
+            "max_workers is 0: nothing admitted",
         )
     if per_worker_bytes <= 0:
         plan = AdmissionPlan(
@@ -458,3 +390,29 @@ def npy_payload_bytes(path: str | Path) -> tuple[int, int]:
     shape = tuple(int(s) for s in shape)
     width = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
     return int(np.prod(shape, dtype=np.int64)) * int(np.dtype(dtype).itemsize), width
+
+
+def warn_if_budget_exceeds_cgroup(resources: ResourcesConfig) -> int | None:
+    """Log a WARNING when ``resources.host.budget_bytes`` exceeds the cgroup limit.
+
+    An explicit budget above the container's ``mem_limit`` plans pools
+    the kernel will kill; the YAML cannot raise the Docker-level cap
+    (``PRISM_MEM_LIMIT``).  Pure read; nothing is changed.
+
+    :param resources: The resolved ``resources:`` block.
+    :returns: The cgroup limit in bytes when one is in effect, else ``None``.
+    """
+    explicit = resources.host.budget_bytes
+    limit = _read_int_file(Path("/sys/fs/cgroup/memory.max"))
+    if limit is None or limit >= _CGROUP_NO_LIMIT_THRESHOLD:
+        limit = _read_int_file(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    if limit is None or limit >= _CGROUP_NO_LIMIT_THRESHOLD:
+        return None
+    if explicit is not None and explicit > limit:
+        logger.warning(
+            "resources.host.budget_bytes (%.2f GB) exceeds the cgroup limit in effect "
+            "(%.2f GB, PRISM_MEM_LIMIT); pools planned against it will be OOM-killed.",
+            explicit / 1024**3,
+            limit / 1024**3,
+        )
+    return limit

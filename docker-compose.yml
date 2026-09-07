@@ -47,11 +47,12 @@ services:
       # expandable segments keep allocator fragmentation from turning
       # those peaks into CUDA OOMs (2026-08-31 crashes).
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-      # Share of the card the run may claim (RUN_RESOURCE_SHARE in
-      # src/utils/device.py). Default keeps half for the desktop; raise
-      # it only for unattended windows, e.g. overnight:
-      #   PRISM_VRAM_SHARE=0.95 docker compose up -d
-      PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-0.5}
+      # One-launch override of resources.gpu.vram_share
+      # (configs/resources.yaml): the share of the card the run may
+      # claim.  Empty = the YAML value (0.95, for unattended nights);
+      # lower it while someone works at the workstation, e.g.
+      #   PRISM_VRAM_SHARE=0.5 docker compose up -d
+      PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-}
     entrypoint: ["python", "main.py"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
@@ -73,10 +74,16 @@ services:
     # sizing heuristics (src/utils/memory.py, src/utils/dataloader.py)
     # read a real budget rather than the host's total RAM.
     #
+    # mem_limit / cpus are the only limits that live here, because Docker
+    # enforces them.  EVERYTHING ELSE (GPU share, host headroom, worker
+    # counts, DataLoader pins, feature residency) is configs/resources.yaml,
+    # which the run validates at startup and records in its manifest; a
+    # resources.host.budget_bytes above mem_limit is logged as a WARNING.
+    #
     # ONE budget, applied to every resource: a run may take half of the
-    # machine, never more (RUN_RESOURCE_SHARE in src/utils/device.py caps
-    # VRAM at the same fraction).  These are caps for the RUN, not for
-    # the WORKSTATION: the other half is what lets the researcher keep
+    # machine, never more (resources.gpu.vram_share caps VRAM at the
+    # same fraction).  These are caps for the RUN, not for the
+    # WORKSTATION: the other half is what lets the researcher keep
     # working across a battery that spans days.  16g and 8 cores are 50%
     # of a 32 GB / 16-core host; override per host, e.g. on a 128 GB lab
     # server:  PRISM_MEM_LIMIT=64g PRISM_CPUS=32 docker compose up -d
@@ -181,7 +188,7 @@ services:
       # Same allocator setting as the pipeline service, so manual runs
       # from the shell behave identically.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-      PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-0.5}
+      PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-}
     entrypoint: ["bash"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the

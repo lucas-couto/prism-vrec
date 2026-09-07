@@ -67,6 +67,7 @@ class TestPlanPoolWorkers:
         n = memory_mod.plan_pool_workers(
             per_worker_bytes=8 * 1024**3,
             hard_cap=12,
+            reserve_bytes=4 * 1024**3,
         )
 
         assert n == 2
@@ -77,6 +78,7 @@ class TestPlanPoolWorkers:
         n = memory_mod.plan_pool_workers(
             per_worker_bytes=1 * 1024**3,
             hard_cap=6,
+            reserve_bytes=4 * 1024**3,
         )
 
         assert n == 6
@@ -88,6 +90,7 @@ class TestPlanPoolWorkers:
         n = memory_mod.plan_pool_workers(
             per_worker_bytes=64 * 1024**3,
             hard_cap=12,
+            reserve_bytes=4 * 1024**3,
         )
 
         assert n == 1
@@ -95,7 +98,7 @@ class TestPlanPoolWorkers:
     def test_unknown_footprint_leaves_the_cap_untouched(self, monkeypatch):
         self._fake_budget(monkeypatch, 4.0)
 
-        n = memory_mod.plan_pool_workers(per_worker_bytes=0, hard_cap=9)
+        n = memory_mod.plan_pool_workers(per_worker_bytes=0, hard_cap=9, reserve_bytes=4 * 1024**3)
 
         assert n == 9
 

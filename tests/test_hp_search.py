@@ -190,22 +190,22 @@ class TestResolveOptunaWorkers:
     def test_explicit_workers_respected_below_cap(self) -> None:
         from src.steps.train import _resolve_optuna_workers
 
-        assert _resolve_optuna_workers(2, "cpu", n_cells=10) == 2
+        assert _resolve_optuna_workers(2, "cpu", n_cells=10, reserve_bytes=4 * 1024**3) == 2
 
     def test_capped_at_three(self) -> None:
         from src.steps.train import _resolve_optuna_workers
 
-        assert _resolve_optuna_workers(8, "cpu", n_cells=10) == 3
+        assert _resolve_optuna_workers(8, "cpu", n_cells=10, reserve_bytes=4 * 1024**3) == 3
 
     def test_never_more_workers_than_cells(self) -> None:
         from src.steps.train import _resolve_optuna_workers
 
-        assert _resolve_optuna_workers(3, "cpu", n_cells=1) == 1
+        assert _resolve_optuna_workers(3, "cpu", n_cells=1, reserve_bytes=4 * 1024**3) == 1
 
     def test_auto_detect_is_at_least_one(self) -> None:
         from src.steps.train import _resolve_optuna_workers
 
-        assert _resolve_optuna_workers(0, "cpu", n_cells=4) >= 1
+        assert _resolve_optuna_workers(0, "cpu", n_cells=4, reserve_bytes=4 * 1024**3) >= 1
 
 
 class TestDetectMaxWorkersUsesFreeVram:
@@ -224,6 +224,6 @@ class TestDetectMaxWorkersUsesFreeVram:
         monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _i=0: (8 * gib, 16 * gib))
         monkeypatch.setattr(parallel, "plan_pool_workers", lambda **kw: kw["hard_cap"])
 
-        n = parallel.detect_max_workers("cuda")
+        n = parallel.detect_max_workers("cuda", reserve_bytes=4 * 1024**3)
 
         assert n == 1  # (8 GB - 1 GB margin) // 4 GB

@@ -80,6 +80,8 @@ from src.steps import (  # noqa: E402
 )
 from src.utils.config import load_config  # noqa: E402
 from src.utils.logging import get_logger  # noqa: E402
+from src.utils.memory import warn_if_budget_exceeds_cgroup  # noqa: E402
+from src.utils.resources import resolve_resources  # noqa: E402
 
 logger = get_logger("main")
 
@@ -159,6 +161,29 @@ def _release_gpu_memory() -> None:
             torch.cuda.empty_cache()
     except Exception:  # pragma: no cover - torch missing or CUDA broken
         return
+
+
+def _log_resource_plan(config: dict[str, Any]) -> None:
+    """Resolve ``configs/resources.yaml`` once at startup and log what applies.
+
+    Fails loud on an invalid block (before any step runs) and warns when
+    an explicit host budget exceeds the cgroup limit in effect.
+    """
+    resources = resolve_resources(config)
+    warn_if_budget_exceeds_cgroup(resources)
+    logger.info(
+        "Resources: vram_share=%.2f ranking_vram_share=%.3f host_budget=%s headroom=%.1f GB "
+        "workers(training=%d fusion=%d dataloader=%s) residency=%s item_block=%d",
+        resources.gpu.vram_share,
+        resources.gpu.ranking_vram_share,
+        "cgroup" if resources.host.budget_bytes is None else resources.host.budget_bytes,
+        resources.host.headroom_bytes / 1024**3,
+        resources.workers.training,
+        resources.workers.fusion,
+        "auto" if resources.workers.dataloader is None else resources.workers.dataloader,
+        resources.features.residency,
+        resources.features.item_block,
+    )
 
 
 def _run_step(name: str, condition: str | None) -> None:
@@ -736,6 +761,7 @@ def main(argv: list[str] | None = None) -> None:
         from src.folds.runner import run_folds
 
         cfg = load_config()
+        _log_resource_plan(cfg)
         _require_complete(run_folds(cfg, cfg["paths"]["results"]), label="K-fold run")
         return
     if args.battery:
@@ -743,6 +769,7 @@ def main(argv: list[str] | None = None) -> None:
         from src.battery.runner import run_battery
 
         cfg = load_config()
+        _log_resource_plan(cfg)
         manifest = run_battery(
             cfg, cfg["paths"]["results"], execute_cell, retry_failed=args.retry_failed
         )
@@ -789,6 +816,7 @@ def main(argv: list[str] | None = None) -> None:
         config["seeds"] = seeds_override
 
     steps, condition, run_both = _resolve_plan(args, config)
+    _log_resource_plan(config)
 
     from src.utils.logging import session_log_path
 

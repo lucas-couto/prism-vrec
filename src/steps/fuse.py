@@ -61,20 +61,12 @@ from src.utils.identity import (
 )
 from src.utils.logging import get_logger
 from src.utils.memory import available_cpus, plan_pool_workers
+from src.utils.resources import ResourcesConfig, resolve_resources
 from src.utils.splits import train_item_indices
 
 logger = get_logger(__name__)
 
 _PCA_STRATEGIES = {"pca", "pca_per_model"}
-
-#: Hard ceiling on the fusion pool, set by the researcher on 2026-09-06
-#: after two PCA workers were OOM-killed inside the 16 GB container.
-#: Fusion is memory-bound, not CPU-bound: the PCA fits already use
-#: every core through BLAS, so one worker loses little wall-clock and
-#: keeps the whole container budget for the one fit matrix.  The
-#: memory-aware planner below still runs, so the log records what a
-#: larger pool *would* have been sized at.
-MAX_FUSION_WORKERS = 1
 
 #: Peak RSS of an *in-memory* fusion worker as a multiple of its source
 #: bytes.  Such a worker holds the loaded sources, the fused output
@@ -169,7 +161,7 @@ def _task_peak_bytes(task: dict) -> int:
     return peak
 
 
-def _plan_fusion_workers(pending: list[dict]) -> int:
+def _plan_fusion_workers(pending: list[dict], resources: ResourcesConfig) -> int:
     """Size the fusion pool from the memory budget, not just the CPU count.
 
     A worker fusing two native matrices for a 350K-item catalogue peaks
@@ -177,22 +169,30 @@ def _plan_fusion_workers(pending: list[dict]) -> int:
     for tens of GB at once and, on a host whose container has no memory
     limit, triggers a *global* OOM that kills processes outside the
     container.  The CPU count stays the upper bound; the memory budget
-    lowers it whenever the sources do not fit.
+    lowers it whenever the sources do not fit; ``resources.workers.fusion``
+    is the hard ceiling (one worker since 2026-09-06, when two PCA
+    workers were OOM-killed inside the 16 GB container -- fusion is
+    memory-bound, the PCA fits already use every core through BLAS).
+    The memory plan is still logged so the run log records what a larger
+    pool would have been sized at.
     """
+    ceiling = resources.workers.fusion
     cpu_cap = min(len(pending), available_cpus())
     per_worker = max((_task_peak_bytes(t) for t in pending), default=0)
     planned = plan_pool_workers(
         per_worker_bytes=per_worker,
         hard_cap=cpu_cap,
+        reserve_bytes=resources.host.reserved_bytes,
         label="fusion pool",
     )
-    if planned > MAX_FUSION_WORKERS:
+    if planned > ceiling:
         logger.info(
-            "fusion pool: pinned to %d worker(s) (MAX_FUSION_WORKERS); the memory plan allowed %d",
-            MAX_FUSION_WORKERS,
+            "fusion pool: pinned to %d worker(s) (resources.workers.fusion); "
+            "the memory plan allowed %d",
+            ceiling,
             planned,
         )
-    return max(1, min(planned, MAX_FUSION_WORKERS))
+    return max(1, min(planned, ceiling))
 
 
 def task_provenance(task: dict) -> dict:
@@ -729,7 +729,7 @@ def run(condition: str = "frozen") -> None:
         logger.info("All fusions already exist.")
         return
 
-    n_workers = _plan_fusion_workers(pending)
+    n_workers = _plan_fusion_workers(pending, resolve_resources(config))
     logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
 
     _run_fusion_pool(pending, n_workers)

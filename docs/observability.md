@@ -58,16 +58,17 @@ ignored. One core is reserved for the trainer (`cpu - 1`) and
 `num_workers` is floored at 1.
 
 Researchers do not have to set these knobs. When they want to, the
-override lives in `configs/default.yaml -> dataloader` (see the
-commented-out block at the end of the file). Pinned values win over
-the autotune; fields left commented fall through to the tier:
+pins live in `configs/resources.yaml`. An integer wins over the
+autotune; `auto` falls through to the tier:
 
 ```yaml
-# configs/default.yaml
-dataloader:
-  num_workers: 4
-  prefetch_factor: 4
-  batch_size: 64
+# configs/resources.yaml
+resources:
+  workers:
+    dataloader: 4        # auto | integer (clamped by the CPU quota)
+  dataloader:
+    prefetch_factor: 4   # auto | integer
+    batch_size: 64       # auto | integer
 ```
 
 Every choice is reproducible from the manifest:
@@ -85,9 +86,10 @@ Every choice is reproducible from the manifest:
 
 `auto` records the values the autotune would have picked, `resolved`
 records the values actually used, and `yaml_overrides` lists the keys
-the YAML pinned. There are no environment variable overrides, the YAML
-is the single source of truth so reruns reproduce from `git checkout`
-alone.
+the YAML pinned (under their DataLoader names). There are no
+environment variable overrides, the YAML is the single source of truth
+so reruns reproduce from `git checkout` alone. The whole resolved
+`resources` block is recorded next to it under `manifest['resources']`.
 
 ## Process-pool sizing
 
@@ -579,13 +581,15 @@ otherwise succeeded.
 When the host detection picks the wrong tier (for example a 12 GB
 container the framework reads as 8 GB because of cgroup quirks), or
 when an experiment needs an exact value for reproducibility, uncomment
-the relevant fields in `configs/default.yaml -> dataloader`:
+the relevant fields in `configs/resources.yaml`:
 
 ```yaml
-dataloader:
-  num_workers: 4         # overrides the tier value
-  prefetch_factor: 4     # leave any field commented to keep the autotune
-  batch_size: 64
+resources:
+  workers:
+    dataloader: 4        # overrides the tier value
+  dataloader:
+    prefetch_factor: 4   # set any field to auto to keep the autotune
+    batch_size: 64
 ```
 
 Pinned values are recorded under

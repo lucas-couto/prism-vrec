@@ -10,14 +10,66 @@ Dates are UTC.
 
 ### Added
 
-- **`PRISM_VRAM_SHARE`** overrides `RUN_RESOURCE_SHARE`
-  (`src/utils/device.py`) through `docker-compose.yml`, like
-  `PRISM_MEM_LIMIT` / `PRISM_CPUS`. Meant for unattended windows: the
-  amazon_women VNPR cells with a 2048-2816-d dense visual buffer and
-  `latent_dim=128` (20 of 976 jobs) do not fit half the card and OOM at
-  construction; `PRISM_VRAM_SHARE=0.95 docker compose up -d` overnight
-  runs their retries without a source edit. Values outside `(0, 1]`
-  fail at import.
+- **`configs/resources.yaml` is the single source of computational
+  limits** (C06 key names approved by the researcher on 2026-09-07).
+  One nested block — `gpu.{vram_share,ranking_vram_share}`,
+  `host.{budget_bytes,headroom_bytes,reserved_bytes}`,
+  `workers.{training,fusion,dataloader}`,
+  `dataloader.{prefetch_factor,batch_size}`,
+  `features.{residency,item_block}` — resolved and validated once at
+  startup by `src/utils/resources.py::resolve_resources`: negative,
+  non-finite, boolean, non-integer or out-of-range values, unknown keys
+  at any level and renamed keys fail naming the key; a missing file or
+  block resolves to the shipped defaults. Every consumer reads the
+  resolved value at its boundary: `cap_process_vram(n, vram_share=)`
+  and the worker ranking planner (`gpu.*`), `plan_pool_workers` /
+  `detect_max_workers` / `admit_workers` (`host.*`, the reserve and
+  headroom are now required arguments), the train step's worker count
+  and the fusion pool ceiling (`workers.*`), the DataLoader autotune
+  (`workers.dataloader`, `dataloader.*`), the admission ledger and
+  `BaseRecommender.configure_item_block` (`features.*`). The resolved
+  block is recorded under `manifest['resources']` and stays out of the
+  scientific identity (`tests/test_resources_config.py` asserts the
+  digest is invariant to it). A `host.budget_bytes` above the cgroup
+  limit in effect is logged as a WARNING at startup.
+- **`PRISM_VRAM_SHARE`** overrides `resources.gpu.vram_share` for one
+  launch, forwarded by `docker-compose.yml` like `PRISM_MEM_LIMIT` /
+  `PRISM_CPUS` (empty by default so the YAML governs). Meant for
+  unattended windows: the amazon_women VNPR cells with a 2048-2816-d
+  dense visual buffer and `latent_dim=128` (20 of 976 jobs) do not fit
+  half the card and OOM at construction; `PRISM_VRAM_SHARE=0.95 docker
+  compose up -d` overnight runs their retries without a source edit.
+  Values outside `(0, 1]` fail at resolution, no longer at import.
+- **`configs/zz_local.yaml`** is git-ignored: the per-night narrowing
+  (`datasets:`, `pipeline.{run_all,start_from,stop_at}`) goes there and
+  is merged last. `docs/battery_runbook.md` documents the pattern and
+  the trap that `start_from` / `stop_at` are ignored while `run_all:
+  true` (`tests/test_local_override.py`).
+
+### Removed
+
+- The duplicate sources of the limits above, each replaced by one
+  `resources` key. A config that still carries a removed key fails at
+  load with a message naming the replacement:
+
+  | Removed | Replacement |
+  |---|---|
+  | `hp_search.workers` (`configs/recommenders.yaml`) | `resources.workers.training` |
+  | top-level `dataloader:` block (`configs/default.yaml`, `DataLoaderConfig`) | `resources.workers.dataloader`, `resources.dataloader.{prefetch_factor,batch_size}` |
+  | `resources.host_budget_bytes` / `headroom_bytes` / `feature_residency` (M05 proposal) | `resources.host.budget_bytes` / `host.headroom_bytes` / `features.residency` |
+  | `resources.max_workers` (M05 proposal) | dropped; `resources.workers.training` |
+  | `RUN_RESOURCE_SHARE`, `SOLO_PROCESS_VRAM_FRACTION`, `POOL_VRAM_FRACTION` (`src/utils/device.py`) | `resources.gpu.vram_share` |
+  | `_RANKING_VRAM_SHARE` (`src/utils/parallel.py`) | `resources.gpu.ranking_vram_share` |
+  | `MAX_FUSION_WORKERS` (`src/steps/fuse.py`) | `resources.workers.fusion` |
+  | `RESERVED_BYTES` (`src/utils/memory.py`) | `resources.host.reserved_bytes` (`headroom_bytes` for admission) |
+  | `_LAZY_BLOCK_ROWS` (`src/steps/train.py`); `_LAZY_ITEM_BLOCK = 8192` literal | `resources.features.item_block` (the class attribute stays as the injection point) |
+
+  The shipped values are unchanged except the VRAM share: 0.95 of the
+  card (the researcher's unattended overnight setting; 0.5 remains the
+  desktop-friendly code default when the block is absent), a 0.125
+  ranking share, 4 GiB headroom and reserve, one training and one
+  fusion worker, DataLoader 10 / 6 / 192, dense features in 8192-row
+  blocks.
 
 ### Fixed
 
