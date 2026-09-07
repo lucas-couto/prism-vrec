@@ -47,6 +47,8 @@ def test_evaluate_cell_passes_train_only_history_to_history_model(tmp_path, monk
 
         def load_state_dict(self, state) -> None: ...
 
+        def configure_item_block(self, rows: int) -> None: ...
+
         def to(self, device):  # noqa: ANN001
             return self
 

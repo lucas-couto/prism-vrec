@@ -40,3 +40,6 @@ Thumbs.db
 
 # Session hand-off notes live outside version control.
 HANDOFF.md
+
+# Per-night YAML override (datasets, pipeline range); merged last, never committed
+configs/zz_local.yaml

@@ -32,6 +32,7 @@ from src.utils.dataloader import resolve_dataloader_settings
 from src.utils.device import cap_process_vram, resolve_device
 from src.utils.item_order import item_order_metadata, load_item_order
 from src.utils.logging import get_logger
+from src.utils.resources import resolve_resources
 from src.utils.seed import set_seed
 from src.utils.splits import train_item_indices
 from src.utils.timing import time_cell
@@ -407,7 +408,7 @@ def run() -> None:
     device = resolve_device(config["device"])
     # The longest GPU step of the pipeline (~5 h on the full battery),
     # in its own process: cap it so the desktop stays usable throughout.
-    cap_process_vram()
+    cap_process_vram(vram_share=resolve_resources(config).gpu.vram_share)
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
     batch_size = config.get("batch_size", 64)

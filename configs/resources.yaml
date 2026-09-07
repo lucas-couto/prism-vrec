@@ -1,0 +1,35 @@
+# configs/resources.yaml — computational limits, researcher-controlled.
+# Everything here is execution metadata: it changes how fast and how
+# much memory a run uses, never what it computes.  The resolved block is
+# recorded in the run manifest (manifest['resources']) and stays out of
+# the scientific identity.  Resolved and validated once at startup by
+# src/utils/resources.py; a missing file or block means the values
+# below, and any negative, non-finite, boolean, non-integer, unknown or
+# renamed key fails with a message naming it.
+#
+# Docker-level caps (mem_limit, cpus) stay in docker-compose.yml.
+# A budget_bytes above the container's cgroup limit is logged as a
+# WARNING at startup.
+resources:
+  gpu:
+    # Fraction of the card the run may claim.  0.95 assumes the machine
+    # runs unattended (overnight batteries); 0.5 is the desktop-friendly
+    # value that keeps the compositor alive while someone works on the
+    # same GPU (the code default when this block is absent).
+    # PRISM_VRAM_SHARE=<fraction> overrides it for one launch.
+    vram_share: 0.95
+    ranking_vram_share: 0.125  # share of the cap one ranking batch may use (shorter kernels)
+  host:
+    budget_bytes: null         # null = read the cgroup limit; must not exceed PRISM_MEM_LIMIT
+    headroom_bytes: 4294967296 # withheld from every pool (4 GiB)
+    reserved_bytes: 4294967296 # parent process + page cache
+  workers:
+    training: 1                # replaces hp_search.workers (0 = auto-detect from VRAM)
+    fusion: 1                  # replaces MAX_FUSION_WORKERS
+    dataloader: 10             # auto | integer; clamped by the CPU quota
+  dataloader:
+    prefetch_factor: 6         # auto | integer; batches prefetched per DataLoader worker
+    batch_size: 192            # auto | integer; the re-extract batch (finetune, evaluate_finetuning)
+  features:
+    residency: dense           # dense | lazy | auto
+    item_block: 8192           # rows per block for catalogue-sized requests

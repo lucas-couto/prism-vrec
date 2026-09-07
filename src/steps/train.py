@@ -74,9 +74,9 @@ from src.utils.memory import (
     estimate_model_state_bytes,
     npy_payload_bytes,
     resolve_host_budget,
-    resolve_resources,
 )
 from src.utils.parallel import TrainingJob, TrainingOrchestrator, checkpoint_root
+from src.utils.resources import resolve_resources
 from src.utils.seed import set_seed
 
 logger = get_logger(__name__)
@@ -658,6 +658,9 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
 
     config = load_config()
     set_seed(config["seed"])
+    # Computational limits, validated before any gate runs (a removed
+    # key such as hp_search.workers fails here, naming its replacement).
+    resources = resolve_resources(config)
 
     if not config.get("datasets"):
         logger.info("train step skipped: datasets list is empty in configs/default.yaml.")
@@ -702,9 +705,9 @@ def run(condition: str = "frozen", workers: int = 0, sequential: bool = False) -
     strategy = get_strategy(config)
     logger.info("Hyperparameter-search strategy: %s", strategy)
 
-    # hp_search.workers in the config is the default; an explicit CLI
-    # value still wins.  workers=1 disables the process pool entirely.
-    effective_workers = workers or int(config.get("hp_search", {}).get("workers", 0))
+    # resources.workers.training is the default; an explicit CLI value
+    # still wins.  workers=1 disables the process pool entirely; 0 = auto.
+    effective_workers = workers or resources.workers.training
     if strategy == "optuna":
         _run_optuna(condition, config, workers=effective_workers, sequential=sequential)
     elif strategy == "fixed":
@@ -734,7 +737,7 @@ def _run_fixed(
     and ``sequential`` are accepted for signature parity with the other
     backends but do not enable a worker pool yet; with one cell per
     configuration the pool would buy little, and a single process keeps
-    the GPU budget identical to the pinned ``hp_search.workers: 1``.
+    the GPU budget identical to the pinned ``resources.workers.training: 1``.
     """
     device = resolve_device(config["device"])
     processed_dir = config["paths"]["data_processed"]
@@ -849,10 +852,8 @@ _WORKER_BASE_BYTES = 1536 * 1024**2
 #: multiplier converts the on-disk CSV size into a resident estimate.
 _INTERACTIONS_MEMORY_FACTOR = 40
 
-#: Rows a lazy source stages per gather (``BaseRecommender._LAZY_ITEM_BLOCK``)
-#: and the number of such blocks charged to a lazy job (source rows on the
-#: host plus their cast/transfer copy).
-_LAZY_BLOCK_ROWS = 8192
+#: Blocks of ``resources.features.item_block`` rows charged to a lazy job
+#: (source rows on the host plus their cast/transfer copy).
 _LAZY_BLOCKS_CHARGED = 2
 
 
@@ -904,10 +905,10 @@ def feature_payload_bytes(path: str | Path | None) -> tuple[int, int]:
         return 0, 0
 
 
-def _resident_feature_bytes(payload: int, width: int, *, lazy: bool) -> int:
+def _resident_feature_bytes(payload: int, width: int, *, lazy: bool, item_block: int) -> int:
     if not lazy:
         return payload
-    return min(payload, _LAZY_BLOCK_ROWS * width * 4 * _LAZY_BLOCKS_CHARGED)
+    return min(payload, item_block * width * 4 * _LAZY_BLOCKS_CHARGED)
 
 
 def estimate_job_bytes(
@@ -917,6 +918,7 @@ def estimate_job_bytes(
     from src.evaluation.protocol import host_ranking_bytes
 
     payload, width = feature_payload_bytes(job.embeddings_path)
+    item_block = resolve_resources(config).features.item_block
     hp = job.hyperparams
     total_dim = (
         hp.get("total_dim") or hp.get("latent_dim") or config.get("common", {}).get("total_dim")
@@ -925,7 +927,7 @@ def estimate_job_bytes(
         Path(processed_dir) / job.dataset_name / "val.csv"
     )
     return JobMemoryEstimate(
-        feature_bytes=_resident_feature_bytes(payload, width, lazy=lazy),
+        feature_bytes=_resident_feature_bytes(payload, width, lazy=lazy, item_block=item_block),
         model_bytes=estimate_model_state_bytes(
             job.n_users, job.n_items, total_dim, visual_dim=width
         ),
@@ -946,22 +948,24 @@ def plan_training_admission(
     Each job is charged its feature payload (source bytes, not sidecar
     size), model + optimizer state, interaction dicts and the host
     ranking workspace, on top of the worker base.  Under
-    ``resources.feature_residency: auto`` a job whose dense payload does
+    ``resources.features.residency: auto`` a job whose dense payload does
     not fit is switched to lazy reads before the verdict.  Jobs whose
     declared minimum still exceeds ``budget - headroom`` are refused; the
     pool is sized so the aggregate commitment of the admitted jobs'
-    heaviest estimate fits, capped by the requested/auto worker count,
-    the CPU quota and ``resources.max_workers``.
+    heaviest estimate fits, capped by the requested/auto worker count
+    and the CPU quota.
     """
     resources = resolve_resources(config)
     budget = resolve_host_budget(config)
-    usable = max(0, budget.limit_bytes - resources.headroom_bytes)
+    residency = resources.features.residency
+    headroom = resources.host.headroom_bytes
+    usable = max(0, budget.limit_bytes - headroom)
     admitted: list[TrainingJob] = []
     refused: list[tuple[TrainingJob, str]] = []
     heaviest = 0
     for job in jobs:
         payload, _ = feature_payload_bytes(job.embeddings_path)
-        job.lazy_features = choose_lazy_features(resources.feature_residency, payload, usable)
+        job.lazy_features = choose_lazy_features(residency, payload, usable)
         estimate = estimate_job_bytes(job, processed_dir, config, lazy=job.lazy_features)
         if estimate.total > usable:
             refused.append((job, _refusal_reason(estimate, usable, budget.source)))
@@ -973,8 +977,7 @@ def plan_training_admission(
         heaviest,
         hard_cap=hard_cap,
         budget=budget,
-        headroom_bytes=resources.headroom_bytes,
-        max_workers=resources.max_workers,
+        headroom_bytes=headroom,
         label="training pool",
     )
     logger.info(
@@ -984,10 +987,10 @@ def plan_training_admission(
         len(refused),
         budget.limit_bytes / 1024**3,
         budget.source,
-        resources.headroom_bytes / 1024**3,
+        headroom / 1024**3,
         heaviest / 1024**3,
         plan.n_workers,
-        resources.feature_residency,
+        residency,
     )
     for job, reason in refused:
         logger.error("  refused %s: %s", job.job_id, reason)
@@ -1031,19 +1034,20 @@ def _estimate_worker_bytes(jobs: list[TrainingJob], processed_dir: str) -> int:
 def lazy_features_for(config: dict, embeddings_path: str | Path | None) -> bool:
     """Whether a single (non-pooled) training/evaluation call should read lazily.
 
-    ``resources.feature_residency``: ``dense`` (default) keeps today's
+    ``resources.features.residency``: ``dense`` (default) keeps today's
     resident matrices, ``lazy`` always reads bounded rows, ``auto``
     switches when the dense payload would not fit the usable budget.
     """
     if embeddings_path is None:
         return False
     resources = resolve_resources(config)
-    if resources.feature_residency == "dense":
+    residency = resources.features.residency
+    if residency == "dense":
         return False
     budget = resolve_host_budget(config)
     payload, _ = feature_payload_bytes(embeddings_path)
-    usable = max(0, budget.limit_bytes - resources.headroom_bytes)
-    return choose_lazy_features(resources.feature_residency, payload, usable)
+    usable = max(0, budget.limit_bytes - resources.host.headroom_bytes)
+    return choose_lazy_features(residency, payload, usable)
 
 
 def _legit_trial_count(study) -> int:
@@ -1058,18 +1062,18 @@ def _legit_trial_count(study) -> int:
     return sum(1 for t in study.trials if t.state.name in ("COMPLETE", "PRUNED"))
 
 
-def _resolve_optuna_workers(workers: int, device: str, n_cells: int) -> int:
+def _resolve_optuna_workers(workers: int, device: str, n_cells: int, *, reserve_bytes: int) -> int:
     """Worker count for inter-cell Optuna parallelism.
 
     Reuses the VRAM heuristic of the grid orchestrator but caps the pool
     at 3: an Optuna worker holds a full study (data + model + evaluator)
     for the whole cell, and 3 concurrent training processes is the
     empirically verified ceiling on the reference 24 GB pod.  Never more
-    workers than cells.
+    workers than cells.  *reserve_bytes* is ``resources.host.reserved_bytes``.
     """
     from src.utils.parallel import detect_max_workers
 
-    n = detect_max_workers(device) if workers <= 0 else workers
+    n = detect_max_workers(device, reserve_bytes=reserve_bytes) if workers <= 0 else workers
     return max(1, min(n, 3, n_cells))
 
 
@@ -1241,7 +1245,7 @@ def _optuna_cell_worker(
     # Capped for any n: the sum of the pool's caps stays below the card
     # (a CUDA context lives outside the cap, on top of it), and a lone
     # worker still leaves the display its headroom.
-    cap_process_vram(n_workers)
+    cap_process_vram(n_workers, vram_share=resolve_resources(config).gpu.vram_share)
 
     while True:
         try:
@@ -1309,7 +1313,14 @@ def _run_optuna(
     if not cells:
         return
 
-    n_workers = 1 if sequential else _resolve_optuna_workers(workers, device, len(cells))
+    resources = resolve_resources(config)
+    n_workers = (
+        1
+        if sequential
+        else _resolve_optuna_workers(
+            workers, device, len(cells), reserve_bytes=resources.host.reserved_bytes
+        )
+    )
 
     if n_workers == 1:
         try:

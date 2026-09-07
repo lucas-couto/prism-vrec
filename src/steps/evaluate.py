@@ -40,6 +40,7 @@ from src.utils.identity import (
     stream_digest,
 )
 from src.utils.logging import get_logger
+from src.utils.resources import resolve_resources
 from src.utils.splits import assert_holdout_disjoint
 from src.utils.timing import note_skipped_cell, time_cell
 from src.utils.variant_filters import checkpoint_matches_config
@@ -416,7 +417,7 @@ def _evaluate_cell(
     the per-user artifact's ``config_hash`` so the artifact says which
     data, protocol and checkpoint bytes produced it.  ``lazy_features``
     reads the artifact through bounded row access (M05 opt-in via
-    ``resources.feature_residency``); the default keeps the resident
+    ``resources.features.residency``); the default keeps the resident
     matrix.
     """
     try:
@@ -476,6 +477,7 @@ def _evaluate_cell(
         config=model_config,
         **ctor_kwargs,
     ).to(device)
+    model.configure_item_block(resolve_resources(load_config()).features.item_block)
     model.load_state_dict(state_dict)
 
     # Task F: persist the per-user sufficient statistic (held-out rank +
@@ -539,7 +541,7 @@ def run(condition: str = "frozen") -> None:
     # process -- the training workers' cap does not reach it.  Without
     # this, ``default_ranking_budget`` sizes the user-batch off the whole
     # card and the desktop freezes for the duration of the step.
-    cap_process_vram()
+    cap_process_vram(vram_share=resolve_resources(config).gpu.vram_share)
     processed_dir = config["paths"]["data_processed"]
     embeddings_dir = config["paths"]["embeddings"]
     datasets = config.get("datasets", [])

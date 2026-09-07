@@ -57,7 +57,6 @@ def _config(tmp_path: Path, strategy: str) -> dict:
         },
         "hp_search": {
             "strategy": strategy,
-            "workers": 1,
             "optuna": {
                 "n_trials": 2,
                 "sampler": "random",

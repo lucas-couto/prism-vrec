@@ -134,10 +134,8 @@ hp_search:
   #            results/best_hyperparams.json of the search run).
   strategy: "grid" # "grid" | "optuna" | "fixed" — grid: see the common: note (Phase D)
 
-  # Parallel training processes.  0 = auto-detect from free VRAM;
-  # pinned to 1 after the 2026-08-29 OOM: an Optuna worker on
-  # amazon_fashion (166k items, full ranking) needs the whole 16 GB GPU.
-  workers: 1
+  # The training worker count moved to configs/resources.yaml
+  # (resources.workers.training); a `workers:` key here is rejected.
 
   optuna:
     n_trials: 30

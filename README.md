@@ -223,19 +223,40 @@ diagnostics:
   steps: [1, 10, 100, 1000]
   output_dir: "results/diagnostics"
 
-# Host memory budget and feature residency (optional; key names are
-# PROVISIONAL pending approval).  Absent = cgroup/host budget with a
-# 4 GiB headroom, never unlimited; features stay dense.
-# resources:
-#   host_budget_bytes: null
-#   headroom_bytes: 4294967296
-#   max_workers: null
-#   feature_residency: dense   # dense | lazy | auto
+# Computational limits (GPU share, host budget, worker counts, DataLoader
+# pins, feature residency) live ONLY in configs/resources.yaml; see below.
 ```
 
 CLI flags (`--all` / `--step` / `--from` / `--to` / `--condition`) override the YAML when present.
 
-Three blocks were added in 3.0.0 (details in the YAML comments and in `docs/reliability-sdd/`): `diagnostics` (task S04) records bounded, detached probes per training run without changing the trajectory; `resources` (tasks M05/M06) is the host budget the training jobs are admitted against — a job whose analytic memory ledger does not fit is recorded as failed and never launched, and `feature_residency: auto` / `lazy` gathers visual rows per forward from a bounded `FeatureSource` instead of holding the catalogue in a module buffer (numerically identical by test; page-cache residency on real catalogues unmeasured); `statistical.population` lives in `configs/evaluation.yaml` below.
+Three blocks were added in 3.0.0 (details in the YAML comments and in `docs/reliability-sdd/`): `diagnostics` (task S04) records bounded, detached probes per training run without changing the trajectory; `resources` (tasks M05/M06, key names approved 2026-09-07 and moved to `configs/resources.yaml`) is the host budget the training jobs are admitted against — a job whose analytic memory ledger does not fit is recorded as failed and never launched, and `features.residency: auto` / `lazy` gathers visual rows per forward from a bounded `FeatureSource` instead of holding the catalogue in a module buffer (numerically identical by test; page-cache residency on real catalogues unmeasured); `statistical.population` lives in `configs/evaluation.yaml` below.
+
+### `configs/resources.yaml`
+
+The single source of computational limits. Everything in it is execution metadata — it changes how fast and how much memory a run uses, never what it computes — so the resolved block is recorded under `manifest['resources']` and stays out of the scientific identity. A missing file or block resolves to conservative code defaults (the values shown, except `vram_share: 0.5`); any negative, non-finite, boolean, non-integer, unknown or renamed key fails at startup with a message naming it.
+
+```yaml
+resources:
+  gpu:
+    vram_share: 0.95           # fraction of the card (0.5 keeps the desktop usable); PRISM_VRAM_SHARE overrides for one launch
+    ranking_vram_share: 0.125  # share of the cap one ranking batch may use (shorter kernels)
+  host:
+    budget_bytes: null         # null = read the cgroup limit; must not exceed PRISM_MEM_LIMIT
+    headroom_bytes: 4294967296 # withheld from every pool (4 GiB)
+    reserved_bytes: 4294967296 # parent process + page cache
+  workers:
+    training: 1                # replaces hp_search.workers (0 = auto-detect)
+    fusion: 1                  # replaces MAX_FUSION_WORKERS
+    dataloader: 10             # auto | integer; clamped by the CPU quota
+  dataloader:
+    prefetch_factor: 6         # auto | integer
+    batch_size: 192            # auto | integer; the re-extract batch
+  features:
+    residency: dense           # dense | lazy | auto
+    item_block: 8192           # rows per block for catalogue-sized requests
+```
+
+Removed in favour of this file (a config that still carries them fails, naming the new key): `hp_search.workers` → `resources.workers.training`; the top-level `dataloader:` block → `resources.workers.dataloader` + `resources.dataloader.*`; the flat `resources.host_budget_bytes` / `headroom_bytes` / `max_workers` / `feature_residency` → their nested names. Docker-level caps (`mem_limit`, `cpus`) stay in `docker-compose.yml`; a `host.budget_bytes` above the container's cgroup limit is logged as a WARNING at startup.
 
 ### `configs/extractors.yaml`
 
@@ -441,17 +462,17 @@ statistical:
 
 The framework reads two sources for DataLoader sizing and VNPR chunking:
 
-1. The `dataloader:` block in `configs/default.yaml` (commented out by default). Uncomment any field to pin it.
+1. `configs/resources.yaml`: `resources.workers.dataloader` and `resources.dataloader.{prefetch_factor,batch_size}`, each `auto` or an integer.
 2. The autotune in `src/utils/dataloader.py` (CPU + cgroup memory for DataLoader, GPU VRAM for VNPR chunk).
 
-When the YAML pins a value, it wins; otherwise the autotune picks the tier value. The resolved values plus any active YAML overrides are recorded under `manifest['dataloader_autotune']`. There are no environment variables for these knobs, the YAML is the only override path so reruns stay reproducible from `git checkout` alone.
+When the YAML pins an integer, it wins; `auto` lets the autotune pick the tier value. The resolved values plus the pinned keys are recorded under `manifest['dataloader_autotune']`. There are no environment variables for these knobs, the YAML is the only override path so reruns stay reproducible from `git checkout` alone.
 
 The fine-tuning training batch size lives in `configs/finetuning.yaml -> finetuning.batch_size`; the frozen-extract batch size lives in `configs/extractors.yaml -> batch_size`. Both are already YAML-only.
 
 | Knob                                  | Source                                                                 |
 | ------------------------------------- | ---------------------------------------------------------------------- |
-| `num_workers` / `prefetch_factor`     | `configs/default.yaml -> dataloader.*` or autotune (2 / 4 / 12 by memory tier) |
-| Re-extract batch size (inside finetune and evaluate_finetuning)  | `configs/default.yaml -> dataloader.batch_size` or autotune (32 / 128 / 256 by memory tier) |
+| `num_workers` / `prefetch_factor`     | `configs/resources.yaml -> resources.workers.dataloader` / `resources.dataloader.prefetch_factor` or autotune (2 / 4 / 12 by memory tier) |
+| Re-extract batch size (inside finetune and evaluate_finetuning)  | `configs/resources.yaml -> resources.dataloader.batch_size` or autotune (32 / 128 / 256 by memory tier) |
 | Fine-tuning training batch size       | `configs/finetuning.yaml -> finetuning.batch_size`                     |
 | Frozen-extract batch size             | `configs/extractors.yaml -> batch_size`                                |
 | VNPR `(user, item)` pairs per forward | Autotune from GPU VRAM (500_000 / 2_000_000 / 5_000_000 by tier)       |
@@ -774,7 +795,7 @@ Each method is toggled individually in `configs/evaluation.yaml` -> `statistical
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | Single directory scan in `CategoryDataset` / `ImageDataset` | One `os.listdir()` instead of N `path.exists()` calls.                                                                         |
 | Persistent DataLoader workers                               | `persistent_workers=True` removes per-epoch fork/warm-up.                                                                      |
-| Tunable batch / workers / prefetch                          | YAML-only: `configs/finetuning.yaml -> finetuning.batch_size`; workers/prefetch via `configs/default.yaml -> dataloader.*` or autotune. |
+| Tunable batch / workers / prefetch                          | YAML-only: `configs/finetuning.yaml -> finetuning.batch_size`; workers/prefetch via `configs/resources.yaml -> resources.workers.dataloader` / `resources.dataloader.*` or autotune. |
 | Per-job try/except                                          | Failures are isolated per `(extractor × dataset)` so the queue continues after an OOM, layer-name mismatch, or HF Hub timeout. |
 
 ---
@@ -813,6 +834,7 @@ Every `main.py` invocation writes a manifest to `results/runs/<run_id>/manifest.
 - `seed`: global RNG seed.
 - `hardware`: GPU name, VRAM, CUDA version, RAM, CPU count.
 - `device`: requested value (`auto` / `cuda` / `cpu`) and the value actually used.
+- `resources`: the resolved `configs/resources.yaml` block (with `PRISM_VRAM_SHARE` applied) — execution metadata, absent from the scientific identity.
 - `dataloader_autotune`: tier picked from the cgroup memory budget plus the resolved `num_workers`, `prefetch_factor`, `batch_size`.
 - `package_versions`: versions of `torch`, `transformers`, `numpy`, and the other pinned dependencies.
 - `config_snapshot`: every YAML merged into a single dict.

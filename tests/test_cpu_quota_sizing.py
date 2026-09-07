@@ -32,7 +32,7 @@ def test_should_never_exceed_the_machines_core_count() -> None:
 
 
 def test_should_clamp_a_pinned_num_workers_to_the_quota() -> None:
-    absurd = {"dataloader": {"num_workers": 512}}
+    absurd = {"resources": {"workers": {"dataloader": 512}}}
 
     settings = resolve_dataloader_settings(absurd)
 
@@ -40,7 +40,7 @@ def test_should_clamp_a_pinned_num_workers_to_the_quota() -> None:
 
 
 def test_should_honour_a_pinned_num_workers_that_fits() -> None:
-    settings = resolve_dataloader_settings({"dataloader": {"num_workers": 1}})
+    settings = resolve_dataloader_settings({"resources": {"workers": {"dataloader": 1}}})
 
     assert settings.num_workers == 1
 

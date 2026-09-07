@@ -5,7 +5,7 @@ The framework picks ``num_workers`` / ``prefetch_factor`` /
 budget; the values are the contract that every step that builds a
 DataLoader relies on.  These tests pin both the *tier boundaries*
 (a small change to the thresholds is caught here) and the *escape
-hatches* (env-var overrides, CPU clamp, cgroup parsing).
+hatches* (``resources`` pins, CPU clamp, cgroup parsing).
 
 The module under test caches via ``@lru_cache``, every test clears
 the cache before exercising new inputs.
@@ -134,7 +134,7 @@ def test_yaml_override_replaces_num_workers(fake_host):
     fake_host(cpu=10, memory_gb=16.0)
 
     settings = autotune_mod.resolve_dataloader_settings(
-        {"dataloader": {"num_workers": 9}},
+        {"resources": {"workers": {"dataloader": 9}}},
     )
 
     assert settings.num_workers == 9
@@ -147,7 +147,7 @@ def test_yaml_override_replaces_prefetch_and_batch_size(fake_host):
     fake_host(cpu=10, memory_gb=16.0)
 
     settings = autotune_mod.resolve_dataloader_settings(
-        {"dataloader": {"prefetch_factor": 16, "batch_size": 512}},
+        {"resources": {"dataloader": {"prefetch_factor": 16, "batch_size": 512}}},
     )
 
     assert settings.prefetch_factor == 16
@@ -163,13 +163,17 @@ def test_yaml_overrides_absent_falls_through_to_auto(fake_host):
     assert (settings.num_workers, settings.prefetch_factor, settings.batch_size) == (2, 2, 32)
 
 
-def test_yaml_none_values_fall_through_to_auto(fake_host):
-    """A pydantic-validated config has the keys with None as default,
-    which must behave the same as missing keys."""
+def test_yaml_auto_values_fall_through_to_auto(fake_host):
+    """``auto`` (the documented spelling) and ``null`` both mean "the tier"."""
     fake_host(cpu=10, memory_gb=16.0)
 
     settings = autotune_mod.resolve_dataloader_settings(
-        {"dataloader": {"num_workers": None, "prefetch_factor": None, "batch_size": None}},
+        {
+            "resources": {
+                "workers": {"dataloader": "auto"},
+                "dataloader": {"prefetch_factor": None, "batch_size": "auto"},
+            }
+        },
     )
 
     assert (settings.num_workers, settings.prefetch_factor, settings.batch_size) == (4, 4, 128)
@@ -193,13 +197,20 @@ def test_describe_returns_expected_shape_without_overrides(fake_host):
 def test_describe_captures_active_yaml_overrides(fake_host):
     fake_host(cpu=10, memory_gb=16.0)
 
-    snapshot = autotune_mod.describe({"dataloader": {"num_workers": 9}})
+    snapshot = autotune_mod.describe({"resources": {"workers": {"dataloader": 9}}})
 
     # Auto values are reported as-is, the resolved block reflects the
     # override, and yaml_overrides surfaces the pinned key.
     assert snapshot["auto"]["num_workers"] == 4
     assert snapshot["resolved"]["num_workers"] == 9
     assert snapshot["yaml_overrides"] == {"num_workers": 9}
+
+
+def test_removed_top_level_dataloader_block_fails_naming_the_new_key(fake_host):
+    fake_host(cpu=10, memory_gb=16.0)
+
+    with pytest.raises(ValueError, match="resources.workers.dataloader"):
+        autotune_mod.resolve_dataloader_settings({"dataloader": {"num_workers": 9}})
 
 
 # The memory-budget resolution itself (cgroup v2 -> v1 -> host RAM ->

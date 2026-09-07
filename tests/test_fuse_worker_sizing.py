@@ -13,8 +13,14 @@ import numpy as np
 
 from src.steps import fuse as fuse_mod
 from src.utils import memory as memory_mod
+from src.utils.resources import resolve_resources
 
 GB = 1024**3
+
+#: The shipped block: one fusion worker (resources.workers.fusion).
+PINNED = resolve_resources({})
+#: The researcher's one-worker pin lifted so the memory sizing is observable.
+UNPINNED = resolve_resources({"resources": {"workers": {"fusion": 64}}})
 
 
 def _npy(tmp_path, name: str, rows: int, dim: int) -> str:
@@ -30,11 +36,6 @@ def _task(paths, *, strategy="concat", train_items=None, sidecar=None) -> dict:
         "train_items": train_items,
         "sidecar_payload": sidecar,
     }
-
-
-def _unpin(monkeypatch) -> None:
-    """Lift the researcher's one-worker pin so the memory sizing is observable."""
-    monkeypatch.setattr(fuse_mod, "MAX_FUSION_WORKERS", 64)
 
 
 class TestTaskPeakBytes:
@@ -85,27 +86,24 @@ class TestTaskPeakBytes:
 class TestPlanFusionWorkers:
     def test_streamed_tasks_keep_every_core(self, tmp_path, monkeypatch):
         """After streaming, a catalogue-sized concat no longer caps the pool."""
-        _unpin(monkeypatch)
         monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 24 * GB)
         # ~4 GB of sources — the shape that used to force 1 worker.
         paths = [_npy(tmp_path, "a.npy", 2 * 1024 * 1024, 512)]
         pending = [_task(paths) for _ in range(12)]
 
-        assert fuse_mod._plan_fusion_workers(pending) == 12
+        assert fuse_mod._plan_fusion_workers(pending, UNPINNED) == 12
 
     def test_in_memory_tasks_are_still_capped(self, tmp_path, monkeypatch):
-        _unpin(monkeypatch)
         monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 24 * GB)
         paths = [_npy(tmp_path, "a.npy", 2 * 1024 * 1024, 512)]
         pending = [_task(paths, strategy="some_plugin") for _ in range(12)]
 
-        assert fuse_mod._plan_fusion_workers(pending) == 1
+        assert fuse_mod._plan_fusion_workers(pending, UNPINNED) == 1
 
     def test_the_heaviest_task_sets_the_pool_size(self, tmp_path, monkeypatch):
         """Homogeneous slots: one fat task must not be sized by the light ones."""
-        _unpin(monkeypatch)
         monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 24 * GB)
         light = [_npy(tmp_path, "light.npy", 100, 32)]
@@ -113,33 +111,30 @@ class TestPlanFusionWorkers:
         pending = [_task(light) for _ in range(11)]
         pending.append(_task(heavy, strategy="some_plugin"))
 
-        assert fuse_mod._plan_fusion_workers(pending) == 1
+        assert fuse_mod._plan_fusion_workers(pending, UNPINNED) == 1
 
     def test_never_more_workers_than_pending_tasks(self, tmp_path, monkeypatch):
-        _unpin(monkeypatch)
         monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 64 * GB)
         paths = [_npy(tmp_path, "a.npy", 100, 32)]
         pending = [_task(paths) for _ in range(3)]
 
-        assert fuse_mod._plan_fusion_workers(pending) == 3
+        assert fuse_mod._plan_fusion_workers(pending, UNPINNED) == 3
 
     def test_sidecar_only_batch_is_not_memory_capped(self, monkeypatch):
-        _unpin(monkeypatch)
         monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 4)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 5 * GB)
         pending = [_task([], sidecar={"components": []}) for _ in range(4)]
 
-        assert fuse_mod._plan_fusion_workers(pending) == 4
+        assert fuse_mod._plan_fusion_workers(pending, UNPINNED) == 4
 
     def test_always_at_least_one_worker(self, tmp_path, monkeypatch):
-        _unpin(monkeypatch)
         monkeypatch.setattr(fuse_mod, "available_cpus", lambda: 16)
         monkeypatch.setattr(memory_mod, "memory_budget_bytes", lambda: 5 * GB)
         paths = [_npy(tmp_path, "a.npy", 4 * 1024 * 1024, 512)]
         pending = [_task(paths, strategy="some_plugin") for _ in range(12)]
 
-        assert fuse_mod._plan_fusion_workers(pending) == 1
+        assert fuse_mod._plan_fusion_workers(pending, UNPINNED) == 1
 
 
 class TestOneWorkerPin:
@@ -150,5 +145,5 @@ class TestOneWorkerPin:
         paths = [_npy(tmp_path, "a.npy", 100, 32)]
         pending = [_task(paths) for _ in range(6)]
 
-        assert fuse_mod.MAX_FUSION_WORKERS == 1
-        assert fuse_mod._plan_fusion_workers(pending) == 1
+        assert PINNED.workers.fusion == 1
+        assert fuse_mod._plan_fusion_workers(pending, PINNED) == 1

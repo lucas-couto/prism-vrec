@@ -35,6 +35,7 @@ from src.utils.identity import (
     selection_scope_digest,
 )
 from src.utils.logging import get_logger
+from src.utils.resources import resolve_resources
 from src.utils.seed import set_seed
 from src.utils.splits import assert_holdout_disjoint
 
@@ -833,6 +834,7 @@ def train_single_run(
         config=model_config,
         **ctor_kwargs,
     ).to(device)
+    model.configure_item_block(resolve_resources(config).features.item_block)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hyperparams["learning_rate"])
 

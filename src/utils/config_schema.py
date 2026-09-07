@@ -24,6 +24,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.utils.resources import reject_removed_keys, resolve_resources
+
 # Mirrors ``main.STEP_ORDER``, kept in sync manually because importing
 # main.py here would create a circular dependency at config-load time.
 PIPELINE_STEPS = (
@@ -70,22 +72,6 @@ class DatasetContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expects_categories: bool
-
-
-class DataLoaderConfig(BaseModel):
-    """Optional manual override of the DataLoader autotune.
-
-    All three fields are optional. When omitted, the framework picks
-    the corresponding value from ``src.utils.dataloader.autotune()``
-    based on the host's CPU and cgroup memory budget. Setting any
-    field pins it for the whole run.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    num_workers: int | None = Field(None, ge=0)
-    prefetch_factor: int | None = Field(None, ge=1)
-    batch_size: int | None = Field(None, ge=1)
 
 
 class TelemetryConfig(BaseModel):
@@ -264,13 +250,16 @@ class HpSearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy: Literal["grid", "optuna", "fixed"] = "grid"
-    #: Training worker processes. 0 = auto-detect from VRAM (capped at
-    #: 3); 1 = fully sequential in the parent process — no spawn, no
-    #: per-process VRAM caps, the whole GPU and host RAM budget for one
-    #: cell at a time.  The safe choice on hosts where N training
-    #: processes exhaust the memory cgroup.
-    workers: int = Field(0, ge=0, le=8)
     optuna: OptunaConfig = Field(default_factory=OptunaConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_workers_key(cls, raw: Any) -> Any:
+        # The worker count is a computational limit and lives in
+        # configs/resources.yaml (resources.workers.training).
+        if isinstance(raw, dict):
+            reject_removed_keys({"hp_search": raw})
+        return raw
 
 
 class HpSpaceEntry(BaseModel):
@@ -441,8 +430,16 @@ class FrameworkConfig(BaseModel):
     )
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     folds: FoldsConfig = Field(default_factory=FoldsConfig)
-    dataloader: DataLoaderConfig = Field(default_factory=DataLoaderConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    resources: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Computational limits (configs/resources.yaml): GPU share, host "
+            "budget, worker counts, DataLoader pins, feature residency.  "
+            "Validated by src.utils.resources.resolve_resources; execution "
+            "metadata, never part of the scientific identity."
+        ),
+    )
 
     projection: ExtractionProjectionConfig = Field(
         default_factory=lambda: ExtractionProjectionConfig(),
@@ -466,6 +463,22 @@ class FrameworkConfig(BaseModel):
             "keeps the native regions (49/196/256).  2 = four quadrants."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_top_level_keys(cls, raw: Any) -> Any:
+        # A top-level ``dataloader:`` block moved to resources.dataloader /
+        # resources.workers.dataloader; ``extra="allow"`` would otherwise
+        # let the stale block through silently.
+        if isinstance(raw, dict):
+            reject_removed_keys({"dataloader": raw["dataloader"]} if "dataloader" in raw else {})
+        return raw
+
+    @field_validator("resources")
+    @classmethod
+    def _resources_resolve(cls, value: dict[str, Any]) -> dict[str, Any]:
+        resolve_resources({"resources": value})
+        return value
 
     @field_validator("seeds")
     @classmethod

@@ -35,9 +35,9 @@ from src.utils.memory import (
     HostBudget,
     admit_workers,
     resolve_host_budget,
-    resolve_resources,
 )
 from src.utils.parallel import TrainingJob, TrainingOrchestrator
+from src.utils.resources import resolve_resources
 from src.utils.training import train_single_run
 
 GB = 1024**3
@@ -91,30 +91,17 @@ def _job(processed: str, emb_path: str | None, **hp) -> TrainingJob:
 
 
 class TestResourcesBlock:
+    """The block itself is covered by tests/test_resources_config.py; here only
+    what the admission path reads from it."""
+
     def test_defaults_are_conservative_and_dense(self) -> None:
         resources = resolve_resources({})
-        assert resources.host_budget_bytes is None
-        assert resources.headroom_bytes == memory_mod.RESERVED_BYTES
-        assert resources.max_workers is None
-        assert resources.feature_residency == "dense"
-
-    @pytest.mark.parametrize(
-        "block",
-        [
-            {"host_budget_bytes": -1},
-            {"headroom_bytes": float("nan")},
-            {"max_workers": float("inf")},
-            {"feature_residency": "sometimes"},
-            {"unknown": 1},
-            {"host_budget_bytes": True},
-        ],
-    )
-    def test_invalid_values_are_rejected(self, block) -> None:
-        with pytest.raises(ValueError):
-            resolve_resources({"resources": block})
+        assert resources.host.budget_bytes is None
+        assert resources.host.headroom_bytes == 4 * GB
+        assert resources.features.residency == "dense"
 
     def test_explicit_budget_wins_and_is_reported(self) -> None:
-        budget = resolve_host_budget({"resources": {"host_budget_bytes": 3 * GB}})
+        budget = resolve_host_budget({"resources": {"host": {"budget_bytes": 3 * GB}}})
         assert (budget.limit_bytes, budget.source) == (3 * GB, "config")
 
 
@@ -192,11 +179,13 @@ class TestAdmitWorkers:
         assert "exceeds the usable budget" in plan.reason
 
     def test_unknown_footprint_admits_one_worker_conservatively(self) -> None:
-        plan = admit_workers(0, hard_cap=8, budget=self._budget(64))
+        plan = admit_workers(0, hard_cap=8, budget=self._budget(64), headroom_bytes=4 * GB)
         assert plan.admitted and plan.n_workers == 1
 
     def test_max_workers_zero_admits_nothing(self) -> None:
-        plan = admit_workers(GB, hard_cap=8, budget=self._budget(64), max_workers=0)
+        plan = admit_workers(
+            GB, hard_cap=8, budget=self._budget(64), headroom_bytes=4 * GB, max_workers=0
+        )
         assert not plan.admitted and plan.n_workers == 0
 
     def test_orchestrator_enforces_the_plan(self, tmp_path) -> None:
@@ -205,7 +194,7 @@ class TestAdmitWorkers:
             n_workers=8, device="cuda", log_dir=str(tmp_path), admission=plan
         )
         assert pool.n_workers == 3
-        refused = admit_workers(50 * GB, hard_cap=1, budget=self._budget(8))
+        refused = admit_workers(50 * GB, hard_cap=1, budget=self._budget(8), headroom_bytes=4 * GB)
         with pytest.raises(AdmissionError):
             TrainingOrchestrator(
                 n_workers=1, device="cpu", log_dir=str(tmp_path), admission=refused
@@ -219,7 +208,7 @@ class TestPlanTrainingAdmission:
         processed, emb = _write_dataset(tmp_path)
         huge = Path(emb) / "synthetic" / "huge.npy"
         np.save(huge, np.zeros((N_ITEMS, 4), dtype=np.float32))
-        config = {"resources": {"host_budget_bytes": 2 * GB, "headroom_bytes": 0}}
+        config = {"resources": {"host": {"budget_bytes": 2 * GB, "headroom_bytes": 0}}}
         small = _job(processed, None)
         big = _job(processed, str(huge))
         monkeypatch.setattr(
@@ -253,7 +242,7 @@ class TestPlanTrainingAdmission:
             "seed": 1,
             "paths": {"data_processed": processed, "embeddings": emb, "results": str(tmp_path)},
             "recommenders_enabled": ["vbpr"],
-            "resources": {"host_budget_bytes": 1, "headroom_bytes": 0},
+            "resources": {"host": {"budget_bytes": 1, "headroom_bytes": 0}},
         }
         launched: list[int] = []
 
@@ -280,15 +269,16 @@ class TestPlanTrainingAdmission:
         feature = str(Path(emb) / "synthetic" / "resnet50.npy")
         tiny_budget = {
             "resources": {
-                "host_budget_bytes": 2 * GB + 100,
-                "headroom_bytes": 2 * GB,
-                "feature_residency": "auto",
+                "host": {"budget_bytes": 2 * GB + 100, "headroom_bytes": 2 * GB},
+                "features": {"residency": "auto"},
             }
         }
+        lazy = {"resources": {"features": {"residency": "lazy"}}}
+        auto = {"resources": {"features": {"residency": "auto"}}}
         assert lazy_features_for(tiny_budget, feature) is True
-        assert lazy_features_for({"resources": {"feature_residency": "lazy"}}, feature) is True
+        assert lazy_features_for(lazy, feature) is True
         assert lazy_features_for({}, feature) is False
-        assert lazy_features_for({"resources": {"feature_residency": "auto"}}, feature) is False
+        assert lazy_features_for(auto, feature) is False
 
 
 class TestLazyPathIsNumericallyIdentical:

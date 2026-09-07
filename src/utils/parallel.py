@@ -30,24 +30,9 @@ import torch.multiprocessing as mp
 from src.utils.atomic_io import atomic_write
 from src.utils.logging import get_logger
 from src.utils.memory import AdmissionPlan, available_cpus, plan_pool_workers
+from src.utils.resources import ResourcesConfig, resolve_resources
 
 logger = get_logger(__name__)
-
-#: Share of a worker's GPU allowance the validation ranking may hold.
-#: The remainder covers the model, its embedding tables, the optimiser
-#: state and the autograd graph.
-#:
-#: Lowered from 0.5 on 2026-09-04.  The card that trains is also the one
-#: that draws the researcher's desktop: a ranking batch sized to fill
-#: half of 16 GB issues kernels long enough that the compositor never
-#: gets a slice, which freezes the machine (and, on 2026-09-01, tripped
-#: the display driver's watchdog).  A quarter halves the user-batch, so
-#: the same work arrives as more, shorter kernels.  Cost: a few percent
-#: of validation time.  Metrics are unaffected -- the batch size is how
-#: the ranking is computed, not what it computes.  An eighth (2026-09-06)
-#: halves the kernel length again so the compositor keeps its slice
-#: while the card is shared with the desktop.
-_RANKING_VRAM_SHARE = 0.125
 
 #: Factor the ranking budget is multiplied by per OOM retry.  Halving
 #: halves the user-batch, which is what actually overflowed: the ranking
@@ -394,7 +379,9 @@ class _JobRegistry:
         )
 
 
-def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
+def detect_max_workers(
+    device: str = "cuda", per_worker_bytes: int = 0, *, reserve_bytes: int
+) -> int:
     """Estimate how many training workers fit in GPU VRAM *and* host RAM.
 
     Uses a simple heuristic based on total VRAM rather than dummy-model
@@ -408,7 +395,8 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
     given, the host-memory budget lowers the count accordingly; the
     default of ``0`` means "unknown", which is charged the conservative
     :data:`UNKNOWN_WORKER_FOOTPRINT_BYTES` per worker (M06) instead of
-    being read as "no host memory needed".
+    being read as "no host memory needed".  *reserve_bytes*
+    (``resources.host.reserved_bytes``) is withheld from the host budget.
     """
     if per_worker_bytes <= 0:
         per_worker_bytes = UNKNOWN_WORKER_FOOTPRINT_BYTES
@@ -417,6 +405,7 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
         return plan_pool_workers(
             per_worker_bytes=per_worker_bytes,
             hard_cap=cpu_cap,
+            reserve_bytes=reserve_bytes,
             label="training pool",
         )
 
@@ -450,6 +439,7 @@ def detect_max_workers(device: str = "cuda", per_worker_bytes: int = 0) -> int:
     return plan_pool_workers(
         per_worker_bytes=per_worker_bytes,
         hard_cap=n_workers,
+        reserve_bytes=reserve_bytes,
         label="training pool",
     )
 
@@ -496,7 +486,6 @@ class _WorkerContext:
         from src.utils.checkpoint import CheckpointManager
 
         self._wlog = wlog
-        self._worker_vram = _probe_worker_vram(n_workers, wlog)
         if config is None:
             from src.utils.config import load_config
 
@@ -506,6 +495,10 @@ class _WorkerContext:
             )
             config = load_config()
         self._config = config
+        self._resources: ResourcesConfig = resolve_resources(config)
+        self._worker_vram = _probe_worker_vram(
+            n_workers, wlog, vram_share=self._resources.gpu.vram_share
+        )
         self._checkpoint_mgr = CheckpointManager(checkpoint_root(config))
         # One slot each: an unbounded cache here is what OOM-killed the
         # worker mid-run.  See :class:`SingleSlotCache`.
@@ -561,12 +554,14 @@ class _WorkerContext:
     def _ranking_budget(self, job: TrainingJob) -> int | None:
         # Each OOM retry halves the ranking budget, which halves the
         # user-batch the evaluator can afford.  Without this the job
-        # came back byte-for-byte identical and OOM'd again.
+        # came back byte-for-byte identical and OOM'd again.  The share
+        # (``resources.gpu.ranking_vram_share``) bounds the kernel length
+        # of one ranking batch; the remainder of the allowance covers the
+        # model, its tables, the optimiser state and the autograd graph.
         if not self._worker_vram:
             return None
-        budget = int(
-            self._worker_vram * _RANKING_VRAM_SHARE * _OOM_SHRINK_PER_RETRY**job.retry_count
-        )
+        share = self._resources.gpu.ranking_vram_share
+        budget = int(self._worker_vram * share * _OOM_SHRINK_PER_RETRY**job.retry_count)
         if job.retry_count:
             self._wlog.info(
                 "  Retry %d for %s: ranking budget %.2f GB",
@@ -649,7 +644,7 @@ class _WorkerContext:
         return best_val
 
 
-def _probe_worker_vram(n_workers: int, wlog) -> int:
+def _probe_worker_vram(n_workers: int, wlog, *, vram_share: float) -> int:
     """Cap this process's VRAM and return the byte allowance (0 = unknown)."""
     # The per-process cap and the ranking budget derived from it are the
     # same decision seen from two sides: torch enforces the cap, and the
@@ -662,7 +657,7 @@ def _probe_worker_vram(n_workers: int, wlog) -> int:
     # let a single worker claim all 16 GB of the display GPU.
     from src.utils.device import cap_process_vram
 
-    fraction = cap_process_vram(n_workers)
+    fraction = cap_process_vram(n_workers, vram_share=vram_share)
     try:
         total = torch.cuda.get_device_properties(0).total_memory
         return int(total * fraction)
@@ -799,8 +794,11 @@ class TrainingOrchestrator:
         """
         self.device = device
         self.log_dir = log_dir
+        reserve = resolve_resources(config).host.reserved_bytes
         self.n_workers = (
-            detect_max_workers(device, per_worker_bytes) if n_workers <= 0 else n_workers
+            detect_max_workers(device, per_worker_bytes, reserve_bytes=reserve)
+            if n_workers <= 0
+            else n_workers
         )
         self.admission = admission
         if admission is not None:

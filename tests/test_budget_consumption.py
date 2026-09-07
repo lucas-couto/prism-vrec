@@ -108,7 +108,6 @@ def _config(tmp_path: Path, **budget_override) -> dict:
         },
         "hp_search": {
             "strategy": "fixed",
-            "workers": 1,
             "optuna": {"n_trials": 5, "sampler": "random", "pruner": "none", "storage": None},
         },
         "hp_budget": {DATASET: budget_override} if budget_override else {},

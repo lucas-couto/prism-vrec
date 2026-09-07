@@ -54,6 +54,7 @@ from src.utils.identity import (
     resolve_data_identity,
 )
 from src.utils.logging import get_logger
+from src.utils.resources import resolve_resources
 
 logger = get_logger(__name__)
 
@@ -240,6 +241,7 @@ def _load_best_model(
         config=model_config,
         **kwargs,
     ).to(device)
+    model.configure_item_block(resolve_resources(cfg).features.item_block)
     model.load_state_dict(saved["model_state"])
     return model, saved["hyperparams"]
 

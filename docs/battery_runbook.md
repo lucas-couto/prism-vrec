@@ -27,16 +27,36 @@ failures.
 
 ## Launch
 
-The run takes half the machine by default (`mem_limit` 16g, 8 cores,
-half the VRAM). For an unattended window raise the VRAM share for that
-launch only:
+The run takes half the host by default (`mem_limit` 16g and 8 cores in
+`docker-compose.yml`) and, since the batteries run overnight, 0.95 of
+the card (`resources.gpu.vram_share` in `configs/resources.yaml`, which
+also holds the worker counts, the host headroom, the DataLoader pins
+and the feature residency). Above ~0.85 the desktop's own GPU
+allocations are no longer guaranteed, so for a daytime launch lower
+the share for that launch only:
 
 ```bash
-PRISM_VRAM_SHARE=0.95 docker compose up -d   # overnight; back to the default next morning
+PRISM_VRAM_SHARE=0.5 docker compose up -d   # while someone works at the workstation
 ```
 
-Above ~0.85 the desktop's own GPU allocations are no longer guaranteed;
-use it only while nobody is at the workstation.
+**One dataset per night, without editing tracked files.** The loader
+merges every `configs/*.yaml` alphabetically after `default.yaml`; a
+later file wins and lists are replaced whole. `configs/zz_local.yaml`
+is git-ignored and sorts last, so it is the place for the night's
+narrowing:
+
+```yaml
+# configs/zz_local.yaml (untracked)
+datasets: ["amazon_fashion"]
+pipeline:
+  run_all: false           # REQUIRED: start_from / stop_at are ignored while run_all is true
+  start_from: null
+  stop_at: beyond_accuracy # run the statistical / consolidation steps once at the end
+```
+
+The easy mistake is leaving `run_all: true`: the range keys are then
+dead and the whole pipeline runs (`tests/test_local_override.py` pins
+this). `--show-plan` prints the steps the merged YAML resolves to.
 
 ```
 uv run python main.py --battery
@@ -106,8 +126,8 @@ estimate", never guessed.
 
 ## Failures and retry
 
-- **Fusion runs on one worker** (`MAX_FUSION_WORKERS = 1` in
-  `src/steps/fuse.py`, decided 2026-09-06 after two PCA workers were
+- **Fusion runs on one worker** (`resources.workers.fusion: 1` in
+  `configs/resources.yaml`, decided 2026-09-06 after two PCA workers were
   OOM-killed in the 16 GB container). A worker that vanishes mid-task
   now raises `FusionWorkerLostError` with the completed count and the
   container cgroup's `oom_kill` counter; finished outputs are reused on
@@ -188,13 +208,17 @@ users × systems matrix for the statistical tests comes from
   explicitly, writes the `_restricted` partition and reports the
   excluded counts per row. Read the `_integrity.json` first when the
   step fails.
-- `resources:` (`configs/default.yaml`, commented; key names
-  provisional pending approval): `host_budget_bytes`, `headroom_bytes`
-  (default 4 GiB), `max_workers`, `feature_residency` (`dense` |
-  `lazy` | `auto`). Absent, the budget resolves from the cgroup limit
-  (v2, then v1, then host RAM, then a 4 GiB fallback — never
-  unlimited) and features stay dense. The ledger is analytic: no peak
-  has been measured on a real catalogue.
+- `resources:` (`configs/resources.yaml`, key names approved
+  2026-09-07): `gpu.{vram_share,ranking_vram_share}`,
+  `host.{budget_bytes,headroom_bytes,reserved_bytes}`,
+  `workers.{training,fusion,dataloader}`,
+  `dataloader.{prefetch_factor,batch_size}`,
+  `features.{residency,item_block}`. With `host.budget_bytes: null`
+  the budget resolves from the cgroup limit (v2, then v1, then host
+  RAM, then a 4 GiB fallback — never unlimited) and features stay
+  dense. The resolved block is recorded under `manifest['resources']`.
+  The ledger is analytic: no peak has been measured on a real
+  catalogue.
 - `diagnostics:` (`configs/default.yaml`, `enabled: false`): opt-in
   bounded probes per training run under `results/diagnostics/<run_id>.json`
   (feature norms, pre-ReLU branches, score ties, gradients, optimizer

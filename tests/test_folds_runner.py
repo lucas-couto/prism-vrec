@@ -71,7 +71,7 @@ def _config(root: Path, processed: str, embeddings: str, *, enabled: bool = True
             "eval_every_epochs": 1,
             "eval_sample_size": None,
         },
-        "hp_search": {"strategy": "fixed", "workers": 1, "optuna": {"n_trials": 1}},
+        "hp_search": {"strategy": "fixed", "optuna": {"n_trials": 1}},
         "evaluation": {"protocol": "full_ranking"},
         "k_values": [5, 10],
         "folds": {

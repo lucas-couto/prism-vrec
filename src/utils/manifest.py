@@ -39,6 +39,7 @@ from src.utils.atomic_io import atomic_write
 from src.utils.dataloader import describe as describe_dataloader_tune
 from src.utils.device import resolve_device
 from src.utils.logging import get_logger
+from src.utils.resources import resolve_resources
 from src.utils.timing import step_timings as collect_step_timings
 
 logger = get_logger(__name__)
@@ -95,6 +96,10 @@ def start_run(
         "platform": _platform_info(),
         "hardware": _hardware_info(),
         "device": _device_info(config_snapshot.get("device", "auto")),
+        # Execution metadata (configs/resources.yaml with PRISM_VRAM_SHARE
+        # applied): how fast and how much memory, never what is computed,
+        # so it is recorded here and kept out of the scientific identity.
+        "resources": resolve_resources(config_snapshot).to_payload(),
         "dataloader_autotune": describe_dataloader_tune(config_snapshot),
         "package_versions": _package_versions(_TRACKED_PACKAGES),
         "config_snapshot": config_snapshot,
