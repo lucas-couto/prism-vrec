@@ -42,10 +42,10 @@ strategies:
 Run the pipeline normally:
 
 ```bash
-python main.py --from fuse        # builds the JSON sidecar (no .npy)
-python main.py --from train       # the recommender picks up the
-                                  # 3-D buffer and instantiates the
-                                  # gate module automatically
+# configs/zz_local.yaml: pipeline: {run_all: false, start_from: fuse}
+python main.py                    # fuse builds the JSON sidecar (no .npy);
+                                  # train picks up the 3-D buffer and
+                                  # instantiates the gate module automatically
 ```
 
 ## Learned alignment (`alignment.method: learned`)

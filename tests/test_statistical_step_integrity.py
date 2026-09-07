@@ -1,7 +1,7 @@
 """R05 (Q17): aggregate reports validate identity/completeness and partition outputs.
 
 The statistical step wrote ``{dataset}_{kind}.csv`` whatever the condition
-it was asked for, so ``--condition frozen`` followed by ``finetuned``
+it was asked for, so ``pipeline.condition: frozen`` followed by ``finetuned``
 silently overwrote the first comparison; it never reconciled the cells it
 tested against the evaluate step's completion record, and cross-seed
 aggregation counted rows instead of seeds.

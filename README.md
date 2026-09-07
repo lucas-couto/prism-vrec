@@ -141,7 +141,7 @@ results/best_hyperparams.json              # Winning hyperparams per (dataset, m
 results/models/<dataset>/*_best.pt         # Best checkpoint per cell
 ```
 
-The three long-format files at the top consolidate the ~160 granular per-(dataset, test_type, metric, k) CSVs into one row per observation with explicit identifier columns. Use them for thesis-time analysis (`pandas.read_csv` + `df.query`); the granular CSVs are kept for backwards compatibility. Since 3.0.0 the granular files are partitioned by `--condition` and by the population policy (`_restricted` only under `statistical.population: declared_intersection`), so a `frozen` run never overwrites a `finetuned` or `all` one; see [§10](#10-evaluation).
+The three long-format files at the top consolidate the ~160 granular per-(dataset, test_type, metric, k) CSVs into one row per observation with explicit identifier columns. Use them for thesis-time analysis (`pandas.read_csv` + `df.query`); the granular CSVs are kept for backwards compatibility. Since 3.0.0 the granular files are partitioned by `pipeline.condition` and by the population policy (`_restricted` only under `statistical.population: declared_intersection`), so a `frozen` run never overwrites a `finetuned` or `all` one; see [§10](#10-evaluation).
 
 ---
 
@@ -227,7 +227,7 @@ diagnostics:
 # pins, feature residency) live ONLY in configs/resources.yaml; see below.
 ```
 
-CLI flags (`--all` / `--step` / `--from` / `--to` / `--condition`) override the YAML when present.
+The YAML is the only control surface: `pipeline.{run_all,start_from,stop_at,condition}` decide what runs (`start_from` / `stop_at` are ignored while `run_all: true`), and `python main.py --show-plan` prints the resolved plan. The former `--all` / `--step` / `--from` / `--to` / `--condition` / `--hp-search` / `--n-trials` / `--eval-protocol` / `--seeds` flags were removed in 3.0.0; passing one fails naming the YAML key. Per-night narrowing goes in the git-ignored `configs/zz_local.yaml` (see `docs/battery_runbook.md`).
 
 Three blocks were added in 3.0.0 (details in the YAML comments and in `docs/reliability-sdd/`): `diagnostics` (task S04) records bounded, detached probes per training run without changing the trajectory; `resources` (tasks M05/M06, key names approved 2026-09-07 and moved to `configs/resources.yaml`) is the host budget the training jobs are admitted against — a job whose analytic memory ledger does not fit is recorded as failed and never launched, and `features.residency: auto` / `lazy` gathers visual rows per forward from a bounded `FeatureSource` instead of holding the catalogue in a module buffer (numerically identical by test; page-cache residency on real catalogues unmeasured); `statistical.population` lives in `configs/evaluation.yaml` below.
 
@@ -711,13 +711,7 @@ Two protocols are available, selected by `evaluation.protocol`:
 | Preserves model ordering vs ground-truth ranking? | Yes (it *is* the ground-truth ranking) | **No** — Krichene & Rendle (KDD 2020) showed sampled metrics can flip relative model orderings |
 | When to use | Primary thesis / paper number | Only for comparability with prior work that adopted the same protocol |
 
-CLI override:
-
-```bash
-python main.py --all --eval-protocol sampled
-```
-
-YAML knobs (`configs/evaluation.yaml`):
+YAML knobs (`configs/evaluation.yaml`; there is no CLI override):
 
 ```yaml
 evaluation:

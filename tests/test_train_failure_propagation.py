@@ -64,6 +64,13 @@ def _grid_config(tmp_path: Path) -> dict:
     return {
         "device": "cpu",
         "seed": 7,
+        # The YAML is the only control surface: one step, one condition.
+        "pipeline": {
+            "run_all": False,
+            "start_from": "train",
+            "stop_at": "train",
+            "condition": "frozen",
+        },
         "paths": {
             "data_processed": str(tmp_path / "processed"),
             "embeddings": str(tmp_path / "embeddings"),
@@ -189,7 +196,7 @@ class TestCliBoundary:
         bad = _job(scratch, "bad", fail=True)
         self._install(tmp_path, monkeypatch, [good, bad], run_fail_flagged)
 
-        code = main.run_cli(["--step", "train", "--condition", "frozen"])
+        code = main.run_cli([])
 
         assert code == 1
         assert _manifest_status(tmp_path / "results") == "error"
@@ -201,7 +208,7 @@ class TestCliBoundary:
         scratch.mkdir()
         self._install(tmp_path, monkeypatch, [_job(scratch, "ok")], run_succeed)
 
-        code = main.run_cli(["--step", "train", "--condition", "frozen"])
+        code = main.run_cli([])
 
         assert code == 0
         assert _manifest_status(tmp_path / "results") == "ok"

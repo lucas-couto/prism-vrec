@@ -3,46 +3,39 @@
 The pipeline is a fixed sequence of named steps living under
 ``src/steps``.  Each step exposes a ``run(...)`` function; this module
 dispatches the right ones depending on the ``pipeline:`` block in
-``configs/default.yaml`` and (optionally) command-line flags.
+``configs/default.yaml``.
 
-Defaults, what runs when nothing is specified
-----------------------------------------------
-``configs/default.yaml`` has a ``pipeline:`` block whose values are the
-defaults used when no CLI flags are passed.  ``docker compose up -d
---build`` therefore runs the full pipeline end-to-end without any
-arguments.
+The YAML is the only control surface for run configuration
+----------------------------------------------------------
+Which steps run, for which condition, with which search strategy,
+protocol and seeds is decided by the merged ``configs/*.yaml`` and by
+nothing else, so a run reproduces from ``git checkout`` plus the
+untracked ``configs/zz_local.yaml`` of the night.  Example::
 
-To change what runs, edit that YAML.  Example::
-
-    # configs/default.yaml
+    # configs/default.yaml (or configs/zz_local.yaml, merged last)
     pipeline:
-      run_all: false
+      run_all: false          # start_from / stop_at are ignored while true
       start_from: train
-      condition: finetuned
+      stop_at: beyond_accuracy
+      condition: finetuned    # frozen | finetuned | both
 
-CLI flags always override the YAML when present.
+    hp_search:
+      strategy: optuna        # configs/recommenders.yaml
+      optuna:
+        n_trials: 30
+    evaluation:
+      protocol: full_ranking  # configs/evaluation.yaml
+    seeds: [42, 99, 7]        # multi-seed run
 
-Examples
---------
-Run the full pipeline (frozen + finetuned, both batteries), also the
-default behaviour::
+``python main.py`` (and ``docker compose up -d --build``) runs that
+plan; ``python main.py --show-plan`` prints it without running.  The
+remaining flags are tools around the run (``--battery``, ``--folds``,
+``--report``, ``--inspect-pending``, ``--validate-*``, ``--list-*``,
+``--config-dir``).  The former step / condition / search / protocol /
+seed flags were removed (3.0.0, by the researcher's decision); passing
+one fails with the YAML key that replaced it.
 
-    python main.py
-    python main.py --all
-
-Run only the fine-tuning step::
-
-    python main.py --step finetune
-
-Resume from training onwards (skip download/preprocess/extract/finetune)::
-
-    python main.py --from train
-
-Limit to one condition for the steps that take ``--condition``::
-
-    python main.py --step train --condition finetuned
-
-The script never re-orders steps: ``--from`` / ``--to`` and the step
+The script never re-orders steps: ``start_from`` / ``stop_at`` and the
 ordering enforced by :data:`STEP_ORDER` always reflect the natural
 pipeline order.
 """
@@ -86,8 +79,8 @@ from src.utils.resources import resolve_resources  # noqa: E402
 logger = get_logger("main")
 
 
-# Steps that take a ``--condition`` argument (frozen / finetuned).  When
-# ``condition == "both"``, these run twice, once per condition.
+# Steps that take a condition (frozen / finetuned).  When
+# ``pipeline.condition == "both"``, these run twice, once per condition.
 CONDITION_STEPS = {"fuse", "train", "evaluate"}
 
 # Steps whose work is meaningful only for the *frozen* battery.  When
@@ -284,34 +277,45 @@ def _run_steps(names: list[str], condition: str | None, run_both_conditions: boo
             _run_step(name, condition)
 
 
+#: Flags removed in 3.0.0 (the YAML is the only control surface) and
+#: the key that provides each one's behaviour.  Passing one fails with
+#: argparse's standard error plus this hint.
+REMOVED_FLAGS: dict[str, str] = {
+    "--all": "pipeline.run_all: true (configs/default.yaml)",
+    "--step": "pipeline.run_all: false with start_from and stop_at set to the step",
+    "--from": "pipeline.run_all: false with pipeline.start_from",
+    "--to": "pipeline.run_all: false with pipeline.stop_at",
+    "--condition": "pipeline.condition (frozen | finetuned | both)",
+    "--hp-search": "hp_search.strategy (configs/recommenders.yaml)",
+    "--n-trials": "hp_search.optuna.n_trials (configs/recommenders.yaml)",
+    "--eval-protocol": "evaluation.protocol (configs/evaluation.yaml)",
+    "--seeds": "seeds: [...] (configs/default.yaml)",
+}
+
+
+def _reject_removed_flags(parser: argparse.ArgumentParser, argv: list[str]) -> None:
+    """Fail loud on a removed flag, naming the YAML key that replaced it."""
+    for token in argv:
+        flag = token.split("=", 1)[0]
+        if flag in REMOVED_FLAGS:
+            parser.error(
+                f"{flag} was removed: the YAML is the only control surface; "
+                f"set {REMOVED_FLAGS[flag]} instead"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the prism-vrec pipeline.  "
-            "With no flags, reads defaults from configs/default.yaml "
-            "(pipeline: section)."
+            "Run the prism-vrec pipeline as configured by configs/*.yaml "
+            "(pipeline: section).  Flags are tools around the run, never "
+            "overrides of the YAML."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument(
-        "--all",
-        action="store_true",
-        help="Run every step end-to-end (overrides the YAML).",
-    )
-    selection.add_argument(
-        "--step",
-        choices=STEP_ORDER,
-        help="Run a single step by name (overrides the YAML).",
-    )
-    selection.add_argument(
-        "--from",
-        dest="from_",
-        choices=STEP_ORDER,
-        help="Run from this step to the end of the pipeline (overrides the YAML).",
-    )
     selection.add_argument(
         "--inspect-pending",
         choices=["frozen", "finetuned"],
@@ -345,7 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-plan",
         action="store_true",
         help=(
-            "Resolve the pipeline plan from CLI + YAML and print which "
+            "Resolve the pipeline plan from the merged YAML and print which "
             "steps would run (with condition filtering applied), then exit."
         ),
     )
@@ -423,71 +427,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--to",
-        choices=STEP_ORDER,
-        help="When used with --from, stop at this step (inclusive).",
-    )
-
-    parser.add_argument(
-        "--condition",
-        choices=["frozen", "finetuned", "both"],
-        default=None,
-        help=(
-            "Condition for fuse/train/evaluate steps.  Defaults to the "
-            "value set in configs/default.yaml under pipeline.condition."
-        ),
-    )
-
-    parser.add_argument(
         "--config-dir",
         default=None,
         metavar="PATH",
         help=(
             "Alternative directory of YAML config files (an ablation or "
             "validation profile that overrides configs/).  Defaults to 'configs/'."
-        ),
-    )
-
-    parser.add_argument(
-        "--hp-search",
-        choices=["grid", "optuna", "fixed"],
-        default=None,
-        help=(
-            "Override the hyperparameter-search strategy "
-            "(``grid`` or ``optuna``).  Defaults to the value in "
-            "configs/recommenders.yaml under hp_search.strategy."
-        ),
-    )
-    parser.add_argument(
-        "--eval-protocol",
-        choices=["full_ranking", "sampled"],
-        default=None,
-        help=(
-            "Override the evaluation protocol.  Defaults to the value "
-            "in configs/evaluation.yaml under evaluation.protocol "
-            "(full_ranking).  See README §10 for the trade-off."
-        ),
-    )
-    parser.add_argument(
-        "--seeds",
-        default=None,
-        metavar="N1,N2,...",
-        help=(
-            "Comma-separated list of seeds for a multi-seed run.  Each "
-            "seed runs the pipeline once under suffixed result/checkpoint "
-            "paths (results_seed<N>, checkpoints_seed<N>) and an "
-            "aggregation pass writes mean/std/median across seeds.  "
-            "Overrides ``seeds`` in configs/default.yaml when present."
-        ),
-    )
-    parser.add_argument(
-        "--n-trials",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Override hp_search.optuna.n_trials per cell.  Ignored "
-            "when --hp-search is grid (or grid is the YAML default)."
         ),
     )
 
@@ -582,10 +527,10 @@ def _validate_dataset(name: str) -> int:
     return 1
 
 
-def _show_plan(args: argparse.Namespace) -> None:
-    """Resolve the plan and print which steps would run, then exit."""
+def _show_plan() -> None:
+    """Resolve the plan from the merged YAML and print which steps would run."""
     config = load_config()
-    steps, condition, run_both = _resolve_plan(args, config)
+    steps, condition, run_both = _resolve_plan(config)
 
     print(
         f"Plan resolved with condition={'both' if run_both else condition!r} ({len(steps)} steps):",
@@ -636,50 +581,29 @@ def _inspect_pending(condition: str) -> None:
         print(f"  {ds:16s} {n:>14d}")
 
 
-def _resolve_plan(
-    args: argparse.Namespace, config: dict[str, Any]
-) -> tuple[list[str], str | None, bool]:
-    """Decide which steps to run, with which condition, given CLI + YAML.
+def _resolve_plan(config: dict[str, Any]) -> tuple[list[str], str | None, bool]:
+    """Decide which steps to run, with which condition, from the merged YAML.
 
     Resolution rules
     ----------------
-    1. Selection mode (which steps):
-       - ``--all`` / ``--step`` / ``--from`` win over the YAML.
-       - Otherwise, the YAML's ``pipeline.run_all`` controls the behaviour:
-         * ``true``  → run every step.
-         * ``false`` → use ``pipeline.start_from`` / ``pipeline.stop_at``.
-
-    2. Condition (which condition for fuse/train/evaluate):
-       - ``--condition`` wins.
-       - Otherwise, the YAML's ``pipeline.condition`` is used (default ``both``).
-
-    3. Condition-based filtering (only when the step list was derived
-       automatically, never when the user pinned a specific step via
-       ``--step``):
-       - ``condition: frozen``    → drop ``finetune`` / ``evaluate_finetuning``.
-       - ``condition: finetuned`` → drop ``extract`` (FT does its own
-         re-extraction).
+    1. Selection (``pipeline:``): ``run_all: true`` runs every step;
+       ``false`` uses ``start_from`` / ``stop_at`` (both inclusive,
+       ``null`` = the ends of :data:`STEP_ORDER`).  The range keys are
+       ignored while ``run_all`` is ``true``.
+    2. Condition: ``pipeline.condition`` (default ``both``).
+    3. Condition filtering: ``frozen`` drops ``finetune`` /
+       ``evaluate_finetuning``; ``finetuned`` drops ``extract`` (the FT
+       step does its own re-extraction).  A plan that ends up empty is
+       an error, not a silent no-op.
     """
     pipeline_cfg = config.get("pipeline", {})
 
-    user_pinned_step = bool(args.step)
-
-    if args.all:
+    if pipeline_cfg.get("run_all", True):
         steps = list(STEP_ORDER)
-    elif args.step:
-        steps = [args.step]
-    elif args.from_:
-        steps = _slice_steps(args.from_, args.to)
     else:
-        if pipeline_cfg.get("run_all", True):
-            steps = list(STEP_ORDER)
-        else:
-            steps = _slice_steps(
-                pipeline_cfg.get("start_from"),
-                pipeline_cfg.get("stop_at"),
-            )
+        steps = _slice_steps(pipeline_cfg.get("start_from"), pipeline_cfg.get("stop_at"))
 
-    cond = args.condition or pipeline_cfg.get("condition", "both")
+    cond = pipeline_cfg.get("condition", "both")
     if cond not in {"frozen", "finetuned", "both"}:
         raise ValueError(
             f"pipeline.condition must be 'frozen', 'finetuned' or 'both', got {cond!r}"
@@ -688,18 +612,28 @@ def _resolve_plan(
     run_both = cond == "both"
     condition = None if run_both else cond
 
-    if not user_pinned_step and not run_both:
+    if not run_both:
         steps = _filter_steps_by_condition(steps, cond)
+    if not steps:
+        raise ValueError(
+            f"pipeline resolved to no steps: start_from={pipeline_cfg.get('start_from')!r} "
+            f"stop_at={pipeline_cfg.get('stop_at')!r} are all irrelevant to "
+            f"pipeline.condition={cond!r}"
+        )
 
     return steps, condition, run_both
+
+
+def _plan_record(steps: list[str], condition: str | None, run_both: bool) -> dict[str, Any]:
+    """The resolved plan as written to ``manifest['plan']``."""
+    return {"steps": list(steps), "condition": "both" if run_both else condition}
 
 
 def _filter_steps_by_condition(steps: list[str], condition: str) -> list[str]:
     """Drop steps whose work is irrelevant to the chosen battery.
 
     Logs every dropped step so the user always knows which work was
-    skipped and why.  When the user explicitly pinned a step via
-    ``--step`` this filter is bypassed (see :func:`_resolve_plan`).
+    skipped and why.
     """
     if condition == "frozen":
         irrelevant = FINETUNED_ONLY_STEPS
@@ -723,6 +657,7 @@ def _filter_steps_by_condition(steps: list[str], condition: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
+    _reject_removed_flags(parser, sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
 
     if args.config_dir:
@@ -743,7 +678,7 @@ def main(argv: list[str] | None = None) -> None:
         _list_datasets()
         return
     if args.show_plan:
-        _show_plan(args)
+        _show_plan()
         return
     if args.validate_dataset:
         sys.exit(_validate_dataset(args.validate_dataset))
@@ -795,27 +730,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     config = load_config()
-    if args.hp_search is not None:
-        config.setdefault("hp_search", {})["strategy"] = args.hp_search
-    if args.n_trials is not None:
-        hp_cfg = config.setdefault("hp_search", {})
-        hp_cfg.setdefault("optuna", {})["n_trials"] = args.n_trials
-    if args.eval_protocol is not None:
-        config.setdefault("evaluation", {})["protocol"] = args.eval_protocol
-    if args.seeds is not None:
-        try:
-            seeds_override = [int(s) for s in args.seeds.split(",") if s.strip()]
-        except ValueError as exc:
-            raise SystemExit(
-                f"--seeds expects a comma-separated list of integers, got {args.seeds!r}: {exc}"
-            ) from exc
-        if not seeds_override:
-            raise SystemExit("--seeds must contain at least one integer")
-        if len(set(seeds_override)) != len(seeds_override):
-            raise SystemExit("--seeds entries must be unique")
-        config["seeds"] = seeds_override
-
-    steps, condition, run_both = _resolve_plan(args, config)
+    steps, condition, run_both = _resolve_plan(config)
     _log_resource_plan(config)
 
     from src.utils.logging import session_log_path
@@ -906,7 +821,11 @@ def _run_single(
     from src.utils.timing import bind_run_dir
 
     results_root = Path(config.get("paths", {}).get("results", "results"))
-    run_dir = start_run(config_snapshot=config, results_root=results_root / "runs")
+    run_dir = start_run(
+        config_snapshot=config,
+        results_root=results_root / "runs",
+        plan=_plan_record(steps, condition, run_both),
+    )
     bind_run_dir(run_dir)
     # One sampler for the whole invocation; every step and cell slices its
     # own window out of the shared series.

@@ -35,8 +35,7 @@ def _configs(tmp_path: Path, local: dict | None) -> Path:
 
 
 def _plan(config: dict) -> list[str]:
-    args = main.build_parser().parse_args([])
-    steps, _condition, _run_both = main._resolve_plan(args, config)
+    steps, _condition, _run_both = main._resolve_plan(config)
     return steps
 
 

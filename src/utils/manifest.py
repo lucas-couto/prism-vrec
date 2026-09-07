@@ -75,12 +75,14 @@ def start_run(
     *,
     results_root: str | Path = "results/runs",
     seed: int | None = None,
+    plan: dict[str, Any] | None = None,
 ) -> Path:
     """Create a new run directory and write the initial manifest.
 
     Returns the absolute path to the run directory.  The caller is
     expected to pass the same path to :func:`finish_run` (or to read it
-    from the returned ``Path``).
+    from the returned ``Path``).  ``plan`` is the pipeline plan the YAML
+    resolved to (``steps`` and ``condition``), recorded verbatim.
     """
     run_id = _make_run_id()
     run_dir = Path(results_root) / run_id
@@ -92,6 +94,7 @@ def start_run(
         "started_at_epoch": time.time(),
         "git": _git_info(),
         "seed": seed if seed is not None else config_snapshot.get("seed"),
+        "plan": plan,
         "hostname": socket.gethostname(),
         "platform": _platform_info(),
         "hardware": _hardware_info(),
