@@ -46,6 +46,34 @@ Dates are UTC.
   the trap that `start_from` / `stop_at` are ignored while `run_all:
   true` (`tests/test_local_override.py`).
 
+### Changed
+
+- **The YAML is the only control surface for run configuration** (by
+  the researcher's decision, 2026-09-07). The flags that duplicated
+  YAML keys were removed from `main.py`; passing one fails with
+  argparse's usage error plus the key that replaces it. The resolved
+  plan is printed by `--show-plan` and recorded under
+  `manifest['plan']` (`steps`, `condition`); a plan the condition
+  filter empties is an error instead of a silent no-op. The
+  `bootstrap` compose service writes the step range into the same
+  transient override it already used for `datasets`.
+
+  | Removed flag | YAML key |
+  |---|---|
+  | `--all` | `pipeline.run_all: true` |
+  | `--step NAME` | `pipeline.run_all: false`, `start_from: NAME`, `stop_at: NAME` |
+  | `--from STEP` / `--to STEP` | `pipeline.run_all: false`, `pipeline.start_from` / `pipeline.stop_at` |
+  | `--condition` | `pipeline.condition` |
+  | `--hp-search` | `hp_search.strategy` |
+  | `--n-trials` | `hp_search.optuna.n_trials` |
+  | `--eval-protocol` | `evaluation.protocol` |
+  | `--seeds` | `seeds: [...]` |
+
+  Kept: `--battery`, `--folds`, `--battery-status`, `--retry-failed`,
+  `--report`, `--report-metric`, `--report-top`, `--show-plan`,
+  `--inspect-pending`, `--validate-dataset`, `--validate-features`,
+  `--list-*`, `--config-dir`.
+
 ### Removed
 
 - The duplicate sources of the limits above, each replaced by one

@@ -14,12 +14,9 @@ hp_search:
   strategy: "optuna"   # or "grid"
 ```
 
-CLI override (one-off, does not edit the YAML):
-
-```bash
-python main.py --hp-search optuna --n-trials 30
-python main.py --hp-search grid
-```
+There is no CLI override: for a one-off change put the same keys
+(`hp_search.strategy`, `hp_search.optuna.n_trials`) in the git-ignored
+`configs/zz_local.yaml`, which is merged last.
 
 ---
 

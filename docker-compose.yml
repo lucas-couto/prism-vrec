@@ -113,8 +113,10 @@ services:
         max-file: "5"
 
   # One-shot helper to fetch + preprocess amazon_fashion.  Narrows the
-  # dataset list to amazon_fashion only via a transient YAML override
-  # (configs/default.yaml normally lists all four DVBPR datasets).
+  # dataset list to amazon_fashion and the step range to download ->
+  # preprocess via a transient YAML override (the YAML is the only
+  # control surface; configs/default.yaml normally lists all four DVBPR
+  # datasets and runs every step).
   bootstrap:
     build: .
     profiles: ["tools"]
@@ -146,9 +148,9 @@ services:
       - |
         set -e
         OVERRIDE=configs/zz_bootstrap_override.yaml
-        printf 'datasets:\n  - amazon_fashion\n' > "$$OVERRIDE"
+        printf 'datasets:\n  - amazon_fashion\npipeline:\n  run_all: false\n  start_from: download\n  stop_at: preprocess\n' > "$$OVERRIDE"
         trap 'rm -f "$$OVERRIDE"' EXIT
-        python main.py --from download --to preprocess
+        python main.py
     shm_size: "2g"
     mem_limit: ${PRISM_MEM_LIMIT:-16g}
     memswap_limit: ${PRISM_MEM_LIMIT:-16g}

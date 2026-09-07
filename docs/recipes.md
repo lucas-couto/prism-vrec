@@ -7,8 +7,11 @@ and runs from the repo root with `python main.py` (or
 
 The pipeline is **opt-in** by configuration: empty `*_enabled` lists
 auto-skip the matching step, `pipeline.condition` toggles the
-fine-tuning battery, and `--step` / `--from` / `--to` give per-run
-overrides. None of these knobs is mutually exclusive.
+fine-tuning battery, and `pipeline.run_all` / `start_from` / `stop_at`
+pick the step range (the range keys are ignored while `run_all: true`).
+The YAML is the only control surface — there are no CLI overrides —
+so put per-run edits in the git-ignored `configs/zz_local.yaml`, which
+is merged last. None of these knobs is mutually exclusive.
 
 > See [`docs/extending.md`](extending.md) for how to add new
 > extractors, fusions, recommenders or datasets to the registry.
@@ -25,13 +28,8 @@ full-ranking against the catalogue.  The two protocols are
 orderings can flip between them — so use this only for direct
 comparability with that prior work, never as your primary number.
 
-CLI override (no YAML edit needed):
-
-```bash
-python main.py --all --eval-protocol sampled
-```
-
-Or pin it permanently in `configs/evaluation.yaml`:
+Pin it in `configs/evaluation.yaml` (or in `configs/zz_local.yaml`
+for one run):
 
 ```yaml
 evaluation:
@@ -57,12 +55,6 @@ YAML:
 ```yaml
 # configs/default.yaml
 seeds: [42, 99, 7]
-```
-
-Or CLI:
-
-```bash
-python main.py --all --seeds 42,99,7
 ```
 
 What happens:
@@ -202,7 +194,8 @@ extractors_enabled:
 # Extract + train + evaluate only the new extractor's slice; the
 # existing .npy / checkpoint files for resnet50 and vit_b16 are
 # detected and skipped automatically (idempotent steps).
-python main.py --from extract
+# configs/zz_local.yaml: pipeline: {run_all: false, start_from: extract}
+python main.py
 ```
 
 ---
@@ -220,10 +213,16 @@ pipeline:
   condition: frozen
 ```
 
+```yaml
+# configs/zz_local.yaml
+pipeline:
+  run_all: false
+  start_from: preprocess
+  stop_at: train
+```
+
 ```bash
-python main.py --step preprocess
-python main.py --step extract
-python main.py --step train
+python main.py
 ```
 
 The fixed step ordering keeps `download` at the top of the list, but
@@ -238,8 +237,13 @@ Existing v2 fine-tuning checkpoints under `checkpoints/finetuning/`
 are scanned and post-hoc metrics (top-K, F1, confusion matrix) are
 written to `results/finetuning/`.
 
+```yaml
+# configs/zz_local.yaml
+pipeline: { run_all: false, start_from: evaluate_finetuning, stop_at: evaluate_finetuning, condition: finetuned }
+```
+
 ```bash
-python main.py --step evaluate_finetuning
+python main.py
 ```
 
 Idempotent, combinations whose JSON already exists are skipped.
@@ -248,8 +252,13 @@ Idempotent, combinations whose JSON already exists are skipped.
 
 ## 8. "Stop after extraction and ship the embeddings somewhere else"
 
+```yaml
+# configs/zz_local.yaml
+pipeline: { run_all: false, start_from: download, stop_at: extract, condition: frozen }
+```
+
 ```bash
-python main.py --from download --to extract --condition frozen
+python main.py
 ```
 
 The output `.npy` files land under `data/embeddings/<dataset>/`. From
@@ -267,8 +276,9 @@ projection:
   dim: 128
 ```
 
-```bash
-python main.py --from extract --to extract --condition frozen
+```yaml
+# configs/zz_local.yaml
+pipeline: { run_all: false, start_from: extract, stop_at: extract, condition: frozen }
 ```
 
 Writes `<extractor>_p128.npy` next to each native artifact. The native
@@ -328,7 +338,8 @@ my_model:
 ```
 
 ```bash
-python main.py --from train     # train + evaluate + statistical
+# configs/zz_local.yaml: pipeline: {run_all: false, start_from: train}
+python main.py                  # train + evaluate + statistical
 ```
 
 The earlier steps' outputs (extracts, fusions) are reused.
@@ -359,7 +370,8 @@ acf:
 ```
 
 ```bash
-python main.py --from extract   # re-extract to add the *_comp files, then train+eval
+# configs/zz_local.yaml: pipeline: {run_all: false, start_from: extract}
+python main.py                  # re-extract to add the *_comp files, then train+eval
 ```
 
 Notes:
@@ -399,5 +411,4 @@ GPU.
 | `recommenders_enabled` | `configs/recommenders.yaml` | `train` step skips entirely. |
 | `pipeline.condition: frozen` | `configs/default.yaml` | Drops `finetune` + `evaluate_finetuning`. |
 | `pipeline.condition: finetuned` | `configs/default.yaml` | Drops `extract`. |
-| `--step NAME` | CLI | Bypasses the condition filter, runs `NAME` regardless. |
-| `--from STEP --to STEP` | CLI | Slice of `STEP_ORDER`; condition filter still applies. |
+| `pipeline.run_all: false` + `start_from` / `stop_at` | `configs/default.yaml` | Slice of `STEP_ORDER`; the condition filter still applies, and a slice it empties is an error. |
