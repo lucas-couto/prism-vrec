@@ -27,6 +27,17 @@ failures.
 
 ## Launch
 
+The run takes half the machine by default (`mem_limit` 16g, 8 cores,
+half the VRAM). For an unattended window raise the VRAM share for that
+launch only:
+
+```bash
+PRISM_VRAM_SHARE=0.95 docker compose up -d   # overnight; back to the default next morning
+```
+
+Above ~0.85 the desktop's own GPU allocations are no longer guaranteed;
+use it only while nobody is at the workstation.
+
 ```
 uv run python main.py --battery
 ```

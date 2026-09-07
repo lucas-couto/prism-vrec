@@ -8,6 +8,17 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **`PRISM_VRAM_SHARE`** overrides `RUN_RESOURCE_SHARE`
+  (`src/utils/device.py`) through `docker-compose.yml`, like
+  `PRISM_MEM_LIMIT` / `PRISM_CPUS`. Meant for unattended windows: the
+  amazon_women VNPR cells with a 2048-2816-d dense visual buffer and
+  `latent_dim=128` (20 of 976 jobs) do not fit half the card and OOM at
+  construction; `PRISM_VRAM_SHARE=0.95 docker compose up -d` overnight
+  runs their retries without a source edit. Values outside `(0, 1]`
+  fail at import.
+
 ### Fixed
 
 - **Fresh offline fusions were reported as "legacy, alignment

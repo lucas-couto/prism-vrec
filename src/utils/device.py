@@ -16,6 +16,9 @@ turns into the device string the steps pass to PyTorch.
 
 from __future__ import annotations
 
+import math
+import os
+
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,7 +65,38 @@ def resolve_device(requested: str) -> str:
 #: display driver's watchdog.  Lowered from 0.65 to 0.5 on 2026-09-06:
 #: with the browser, IDE and another project's containers on the same
 #: host, the 65% run share still pushed the desktop into swap.
-RUN_RESOURCE_SHARE = 0.5
+DEFAULT_RUN_RESOURCE_SHARE = 0.5
+
+#: Environment override of :data:`RUN_RESOURCE_SHARE`, forwarded by
+#: ``docker-compose.yml`` like ``PRISM_MEM_LIMIT`` / ``PRISM_CPUS``.
+#: Meant for unattended windows -- ``PRISM_VRAM_SHARE=0.95 docker compose
+#: up -d`` overnight lets the amazon_women VNPR cells that do not fit
+#: half the card run without touching the source (2026-09-07).  Anything
+#: above ~0.85 leaves the desktop's own allocations at the driver's
+#: mercy; use it only while nobody sits at the machine.
+RUN_RESOURCE_SHARE_ENV = "PRISM_VRAM_SHARE"
+
+
+def _resolve_run_resource_share() -> float:
+    """``PRISM_VRAM_SHARE`` as a fraction in ``(0, 1]``, else the default.
+
+    An unparsable or out-of-range value fails at import, in the spirit
+    of the single validated environment boundary: a typo must not
+    silently run the battery uncapped or at 5% of the card.
+    """
+    raw = os.environ.get(RUN_RESOURCE_SHARE_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_RUN_RESOURCE_SHARE
+    try:
+        share = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{RUN_RESOURCE_SHARE_ENV}={raw!r} is not a number.") from exc
+    if not math.isfinite(share) or not 0.0 < share <= 1.0:
+        raise ValueError(f"{RUN_RESOURCE_SHARE_ENV}={raw!r} must be a fraction in (0, 1].")
+    return share
+
+
+RUN_RESOURCE_SHARE = _resolve_run_resource_share()
 
 #: VRAM cap for a process that has the card to itself.
 SOLO_PROCESS_VRAM_FRACTION = RUN_RESOURCE_SHARE
