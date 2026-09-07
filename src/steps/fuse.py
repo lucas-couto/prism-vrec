@@ -283,6 +283,7 @@ def _fuse_single(
             train_items=train_items,
             **kwargs,
         )
+        _inherit_item_order(out, emb_list_paths, strategy_name)
         return f"{strategy_name}: {shape} -> {out}"
 
     emb_list = [np.load(p) for p in emb_list_paths]
@@ -291,7 +292,46 @@ def _fuse_single(
     fuse_fn = get_fusion_strategy(strategy_name, **kwargs)
     fused = fuse_fn(emb_list, normalize=normalize)
     atomic_np_save(fused, out)
+    _inherit_item_order(out, emb_list_paths, strategy_name)
     return f"{strategy_name}: {fused.shape} -> {out}"
+
+
+def _source_item_order(source: Path) -> dict | None:
+    """The ``item_order`` block of a source's ``<stem>.meta.json``, if any."""
+    meta_path = source.with_suffix("").with_suffix(".meta.json")
+    if not meta_path.exists():
+        return None
+    try:
+        block = json.loads(meta_path.read_text(encoding="utf-8")).get("item_order")
+    except (OSError, ValueError):
+        return None
+    return block if isinstance(block, dict) else None
+
+
+def _inherit_item_order(out: Path, emb_list_paths: list[str], strategy_name: str) -> None:
+    """Write ``<stem>.meta.json`` for an offline fusion, inheriting the row order.
+
+    An offline fusion is row-wise over its sources, so row i of the
+    output is row i of every input: the ``item_order`` digest (S01) is
+    inherited, not re-derived.  It is written only when every source
+    carries the block and all agree; otherwise no sidecar is written and
+    ``validate_features`` keeps reporting the artifact as unverified,
+    which is the truthful state.
+    """
+    meta_path = out.with_suffix("").with_suffix(".meta.json")
+    if meta_path.exists():
+        return
+    blocks = [_source_item_order(Path(p)) for p in emb_list_paths]
+    if not blocks or any(b is None for b in blocks) or any(b != blocks[0] for b in blocks):
+        logger.warning(
+            "%s: sources carry no common item_order digest; the fused artifact stays "
+            "alignment-unverified.",
+            out.name,
+        )
+        return
+    meta = {"kind": "fusion", "strategy": strategy_name, "item_order": blocks[0]}
+    payload = json.dumps(meta, indent=2)
+    atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), meta_path)
 
 
 def _ensure_pca_aligned_sources(
@@ -674,6 +714,13 @@ def run(condition: str = "frozen") -> None:
     # a fusion built from other source content, fit set, recipe or
     # normalisation must not pass as this run's artifact.
     pending = [t for t in all_tasks if not _reusable(t)]
+    for task in all_tasks:
+        if task not in pending and task.get("sidecar_payload") is None:
+            # A reused offline fusion written before the item_order
+            # sidecar existed gets it now; idempotent when present.
+            _inherit_item_order(
+                Path(task["output_path"]), task["emb_list_paths"], task["strategy_name"]
+            )
     skipped = len(all_tasks) - len(pending)
     if skipped:
         logger.info("Skipping %d already existing fusions.", skipped)
