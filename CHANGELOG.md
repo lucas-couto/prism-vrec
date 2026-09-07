@@ -10,6 +10,17 @@ Dates are UTC.
 
 ### Fixed
 
+- **Fresh offline fusions were reported as "legacy, alignment
+  unverified".** The fuse step wrote provenance but no `item_order`
+  sidecar, so `validate_features` warned on every `hybrid_concat`,
+  `hybrid_pca_nc128` and `hybrid_pca_per_model_nc64` it had just built
+  (12 warnings per run). A fusion is row-wise over its sources, so
+  `_fuse_single` now inherits the block into `<stem>.meta.json` when
+  every source carries the same digest — and leaves the artifact
+  unverified, truthfully, when they do not. Reused fusions written
+  before this change get the sidecar on the next run
+  (`tests/test_fusion_item_order_sidecar.py`).
+
 - **`scripts/stamp_item_order.py` wrote the digest where nothing reads
   it.** Its first version merged the `item_order` block's keys
   (`schema_version`, `n_items`, `digest`) into the top level of
