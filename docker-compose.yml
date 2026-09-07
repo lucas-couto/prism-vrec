@@ -47,6 +47,11 @@ services:
       # expandable segments keep allocator fragmentation from turning
       # those peaks into CUDA OOMs (2026-08-31 crashes).
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # Share of the card the run may claim (RUN_RESOURCE_SHARE in
+      # src/utils/device.py). Default keeps half for the desktop; raise
+      # it only for unattended windows, e.g. overnight:
+      #   PRISM_VRAM_SHARE=0.95 docker compose up -d
+      PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-0.5}
     entrypoint: ["python", "main.py"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
@@ -176,6 +181,7 @@ services:
       # Same allocator setting as the pipeline service, so manual runs
       # from the shell behave identically.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-0.5}
     entrypoint: ["bash"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
