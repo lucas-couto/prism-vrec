@@ -242,3 +242,86 @@ def test_state_dict_holds_exactly_the_paper_parameters(model: VNPR) -> None:
 def test_missing_visual_embeddings_are_rejected() -> None:
     with pytest.raises(RuntimeError):
         VNPR(N_USERS, N_ITEMS, visual_embeddings=None, config={"latent_dim": K})
+
+
+def test_dense_bias_starts_positive_so_every_branch_is_active_at_initialisation() -> None:
+    """The single ReLU neuron must fire for every item before any step.
+
+    With the customary zero bias the pre-activation is centred on 0 and
+    roughly half the items already sit in the flat region, so one Adam
+    step of size ``lr`` -- orders of magnitude larger than the
+    pre-activation spread on a real catalogue -- can push all of them
+    below zero at once (see :attr:`VNPR.DENSE_BIAS_INIT`).
+    """
+    model = _make().train()
+    users, pos, neg = torch.arange(8), torch.arange(8), torch.arange(8, 16)
+
+    score_pos, score_neg = model(users, pos, neg)
+
+    assert model.dense.bias.item() == VNPR.DENSE_BIAS_INIT > 0.0
+    assert (score_pos > 0).all(), "positive branch has dead units at initialisation"
+    assert (score_neg > 0).all(), "negative branch has dead units at initialisation"
+
+
+def test_a_bias_step_larger_than_the_preactivation_range_is_unrecoverable() -> None:
+    """Regression for the dead-ReLU collapse (found 2026-09-09).
+
+    On a real catalogue the Xavier bound of the embedding tables shrinks
+    with the vocabulary, so the branch pre-activation spans ~1e-3 while
+    one Adam step moves the bias by ``learning_rate`` -- 1e-3 or 1e-2.
+    A single adverse step therefore drops EVERY item into the flat
+    region of the ReLU at once; from there the data gradient is exactly
+    zero for every parameter and no later step can revive the model (79
+    of the 320 battery cells scored exactly 0 this way).  The shipped
+    positive initialisation absorbs that step; a zero bias does not.
+
+    The tables are scaled to reproduce the pre-activation range of a
+    real catalogue, which the tiny synthetic vocabulary does not have,
+    and ``l2_reg`` is switched off so the assertion sees the DATA
+    gradient alone -- in a real run the surviving L2 gradient is what
+    then decays the dead model's parameters towards zero.
+    """
+    learning_rate = 1e-2
+    users, pos, neg = torch.arange(8), torch.arange(8), torch.arange(8, 16)
+
+    def preactivation_range(model: VNPR) -> torch.Tensor:
+        merged = model._preactivation(  # noqa: SLF001 -- the quantity under test
+            model.user_embedding(users),
+            model.item_embedding(pos),
+            model.visual_user_embedding(users),
+            model.visual_features[pos],
+        )
+        return (merged - model.dense.bias).abs().max().detach()
+
+    def activity_after_one_adverse_step(bias_init: float) -> tuple[float, float]:
+        model = _make({"l2_reg": 0.0}).train()
+        with torch.no_grad():
+            # Shrink the tables until the whole pre-activation range fits
+            # well inside one bias step, as it does on a real catalogue.
+            scale = 0.1 * learning_rate / preactivation_range(model)
+            for table in (
+                model.user_embedding,
+                model.item_embedding,
+                model.item_embedding_neg,
+                model.visual_user_embedding,
+            ):
+                table.weight *= scale
+            assert preactivation_range(model) < learning_rate
+            # Adam's first step is exactly +/- lr, whatever the gradient.
+            model.dense.bias.fill_(bias_init - learning_rate)
+
+        score_pos, score_neg = model(users, pos, neg)
+        model.bpr_loss(score_pos, score_neg).backward()
+        gradient = model.user_embedding.weight.grad
+        return (
+            torch.cat([score_pos, score_neg]).gt(0).float().mean().item(),
+            0.0 if gradient is None else gradient.abs().max().item(),
+        )
+
+    dead_active, dead_gradient = activity_after_one_adverse_step(0.0)
+    live_active, live_gradient = activity_after_one_adverse_step(VNPR.DENSE_BIAS_INIT)
+
+    assert dead_active == 0.0, "control did not reproduce the dead-ReLU collapse"
+    assert dead_gradient == 0.0, "a dead ReLU must leave the tables without a data gradient"
+    assert live_active == 1.0, "the positive bias initialisation did not absorb the step"
+    assert live_gradient > 0.0

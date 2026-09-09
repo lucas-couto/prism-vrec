@@ -109,8 +109,12 @@ Declared divergences:
   ``dropout`` (default ``0.0``) in ``configs/recommenders.yaml``.
 * Image features come from the framework's extractors (possibly fused)
   instead of the paper's AlexNet features; ``dv`` follows the feature.
-* Negative sampling, optimiser and initialisation (Xavier-uniform for
-  the tables, zero bias) are the framework's, not the paper's.
+* Negative sampling, optimiser and initialisation are the framework's,
+  not the paper's: Xavier-uniform for the tables and a POSITIVE dense
+  bias (:attr:`VNPR.DENSE_BIAS_INIT`, 1.0) instead of the customary
+  zero.  A zero bias leaves the single ReLU neuron one Adam step away
+  from outputting a constant 0 for every item, which is unrecoverable
+  (see the attribute's own note and ``docs/protocol.md``).
 
 Config
 ------
@@ -159,6 +163,21 @@ class VNPR(BaseRecommender):
     #: ``(B, N)`` buffers, 8 bytes per pair.
     PREDICT_BATCH_BYTES_PER_ELEMENT: int = 8
 
+    #: Initial value of the single ReLU neuron's bias ``b`` (Eq. 3).
+    #: NOT zero: the branch pre-activation at initialisation is a sum of
+    #: products of two Xavier-uniform rows, whose spread on a real
+    #: catalogue is ~1e-3 (fused, unit-norm features) to ~5e-3 (native),
+    #: while one Adam step moves ``b`` by ~``learning_rate``.  A single
+    #: negative step therefore drives EVERY item's pre-activation below
+    #: zero, the ReLU outputs a constant 0, the data gradient vanishes
+    #: for every parameter, and the model can never recover -- the
+    #: collapse documented in ``docs/protocol.md`` ("VNPR dead ReLU").
+    #: Starting the neuron firmly active removes the failure mode; the
+    #: value is where healthy cells converge on their own (+0.4 to
+    #: +2.2).  Initialisation is declared framework-side, not a property
+    #: of the paper (see the module docstring).
+    DENSE_BIAS_INIT: float = 1.0
+
     def __init__(
         self,
         n_users: int,
@@ -191,7 +210,7 @@ class VNPR(BaseRecommender):
         ):
             self._init_embedding(table)
         nn.init.xavier_uniform_(self.dense.weight)
-        nn.init.zeros_(self.dense.bias)
+        nn.init.constant_(self.dense.bias, self.DENSE_BIAS_INIT)
 
         # Full-catalogue image features: in eval only (no online fusion)
         # a zero-copy alias of the buffer, invalidated by every train()

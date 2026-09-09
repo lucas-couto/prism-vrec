@@ -520,26 +520,54 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   `tests/recommenders/test_vnpr_paper.py::test_adam_training_keeps_rows_outside_the_batch_at_their_initial_norm`.
   Every VNPR checkpoint trained before this change is visual-only and
   must be discarded.
-  **Status after 3.0.0 (task record S04): the collapse is NOT declared
-  fixed.** The BPR-Opt reading removed the whole-matrix mechanism
-  described above, but the 2026-09 battery still finished 55 of 354
-  jobs at `best_metric = 0.0000` with every catalogue item tied —
-  VBPR 0/96, VNPR native 3/112, VNPR × hybrid 52/146 (35.6 %), worst on
-  scale-distorting fusions — and no historical log carries the probes
-  needed to attribute it. 3.0.0 therefore (a) keeps zero cells visible
-  in every table (§3, first-observation rule), (b) ships opt-in
-  training diagnostics (`diagnostics:` in `configs/default.yaml`) and a
-  controlled driver (`scripts/vnpr_collapse_diagnostic.py`: seven
-  visual-input conditions, ≥ 3 seeds, same split/sampler/budget) whose
-  synthetic run observed none of the candidate mechanisms (dead ReLU,
-  skipped optimizer steps, scale, evaluation-only ties, data error),
-  and (c) makes no claim about amazon_women / tradesy until the same
-  probes are recorded there. The paragraph above is the historical
-  finding; the "‖f‖ ≈ 1 flattens the visual term" reading is a
-  hypothesis the synthetic ablation did not support (unit-norm input
-  lowered the metric, not viability). No activation, regularisation or
-  normalisation change is proposed; any such change is a separately
-  versioned experiment.
+  **Status: RESOLVED 2026-09-09 — dead ReLU at initialisation.** The
+  BPR-Opt reading removed the whole-matrix mechanism described above,
+  but the 2026-09 battery still finished cells at `best_metric =
+  0.0000` with every catalogue item tied. Over the complete 3.0.0-rc.1
+  grid (320 VNPR jobs, four datasets) that is 79 cells: 76 of 192
+  fused/hybrid (39.6 %) and 3 of 128 native (2.3 %, all amazon_women
+  with `lr = 0.01`); VBPR, DeepStyle and BPR never collapse. The cause
+  is the interaction between the initialisation and the single ReLU
+  neuron of Eq. 3, and it is attributable and reproducible per cell:
+  * the branch pre-activation at initialisation is a sum of products of
+    two Xavier-uniform rows, whose bound `sqrt(6/(n+k))` shrinks with
+    the vocabulary; on the real catalogues its spread is ~3e-4 to 1e-3
+    on fused (unit-norm) features and ~5e-3 on native ones, while one
+    Adam step moves the unpenalised bias `b` by ≈ `learning_rate`;
+  * a single adverse step therefore drives EVERY item's pre-activation
+    below zero, `ReLU` returns a constant 0, and the data gradient
+    vanishes for every parameter — the ranking is exactly flat and the
+    loss sits at `ln 2` plus the L2 term. The model cannot recover: the
+    surviving L2 gradient then decays the online-fusion projections to
+    exactly 0.0 (the same Adam-plus-L2 mechanism as above);
+  * the outcome is decided by the sign of the first applied bias step,
+    so it is deterministic per cell and invisible to a seed sweep. The
+    aggravation by `lr = 0.01` (50 of the 79) and by the fused features
+    is exactly the ratio `learning_rate / pre-activation spread`.
+  Fix adopted: `VNPR.DENSE_BIAS_INIT = 1.0` — the dense bias starts
+  positive instead of at the customary zero, so every unit fires before
+  the first step and one adverse step cannot silence the neuron. The
+  value is where healthy cells converge on their own (`+0.4` to `+2.2`).
+  Initialisation is declared framework-side, not a property of the
+  paper, so this changes no architecture, score function or
+  regularisation term, and touches no other recommender (VNPR is the
+  only built-in with a non-linearity over the merged vector). Guarded
+  by `tests/recommenders/test_vnpr_paper.py::test_dense_bias_starts_positive_so_every_branch_is_active_at_initialisation`
+  and `::test_a_bias_step_larger_than_the_preactivation_range_is_unrecoverable`.
+  Verified end-to-end before adoption on tradesy
+  `hybrid_sigmoid_gated_l1_0_learned_D128` (`lr` 1e-3, `T` 64, 30
+  epochs, selection Evaluator): `0.0000` with the zero bias — including
+  the same final `b = -0.006` as the battery checkpoint — against
+  `0.0026` with the positive one, in the band of that dataset's healthy
+  hybrid cells. **Every VNPR result produced before this change is
+  invalid and was deleted**; the earlier "‖f‖ ≈ 1 flattens the visual
+  term" reading was a hypothesis and is superseded by the account above.
+  The opt-in training diagnostics (`diagnostics:` in
+  `configs/default.yaml`) and `scripts/vnpr_collapse_diagnostic.py`
+  remain available; note that the driver's synthetic default (300
+  users) has a Xavier bound an order of magnitude larger than a real
+  catalogue and therefore cannot reproduce this failure — use
+  `--processed-dir` with real features.
 - **DeepStyle (paper formulation)**: the item style term is
   `s_i = E·f_i − l_cat(i)` — a linear projection `E` (`D_backbone → d`)
   minus a **learned category embedding** subtracted in the style space,

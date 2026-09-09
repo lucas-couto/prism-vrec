@@ -10,6 +10,31 @@ Dates are UTC.
 
 ### Fixed
 
+- **VNPR collapsed to a constant score on 79 of 320 battery cells: the
+  single ReLU neuron died at initialisation.** The dense bias started at
+  the customary zero, so half the catalogue already sat on the flat side
+  of `ReLU(w^T [p∘q, v∘f] + b)`; because the Xavier bound of the
+  embedding tables shrinks with the vocabulary, the pre-activation
+  spreads only ~3e-4 to 1e-3 on a real catalogue (fused, unit-norm
+  features) against a bias step of ≈ `learning_rate` under Adam. One
+  adverse step therefore silenced every unit at once, the data gradient
+  vanished for every parameter, and the surviving L2 gradient decayed
+  the online-fusion projections to exactly 0.0 — a flat ranking, every
+  item tied, `best_metric = 0.0000`, deterministic per cell and
+  therefore invisible to a seed sweep. It struck fused embeddings
+  (76/192) far more than native ones (3/128) purely through the ratio
+  `learning_rate / pre-activation spread`, and never struck the
+  bilinear recommenders. `VNPR.DENSE_BIAS_INIT = 1.0` now starts the
+  neuron firmly active — the value healthy cells converge to on their
+  own — which changes no architecture, score function or regularisation
+  term, and no other recommender. Initialisation was already declared
+  framework-side rather than a property of Niu et al. (2018). Verified
+  on tradesy `hybrid_sigmoid_gated_l1_0_learned_D128`: `0.0000` before,
+  `0.0026` after. Guarded by two regression tests in
+  `tests/recommenders/test_vnpr_paper.py`. **Every VNPR artifact
+  produced before this change is invalid and has been deleted**
+  (`docs/protocol.md`, "VNPR regularisation").
+
 - **The fusion item-order sidecar became a phantom embedding.** #39 made
   offline fusions write `<stem>.meta.json`; the embedding discovery glob
   `hybrid_*.json` (`get_embedding_files`) then listed

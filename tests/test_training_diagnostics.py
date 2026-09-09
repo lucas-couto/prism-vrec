@@ -132,6 +132,12 @@ class TestVNPRBranches:
         torch.manual_seed(0)
         model = VNPR(N_USERS, N_ITEMS, _visual(), {"latent_dim": K}).eval()
         users, pos, neg = torch.arange(6), torch.arange(6, 12), torch.arange(12, 18)
+        # The shipped bias starts the neuron above every pre-activation
+        # (VNPR.DENSE_BIAS_INIT), so drive it negative to make the ReLU
+        # actually clip -- otherwise the probe could return the POST-ReLU
+        # value and still match.
+        with torch.no_grad():
+            model.dense.bias.fill_(-1.0)
 
         with torch.no_grad():
             pre = model.diagnostic_branches(users, pos, neg)
