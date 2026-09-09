@@ -8,6 +8,25 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **ACF joins the fusion family through early per-region fusion.** ACF
+  consumes per-item component maps, so the pooled `hybrid_*` artifacts
+  could never reach it (`is_component_artifact` routes them apart) and
+  it was left out of the 3.0.0-rc.1 battery. The `fuse` step now runs a
+  second pass over the `<extractor>_comp.npy` sources: each
+  `(n_items, R, D_i)` source is flattened to `(n_items · R, D_i)`, the
+  unchanged pooled strategy fuses those rows, and the result is folded
+  back to `(n_items, R, D_fused)` as `hybrid_<strategy>…_comp.npy`, or
+  as a `…_comp.json` sidecar fused per region inside the recommender for
+  the learned-alignment strategies. Any fitted parameter is one basis
+  shared by every region, a PCA fit is expanded to the rows owned by
+  training items only, and the pass is gated by the existing recommender
+  roster rather than a new configuration key. `_collect_fusion_tasks`
+  and `_fuse_single` gained keyword-only `component` flags whose
+  defaults reproduce the previous behaviour. Record:
+  `docs/reliability-sdd/S05.md`.
+
 ### Fixed
 
 - **VNPR collapsed to a constant score on 79 of 320 battery cells: the

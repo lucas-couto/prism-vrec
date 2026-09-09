@@ -175,7 +175,16 @@ class BaseRecommender(nn.Module, abc.ABC):
         """Historical path: the whole matrix becomes a non-persistent buffer."""
         source_dims = getattr(visual_embeddings, "source_dims", None)
         if source_dims:
-            arr = torch.FloatTensor(np.asarray(visual_embeddings))
+            raw_sources = np.asarray(visual_embeddings)
+            if raw_sources.ndim == 3 and self.consumes_raw_components:
+                # Per-region component sources (n_items, R, sum(D_i)):
+                # keep the on-disk fp16, as the raw-component branch
+                # below does.  An fp32 copy would double the catalogue
+                # buffer the component grid was sized against
+                # (``docs/protocol.md``, ACF component grid).
+                arr = torch.from_numpy(np.array(raw_sources))
+            else:
+                arr = torch.FloatTensor(raw_sources)
             self.register_buffer("visual_features", arr, persistent=False)
             self._visual_shape = tuple(arr.shape)
             self.visual_dim_raw = int(visual_embeddings.aligned_dim)

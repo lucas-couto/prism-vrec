@@ -68,10 +68,14 @@ class RaggedSources(np.ndarray):
     """Concatenated native sources ``(n_items, sum(D_i))`` + metadata.
 
     Produced by :func:`load_embedding` for learned-alignment fusion
-    sidecars.  The array itself is the axis-1 concatenation of the M
-    native source matrices; the attached attributes let the recommender
-    build a :class:`LearnedAlignmentFusion` that splits, projects and
-    combines them at every forward pass:
+    sidecars.  The array itself is the LAST-axis concatenation of the M
+    native source matrices -- ``(n_items, sum(D_i))`` for pooled sources
+    and ``(n_items, R, sum(D_i))`` for the per-region component
+    artifacts ACF consumes, where the fusion is applied region by region
+    and the projections are shared by every region.  The attached
+    attributes let the recommender build a
+    :class:`LearnedAlignmentFusion` that splits, projects and combines
+    them at every forward pass:
 
     * ``source_dims`` — the native dim of each source, in concat order.
     * ``strategy`` — the element-wise fusion op to apply after
@@ -478,14 +482,14 @@ def load_embedding(path: str | Path, *, lazy: bool = False):
             # feature axis and attach the metadata the recommender needs
             # to build a LearnedAlignmentFusion (per-source learned
             # projections co-trained via BPR).
-            n_rows = {arr.shape[0] for arr in loaded}
-            if len(n_rows) != 1:
+            leading = {arr.shape[:-1] for arr in loaded}
+            if len(leading) != 1:
                 raise ValueError(
-                    f"sidecar {p}: components disagree on n_items ({sorted(n_rows)}).",
+                    f"sidecar {p}: components disagree on item/region layout ({sorted(leading)}).",
                 )
             return RaggedSources(
-                np.concatenate(loaded, axis=1),
-                source_dims=[int(arr.shape[1]) for arr in loaded],
+                np.concatenate(loaded, axis=-1),
+                source_dims=[int(arr.shape[-1]) for arr in loaded],
                 strategy=sidecar["strategy"],
                 aligned_dim=int(sidecar["dim"]),
                 normalize=bool(sidecar.get("normalize", True)),

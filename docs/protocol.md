@@ -584,6 +584,32 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   `tests/recommenders/test_deepstyle_paper.py::TestTradesyDegeneration`),
   not a bug. An earlier MLP-style variant (which did not subtract a
   category vector) was removed in commit `60c7436`.
+- **ACF per-region fusion (3.0.0-rc.2)**: ACF consumes per-item
+  component maps, so it could not read the pooled `hybrid_*` artifacts
+  and was absent from the 3.0.0-rc.1 battery. It now joins the fusion
+  family through **early per-region fusion**: each component source
+  `(n_items, R, D_i)` is flattened to `(n_items · R, D_i)`, the same
+  strategy that the pooled recommenders use runs on those rows, and the
+  result is folded back to `(n_items, R, D_fused)`. The artifacts are
+  named `hybrid_<strategy>…_comp.npy` (offline) and
+  `hybrid_<strategy>_learned_D<dim>_comp.json` (online), with `_comp`
+  last so they stay routed to component models only, and the pass is
+  gated by the recommender roster — no separate configuration key.
+  Three properties make the axis comparable with the pooled models and
+  are pinned by tests
+  (`tests/test_fusion_per_region_components.py`): every region is fused
+  independently of the others; any fitted parameter (a PCA basis, the
+  learned projections `D_backbone → D`) is ONE, shared by every region,
+  so the regions stay in a common space and the component attention
+  keeps comparing like with like; and a PCA fit sees only the rows owned
+  by training items (`i · R + r`), never a validation or test item. The
+  `alignment: pca` route is not built for components and is skipped with
+  a log rather than emitting a wrong artifact. Both `sum` and `mean` are
+  kept for symmetry with the other recommenders even though they are the
+  same model here (`mean = ½·sum`, absorbed by the unpenalised `W_c`);
+  `concat` and the aligned additive strategies are NOT equivalent,
+  because each aligned source is L2-normalised before the operation.
+  Full record: `docs/reliability-sdd/S05.md`.
 - **ACF history**: the paper sums over the full `R(u)`; `max_history`
   (H = 50) is an implementation bound. When `|R(u)| > H` the profile is a
   **seeded uniform subsample** (`history_seed` = the run seed), never the
