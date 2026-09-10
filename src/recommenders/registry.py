@@ -83,12 +83,15 @@ class RecommenderSpec:
         pool used by every other recommender.
     dim_split:
         How the shared dimension budget ``common.total_dim`` (``T``) is
-        split into the model's own dimensions, so every recommender of a
-        comparison spends the same number of factor dimensions (VBPR
-        §"Baselines": all MF methods use the same total; VBPR splits it
-        50/50 between latent and visual).  ``"latent"``: ``latent_dim =
-        T`` (and ``visual_dim = T`` when ``uses_visual_dim``); ``"half"``:
-        ``latent_dim = T // 2`` and ``visual_dim = T - T // 2``.
+        expanded into the model's own dimensions, so every recommender of
+        a comparison spends the same COLLABORATIVE capacity and the
+        comparison isolates the visual mechanism.  ``"latent"``:
+        ``latent_dim = T`` (and ``visual_dim = T`` alongside it when
+        ``uses_visual_dim``) — what every registered model uses.
+        ``"half"``: ``latent_dim = T // 2`` and ``visual_dim = T - T //
+        2``, i.e. the visual dimensions taken OUT of the collaborative
+        budget; supported, but no longer registered by any model (see
+        ``src/recommenders/__init__.py``).
     """
 
     name: str

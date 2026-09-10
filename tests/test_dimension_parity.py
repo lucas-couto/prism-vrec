@@ -1,11 +1,16 @@
 """Dimension parity: every recommender spends the same ``common.total_dim``.
 
-The VBPR baseline protocol (He & McAuley 2016) gives every MF method the
-same total number of factors and splits VBPR's 50/50 between latent and
-visual.  Without it, a visual model can out-score BPR-MF through extra
-capacity rather than visual signal, confounding H1.  The budget is
-resolved per model through ``RecommenderSpec.dim_split`` and guarded
-before any training starts.
+The budget is the COLLABORATIVE capacity: ``latent_dim = T`` for every
+registered model, with a visual model's own dimensions alongside it
+rather than taken out of it.  A comparison at a fixed ``T`` is then a
+comparison of the visual mechanism, not of how many collaborative
+factors each model was left with.  ``dim_split="half"`` (``T/2`` latent
++ ``T/2`` visual) is still supported and still tested here through a
+dummy model, but no recommender registers it since 2026-09-09 -- it gave
+VBPR half of BPR's collaborative factors at the same ``T``, which was
+the leading explanation for VBPR trailing BPR (audit hypothesis H1).
+The budget is resolved per model through ``RecommenderSpec.dim_split``
+and guarded before any training starts.
 """
 
 from __future__ import annotations
@@ -160,3 +165,31 @@ class TestParityGuard:
 
         with pytest.raises(DimensionParityError, match="hp_space.latent_dim"):
             assert_dimension_parity(cfg)
+
+
+class TestRegisteredModelsShareTheCollaborativeBudget:
+    """The decision of 2026-09-09, pinned on the real registry.
+
+    Every registered recommender must hold ``latent_dim = T``; a visual
+    model adds ``visual_dim = T`` beside it.  If VBPR ever returns to
+    the 50/50 split it silently competes against BPR-MF with half the
+    collaborative capacity, which is the confound H1 named.
+    """
+
+    @pytest.mark.parametrize("model", ["bpr", "vbpr", "vnpr", "deepstyle", "avbpr", "acf"])
+    def test_every_registered_model_spends_the_full_budget_on_latent_factors(
+        self, model: str
+    ) -> None:
+        assert resolve_dimensions(model, 128)["latent_dim"] == 128
+
+    @pytest.mark.parametrize("model", ["vbpr", "avbpr"])
+    def test_the_visual_side_sits_beside_the_budget_not_inside_it(self, model: str) -> None:
+        dims = resolve_dimensions(model, 128)
+
+        assert dims == {"latent_dim": 128, "visual_dim": 128}
+
+    def test_vbpr_holds_as_many_collaborative_factors_as_bpr(self) -> None:
+        assert (
+            resolve_dimensions("vbpr", 128)["latent_dim"]
+            == resolve_dimensions("bpr", 128)["latent_dim"]
+        )

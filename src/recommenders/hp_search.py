@@ -95,9 +95,12 @@ def resolve_dimensions(model_name: str, total_dim: int) -> dict[str, int]:
     """Expand the shared budget ``total_dim`` into a model's own dimensions.
 
     Driven by :attr:`RecommenderSpec.dim_split` so every recommender of a
-    comparison spends the same total number of factor dimensions (the
-    VBPR baseline protocol: all MF methods share one total; VBPR itself
-    splits it 50/50 between latent and visual).
+    comparison spends the same COLLABORATIVE capacity: ``latent_dim = T``
+    for all of them, with a model's visual dimensions alongside that
+    budget rather than inside it.  A visual model therefore holds more
+    parameters than BPR-MF at the same ``T`` by exactly its visual side,
+    which is the point — the comparison isolates the visual mechanism
+    instead of charging it against the collaborative factors.
     """
     spec = get_recommender_spec(model_name)
     if spec.dim_split == "half":
