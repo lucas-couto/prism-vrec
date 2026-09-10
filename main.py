@@ -42,7 +42,6 @@ pipeline order.
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 import time
@@ -104,11 +103,34 @@ STEP_ORDER: list[str] = [
     "evaluate_finetuning",
     "fuse",
     "train",
+    "folds",
     "evaluate",
     "beyond_accuracy",
     "statistical",
     "export_best",
 ]
+
+
+def _run_folds_step() -> None:
+    """Pipeline step: user-level K-fold, driven by ``folds.enabled``.
+
+    Inert when the block is off, so the step can stay in the order for
+    every run.  When it is on it REPLACES the single-split ``evaluate``
+    as the producer of the per-user records: the K partial artifacts are
+    concatenated into the cell's canonical
+    ``results/per_user/<dataset>/<cell>.csv.gz``, which is what
+    ``beyond_accuracy`` and ``statistical`` read.  That is why it sits
+    before them in :data:`STEP_ORDER`.
+    """
+    from src.folds.runner import run_folds
+
+    config = load_config()
+    if not (config.get("folds") or {}).get("enabled", False):
+        logger.info("folds step skipped: configs/default.yaml -> folds.enabled is false.")
+        return
+    _log_resource_plan(config)
+    _require_complete(run_folds(config, config["paths"]["results"]), label="K-fold run")
+
 
 STEP_FUNCTIONS: dict[str, Callable] = {
     "download": download.run,
@@ -118,6 +140,7 @@ STEP_FUNCTIONS: dict[str, Callable] = {
     "evaluate_finetuning": evaluate_finetuning.run,
     "fuse": fuse.run,
     "train": train.run,
+    "folds": _run_folds_step,
     "evaluate": evaluate.run,
     "beyond_accuracy": beyond_accuracy.run,
     "statistical": statistical.run,
@@ -279,8 +302,8 @@ def _run_steps(names: list[str], condition: str | None, run_both_conditions: boo
 
 #: Flags removed in 3.0.0 (the YAML is the only control surface) and
 #: the key that provides each one's behaviour.  Passing one fails with
-#: argparse's standard error plus this hint.
-REMOVED_FLAGS: dict[str, str] = {
+#: a message naming the key, and no parser is built at all.
+REMOVED_FLAGS: dict[str, str | None] = {
     "--all": "pipeline.run_all: true (configs/default.yaml)",
     "--step": "pipeline.run_all: false with start_from and stop_at set to the step",
     "--from": "pipeline.run_all: false with pipeline.start_from",
@@ -290,153 +313,48 @@ REMOVED_FLAGS: dict[str, str] = {
     "--n-trials": "hp_search.optuna.n_trials (configs/recommenders.yaml)",
     "--eval-protocol": "evaluation.protocol (configs/evaluation.yaml)",
     "--seeds": "seeds: [...] (configs/default.yaml)",
+    "--folds": "folds.enabled: true (configs/default.yaml); the folds STEP then runs "
+    "in pipeline order, and start_from / stop_at reach it like any other step",
+    "--config-dir": None,  # nothing replaces it: the directory is always `configs/`
+    "--battery": "pipeline.mode: battery (configs/default.yaml)",
+    "--retry-failed": "pipeline.retry_failed: true, with pipeline.mode: battery",
+    "--show-plan": "pipeline.mode: show_plan",
+    "--battery-status": "pipeline.mode: battery_status",
+    "--report": "pipeline.mode: report",
+    "--report-metric": "report.metric (configs/evaluation.yaml)",
+    "--report-top": "report.top_n (configs/evaluation.yaml)",
+    "--inspect-pending": "pipeline.mode: inspect_pending, over pipeline.condition",
+    "--validate-dataset": "pipeline.mode: validate_datasets, over the `datasets` list",
+    "--validate-features": "pipeline.mode: validate_features, over `datasets` x "
+    "`extractors_enabled`",
+    "--list-extractors": "pipeline.mode: list",
+    "--list-fusions": "pipeline.mode: list",
+    "--list-recommenders": "pipeline.mode: list",
+    "--list-datasets": "pipeline.mode: list",
 }
 
 
-def _reject_removed_flags(parser: argparse.ArgumentParser, argv: list[str]) -> None:
-    """Fail loud on a removed flag, naming the YAML key that replaced it."""
+def _reject_arguments(argv: list[str]) -> None:
+    """``main.py`` takes no arguments; name the YAML key that replaced one.
+
+    The files under ``configs/`` are the only control surface, so there
+    is no parser to build: an argument is always a mistake, and the
+    useful answer is the key that now carries its behaviour.
+    """
     for token in argv:
         flag = token.split("=", 1)[0]
-        if flag in REMOVED_FLAGS:
-            parser.error(
-                f"{flag} was removed: the YAML is the only control surface; "
-                f"set {REMOVED_FLAGS[flag]} instead"
+        if flag == "--config-dir":
+            detail = "the configuration directory is always `configs/`"
+        elif flag in REMOVED_FLAGS:
+            detail = f"set {REMOVED_FLAGS[flag]} instead"
+        else:
+            detail = (
+                "every knob lives in configs/*.yaml (start at configs/default.yaml -> pipeline:)"
             )
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run the prism-vrec pipeline as configured by configs/*.yaml "
-            "(pipeline: section).  Flags are tools around the run, never "
-            "overrides of the YAML."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-
-    selection = parser.add_mutually_exclusive_group()
-    selection.add_argument(
-        "--inspect-pending",
-        choices=["frozen", "finetuned"],
-        metavar="CONDITION",
-        help=(
-            "Print how many grid-search jobs are still pending for the "
-            "given condition (does not run the pipeline)."
-        ),
-    )
-    selection.add_argument(
-        "--list-extractors",
-        action="store_true",
-        help="Print every registered visual extractor and exit.",
-    )
-    selection.add_argument(
-        "--list-fusions",
-        action="store_true",
-        help="Print every registered fusion strategy and exit.",
-    )
-    selection.add_argument(
-        "--list-recommenders",
-        action="store_true",
-        help="Print every registered recommender and exit.",
-    )
-    selection.add_argument(
-        "--list-datasets",
-        action="store_true",
-        help="Print every registered dataset provider and exit.",
-    )
-    selection.add_argument(
-        "--show-plan",
-        action="store_true",
-        help=(
-            "Resolve the pipeline plan from the merged YAML and print which "
-            "steps would run (with condition filtering applied), then exit."
-        ),
-    )
-    selection.add_argument(
-        "--validate-dataset",
-        metavar="NAME",
-        help=(
-            "Run schema and image-coverage checks on dataset NAME and "
-            "exit with non-zero status if problems are found.  Useful "
-            "before launching a multi-day grid search."
-        ),
-    )
-    selection.add_argument(
-        "--validate-features",
-        nargs="*",
-        metavar="DATASET BACKBONE",
-        help=(
-            "Sanity-check extracted feature matrices (shape, native dim, "
-            "dtype, NaN/Inf, zero-norm rows) and exit non-zero on any "
-            "failure.  No args = every enabled (dataset, backbone); pass "
-            "DATASET or DATASET BACKBONE to narrow.  Run before the battery."
-        ),
-    )
-    selection.add_argument(
-        "--battery",
-        action="store_true",
-        help=(
-            "Run the full battery via the resumable runner: enumerate cells, "
-            "skip completed ones (idempotent), track state in the manifest, "
-            "and retry-safe after a spot-instance interruption."
-        ),
-    )
-    selection.add_argument(
-        "--folds",
-        action="store_true",
-        help=(
-            "Run the user-level K-fold cross-validation (configs/default.yaml "
-            "-> folds:) over every battery cell with frozen hyperparameters: "
-            "train on K-1 folds, fold the held-out users in, evaluate them on "
-            "their single target, concatenate the K per-user artifacts."
-        ),
-    )
-    selection.add_argument(
-        "--battery-status",
-        action="store_true",
-        help="Print the battery manifest state counts + remaining-cost projection.",
-    )
-    selection.add_argument(
-        "--retry-failed",
-        action="store_true",
-        help="With --battery, also re-run cells currently marked failed.",
-    )
-    selection.add_argument(
-        "--report",
-        action="store_true",
-        help=(
-            "Aggregate every evaluation CSV under results/tables/ into "
-            "results/report.md (top-N by metric, best per recommender, "
-            "frozen vs finetuned delta) and exit."
-        ),
-    )
-
-    parser.add_argument(
-        "--report-metric",
-        default="ndcg@10",
-        metavar="METRIC",
-        help="Metric used to rank configurations in --report (default: ndcg@10).",
-    )
-    parser.add_argument(
-        "--report-top",
-        type=int,
-        default=15,
-        metavar="N",
-        help="Number of top configurations to list in --report (default: 15).",
-    )
-
-    parser.add_argument(
-        "--config-dir",
-        default=None,
-        metavar="PATH",
-        help=(
-            "Alternative directory of YAML config files (an ablation or "
-            "validation profile that overrides configs/).  Defaults to 'configs/'."
-        ),
-    )
-
-    return parser
+        raise SystemExit(
+            f"main.py takes no arguments: {flag} was removed because the YAML is the "
+            f"only control surface; {detail}."
+        )
 
 
 def _list_extractors() -> None:
@@ -655,81 +573,75 @@ def _filter_steps_by_condition(steps: list[str], condition: str) -> list[str]:
     return kept
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = build_parser()
-    _reject_removed_flags(parser, sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(argv)
+def _run_mode(mode: str, config: dict[str, Any]) -> None:
+    """Execute a non-``pipeline`` ``pipeline.mode`` and return.
 
-    if args.config_dir:
-        from src.utils.config import set_config_dir
-
-        set_config_dir(args.config_dir)
-
-    if args.list_extractors:
+    Each of these prints something, or runs the battery, instead of the
+    step plan.  None of them takes a parameter here: what they operate on
+    comes from the same YAML that selected them.
+    """
+    if mode == "list":
         _list_extractors()
-        return
-    if args.list_fusions:
         _list_fusions()
-        return
-    if args.list_recommenders:
         _list_recommenders()
-        return
-    if args.list_datasets:
         _list_datasets()
         return
-    if args.show_plan:
+    if mode == "show_plan":
         _show_plan()
         return
-    if args.validate_dataset:
-        sys.exit(_validate_dataset(args.validate_dataset))
-    if args.validate_features is not None:
-        ds = args.validate_features[0] if len(args.validate_features) >= 1 else None
-        bb = args.validate_features[1] if len(args.validate_features) >= 2 else None
-        sys.exit(validate_features.run(dataset=ds, backbone=bb))
-    if args.battery_status:
+    if mode == "validate_datasets":
+        failures = [name for name in config.get("datasets", []) if _validate_dataset(name)]
+        if failures:
+            raise SystemExit(f"invalid dataset(s): {', '.join(failures)}")
+        return
+    if mode == "validate_features":
+        raise SystemExit(validate_features.run(dataset=None, backbone=None))
+    if mode == "battery_status":
         from src.battery.runner import battery_status
 
-        cfg = load_config()
-        battery_status(cfg["paths"]["results"])
+        battery_status(config["paths"]["results"])
         return
-    if args.folds:
-        from src.folds.runner import run_folds
-
-        cfg = load_config()
-        _log_resource_plan(cfg)
-        _require_complete(run_folds(cfg, cfg["paths"]["results"]), label="K-fold run")
+    if mode == "inspect_pending":
+        _inspect_pending(config.get("pipeline", {}).get("condition", "frozen"))
         return
-    if args.battery:
-        from src.battery.execute import execute_cell
-        from src.battery.runner import run_battery
-
-        cfg = load_config()
-        _log_resource_plan(cfg)
-        manifest = run_battery(
-            cfg, cfg["paths"]["results"], execute_cell, retry_failed=args.retry_failed
-        )
-        _require_complete(manifest, label="battery")
-        return
-    if args.report:
+    if mode == "report":
         from src.utils.report import write_report
 
-        config = load_config()
+        report_cfg = config.get("report") or {}
         results_dir = Path(config.get("paths", {}).get("results", "results"))
-        tables_dir = results_dir / "tables"
-        out_path = results_dir / "report.md"
         written = write_report(
-            out_path=out_path,
-            tables_dir=tables_dir,
-            metric=args.report_metric,
-            top_n=args.report_top,
+            out_path=results_dir / "report.md",
+            tables_dir=results_dir / "tables",
+            metric=report_cfg.get("metric"),
+            top_n=report_cfg.get("top_n"),
         )
         print(f"Report written to {written}")
         return
-    if args.inspect_pending:
-        _inspect_pending(args.inspect_pending)
+    if mode == "battery":
+        from src.battery.execute import execute_cell
+        from src.battery.runner import run_battery
+
+        _log_resource_plan(config)
+        manifest = run_battery(
+            config,
+            config["paths"]["results"],
+            execute_cell,
+            retry_failed=bool(config.get("pipeline", {}).get("retry_failed", False)),
+        )
+        _require_complete(manifest, label="battery")
         return
+    raise SystemExit(f"unknown pipeline.mode {mode!r}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    _reject_arguments(sys.argv[1:] if argv is None else argv)
 
     config = load_config()
+    mode = (config.get("pipeline") or {}).get("mode", "pipeline")
+    if mode != "pipeline":
+        _run_mode(mode, config)
+        return
+
     steps, condition, run_both = _resolve_plan(config)
     _log_resource_plan(config)
 

@@ -36,6 +36,7 @@ PIPELINE_STEPS = (
     "evaluate_finetuning",
     "fuse",
     "train",
+    "folds",
     "evaluate",
     "beyond_accuracy",
     "statistical",
@@ -106,6 +107,21 @@ class PipelineConfig(BaseModel):
     start_from: str | None = None
     stop_at: str | None = None
     condition: Literal["frozen", "finetuned", "both"] = "both"
+    #: What ``python main.py`` does.  The command takes no arguments —
+    #: this key is how a run, a battery or an inspection is selected.
+    mode: Literal[
+        "pipeline",
+        "battery",
+        "show_plan",
+        "battery_status",
+        "report",
+        "inspect_pending",
+        "validate_features",
+        "validate_datasets",
+        "list",
+    ] = "pipeline"
+    #: ``mode: battery`` only — re-dispatch the cells that failed.
+    retry_failed: bool = False
 
     @field_validator("start_from", "stop_at")
     @classmethod

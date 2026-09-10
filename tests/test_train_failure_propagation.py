@@ -222,8 +222,12 @@ class TestBatteryBoundary:
         for i, state in enumerate(states):
             manifest.set_state(f"cell-{i}", state)
         monkeypatch.setattr(runner, "run_battery", lambda *a, **k: manifest)
-        monkeypatch.setattr(main, "load_config", lambda *a, **k: _grid_config(tmp_path))
-        return main.run_cli(["--battery"])
+        # The battery is selected by the YAML now, not by a flag:
+        # main.py takes no arguments (2026-09-09).
+        config = _grid_config(tmp_path)
+        config.setdefault("pipeline", {})["mode"] = "battery"
+        monkeypatch.setattr(main, "load_config", lambda *a, **k: config)
+        return main.run_cli([])
 
     def test_should_exit_nonzero_when_the_battery_manifest_has_failed_cells(
         self, tmp_path, monkeypatch
