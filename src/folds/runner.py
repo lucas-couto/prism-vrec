@@ -70,12 +70,23 @@ def manifest_path(results_dir: str | Path) -> Path:
 
 
 def _fold_paths(config: dict, fold_index: int) -> dict:
-    """Seed-isolated results/checkpoint roots for one fold."""
+    """Seed-isolated results/checkpoint roots for one fold.
+
+    NESTED under the configured roots, never siblings of them: a sibling
+    (``results_fold0`` next to ``results``) lands outside every mount a
+    container is given, and the run dies with ``Permission denied`` on
+    the image's own read-only working directory (found 2026-09-09 on the
+    first real fold run).  Nesting also matches the layout
+    :mod:`src.folds.aggregate` documents for the partial artifacts,
+    ``folds/fold<k>/`` under the results root.
+    """
     paths = config["paths"]
+    results = Path(paths["results"])
+    checkpoints = Path(paths.get("checkpoints", "checkpoints"))
     return {
         **paths,
-        "results": f"{paths['results']}_fold{fold_index}",
-        "checkpoints": f"{paths.get('checkpoints', 'checkpoints')}_fold{fold_index}",
+        "results": str(results / "folds" / f"fold{fold_index}"),
+        "checkpoints": str(checkpoints / "folds" / f"fold{fold_index}"),
     }
 
 
@@ -441,6 +452,48 @@ def _fold_provenance_mismatch(
     return None
 
 
+def _lazy_config(config: dict) -> dict:
+    """*config* with the feature residency forced to ``lazy``."""
+    forced = copy.deepcopy(config)
+    resources = forced.setdefault("resources", {})
+    resources.setdefault("features", {})["residency"] = "lazy"
+    return forced
+
+
+def _run_cell_with_oom_recovery(runner, cell, config, plan, frames, *, results_dir, device):
+    """Run one fold cell, retrying once with lazy feature reads on an OOM.
+
+    The training pool escalates a job that dies allocating to lazy reads
+    (``src.utils.parallel``); the fold runner had no such recovery, so
+    the same ACF cells that the pool rescued died here instead and the
+    whole K-fold run failed (found 2026-09-09).  Shrinking a batch would
+    not help: the allocation that fails is the one made before the first
+    step, and only reading the features on demand changes it.
+    """
+    import torch
+
+    try:
+        return runner(cell, config, plan, frames, results_dir=results_dir, device=device)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        logger.warning("%s: out of memory; retrying the cell with lazy feature reads.", cell.key())
+        return runner(
+            cell, _lazy_config(config), plan, frames, results_dir=results_dir, device=device
+        )
+
+
+def _write_evaluation_tables(config: dict, results_dir: Path, datasets: set[str]) -> None:
+    """Tabulate the concatenated fold artifacts for ``beyond_accuracy`` / ``statistical``."""
+    from src.folds.evaluation_table import write_evaluation_table
+
+    condition = (config.get("pipeline") or {}).get("condition") or "frozen"
+    if condition == "both":
+        condition = "frozen"
+    k_values = [int(k) for k in (config.get("k_values") or [5, 10, 20])]
+    for dataset in sorted(datasets):
+        write_evaluation_table(results_dir, dataset, condition, k_values)
+
+
 def run_folds(
     config: dict,
     results_dir: str | Path,
@@ -509,7 +562,9 @@ def run_folds(
         started = time.perf_counter()
         plan, frames = plans[cell.dataset]
         try:
-            extra = runner(cell, config, plan, frames, results_dir=results_dir, device=device)
+            extra = _run_cell_with_oom_recovery(
+                runner, cell, config, plan, frames, results_dir=results_dir, device=device
+            )
             manifest.set_state(
                 key,
                 "done",
@@ -531,4 +586,7 @@ def run_folds(
         logger.error("K-fold run INCOMPLETE: %s", summary)
     else:
         logger.info("K-fold run finished: %s", summary)
+        # The folds replaced `evaluate` as the producer of the per-user
+        # records, so they owe the back half its input table too.
+        _write_evaluation_tables(config, results_dir, {cell.dataset for cell in cells})
     return manifest
