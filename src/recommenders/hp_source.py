@@ -303,15 +303,34 @@ def _optuna_winner(
     return dict(best.params), meta
 
 
+def _winners_are_stale(summary_path: Path, models_dir: Path) -> bool:
+    """Whether any winner checkpoint is newer than the summary that names it.
+
+    ``best_hyperparams.json`` is an EXPORT of ``models/``, and reading it
+    back as a cache with no invalidation is how a superseded winner
+    survives a retrain: on 2026-09-09 a summary written before the VBPR
+    dimension change kept naming ``latent_dim: 32`` for cells whose
+    checkpoints had already been retrained and deleted, and every fold
+    cell that read it failed.  A checkpoint newer than the summary means
+    the summary predates the promotion.
+    """
+    try:
+        written = summary_path.stat().st_mtime
+    except OSError:
+        return True
+    return any(path.stat().st_mtime > written for path in models_dir.rglob("*_best.pt"))
+
+
 def _load_or_export_best(results_root: Path) -> dict:
-    """Read ``best_hyperparams.json``; build it from ``models/`` when absent."""
+    """Read ``best_hyperparams.json``, rebuilding it when ``models/`` moved on."""
     summary_path = results_root / BEST_HYPERPARAMS_FILENAME
-    if summary_path.exists():
+    models_dir = results_root / "models"
+    if summary_path.exists() and not _winners_are_stale(summary_path, models_dir):
         with open(summary_path, encoding="utf-8") as fh:
             return json.load(fh)
     from src.steps.export_best import export_best_hyperparams
 
-    return export_best_hyperparams(results_root / "models", summary_path)
+    return export_best_hyperparams(models_dir, summary_path)
 
 
 __all__ = [

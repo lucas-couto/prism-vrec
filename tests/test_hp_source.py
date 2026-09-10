@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ _WINNERS = {
     "amazon_fashion": {
         "vbpr": {
             "resnet50": {
-                "hyperparams": {"total_dim": 128, "latent_dim": 64, "visual_dim": 64},
+                "hyperparams": {"total_dim": 128, "latent_dim": 128, "visual_dim": 128},
                 "best_metric": 0.55,
             }
         }
@@ -69,8 +70,8 @@ class TestResolveCellHyperparams:
             "learning_rate": 0.001,
             "l2_reg": 1e-4,
             "total_dim": 64,
-            "latent_dim": 32,
-            "visual_dim": 32,
+            "latent_dim": 64,
+            "visual_dim": 64,
         }
 
     def test_search_strategy_reads_existing_winners_file(self, tmp_path) -> None:
@@ -113,3 +114,44 @@ class TestResolveCellHyperparams:
         origin = _resolve({**_SEARCH_CONFIG, "hp_search": {"strategy": "grid"}}, tmp_path)
 
         assert origin.source == "search"
+
+
+class TestWinnersSummaryInvalidation:
+    """``best_hyperparams.json`` is an export of ``models/``, not a cache.
+
+    Found 2026-09-09: a summary written before the VBPR dimension change
+    kept naming the superseded ``latent_dim`` for cells whose checkpoints
+    had already been retrained, and every fold cell that read it failed
+    with "suggestion declares ... but total_dim=...".
+    """
+
+    def _summary(self, tmp_path, hyperparams: dict) -> Path:
+        (tmp_path / "models" / "amazon_fashion").mkdir(parents=True)
+        ckpt = tmp_path / "models" / "amazon_fashion" / "vbpr_resnet50_best.pt"
+        torch.save({"hyperparams": hyperparams, "best_metric": 0.5}, ckpt)
+        return ckpt
+
+    def test_a_checkpoint_newer_than_the_summary_forces_a_rebuild(self, tmp_path) -> None:
+        from src.recommenders.hp_source import _winners_are_stale
+
+        summary = tmp_path / BEST_HYPERPARAMS_FILENAME
+        summary.write_text("{}")
+        ckpt = self._summary(tmp_path, {"total_dim": 128, "latent_dim": 128})
+        os.utime(ckpt, (summary.stat().st_mtime + 10,) * 2)
+
+        assert _winners_are_stale(summary, tmp_path / "models") is True
+
+    def test_an_untouched_models_tree_keeps_the_summary(self, tmp_path) -> None:
+        from src.recommenders.hp_source import _winners_are_stale
+
+        ckpt = self._summary(tmp_path, {"total_dim": 128, "latent_dim": 128})
+        summary = tmp_path / BEST_HYPERPARAMS_FILENAME
+        summary.write_text("{}")
+        os.utime(summary, (ckpt.stat().st_mtime + 10,) * 2)
+
+        assert _winners_are_stale(summary, tmp_path / "models") is False
+
+    def test_a_missing_summary_is_stale(self, tmp_path) -> None:
+        from src.recommenders.hp_source import _winners_are_stale
+
+        assert _winners_are_stale(tmp_path / "nope.json", tmp_path) is True
