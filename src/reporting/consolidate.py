@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.reporting.long_format import (
+    _METRIC_COL_PATTERN,
     classify_table_file,
     evaluation_to_long,
     friedman_to_long,
@@ -65,16 +66,39 @@ _GROUP_KEYS = (
 )
 
 
-def _chunk_totals(long_df: pd.DataFrame) -> pd.DataFrame:
-    """One row per cell with this chunk's ``sum`` and ``size`` of ``value``.
+#: What identifies a cell in the WIDE evaluation table.  Grouping by
+#: "every column that is not a metric" instead exploded the group count
+#: from 75 to 4 400: ``efd_excluded_frac@k`` and ``icov@k`` do not match
+#: the metric pattern, and the first varies per user, so each user's
+#: value became part of the key.  Those columns are dropped here exactly
+#: as ``evaluation_to_long``'s fixed column list already dropped them.
+_CELL_IDENTITY = ("dataset", "model_name", "embedding_name")
 
-    Accumulated with pandas rather than a dict: a cell identity can carry
-    a missing ``embedding_dim``, and ``NaN != NaN``, so dict keys never
-    matched across chunks and every chunk produced its own row (each
-    reporting its own chunk size as ``n_users``).
+
+def _wide_totals(chunk: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Per-cell ``(sums, non-null counts, row counts)`` of one WIDE chunk.
+
+    Aggregating before the melt is the point.  Melting first turned a
+    200 000-row chunk into 6 000 000 long rows and grouped them on ten
+    keys, seven of which are text: chunking alone kept that inside the
+    memory limit but not inside any usable time -- ten minutes on one
+    table and still going (found 2026-09-09).  Collapsing the wide chunk
+    to one row per cell first leaves ~75 rows to melt instead.
+
+    ``sum`` / ``count`` skip missing values while ``size`` does not,
+    which reproduces the original semantics exactly: ``n_users`` counts
+    every user of the cell, and a mean ignores the users whose metric is
+    undefined (EFD is ``nan`` when no recommended item has positive
+    train popularity).
     """
-    keys = [k for k in _GROUP_KEYS if k in long_df.columns]
-    return long_df.groupby(keys, dropna=False)["value"].agg(total="sum", count="size").reset_index()
+    metric_cols = [c for c in chunk.columns if _METRIC_COL_PATTERN.match(c)]
+    id_cols = [c for c in _CELL_IDENTITY if c in chunk.columns]
+    grouped = chunk.groupby(id_cols, dropna=False)
+    return (
+        grouped[metric_cols].sum(min_count=1),
+        grouped[metric_cols].count(),
+        grouped.size(),
+    )
 
 
 def consolidate_evaluation(
@@ -103,23 +127,35 @@ def consolidate_evaluation(
         if conditions is not None and info["condition"] not in conditions:
             logger.info("  evaluation: %s outside this run's conditions - skipped.", path.name)
             continue
-        partials: list[pd.DataFrame] = []
+        sums = counts = sizes = None
         for chunk in pd.read_csv(path, chunksize=EVALUATION_CHUNK_ROWS):
-            long_df = evaluation_to_long(
-                chunk,
-                dataset=info["dataset"],
-                condition=info["condition"],
-            )
-            if not long_df.empty:
-                partials.append(_chunk_totals(long_df))
-        if not partials:
+            chunk_sums, chunk_counts, chunk_sizes = _wide_totals(chunk)
+            sums = chunk_sums if sums is None else sums.add(chunk_sums, fill_value=0)
+            counts = chunk_counts if counts is None else counts.add(chunk_counts, fill_value=0)
+            sizes = chunk_sizes if sizes is None else sizes.add(chunk_sizes, fill_value=0)
+        if sums is None or sums.empty:
             continue
-        combined = pd.concat(partials, ignore_index=True)
-        keys = [k for k in _GROUP_KEYS if k in combined.columns]
-        summed = combined.groupby(keys, dropna=False)[["total", "count"]].sum().reset_index()
-        aggregated = summed.assign(
-            n_users=summed["count"], mean=summed["total"] / summed["count"]
-        ).drop(columns=["total", "count"])
+        means = (sums / counts.where(counts > 0)).reset_index()
+        aggregated = evaluation_to_long(
+            means,
+            dataset=info["dataset"],
+            condition=info["condition"],
+        ).rename(columns={"value": "mean"})
+        if aggregated.empty:
+            continue
+        # ``evaluation_to_long`` keeps a fixed column list, so the user
+        # count rides back in by cell identity rather than through it.
+        # ``Series.add`` across chunks promotes the count to float.
+        per_cell = (
+            sizes.astype("int64")
+            .rename("n_users")
+            .reset_index()
+            .rename(columns={"model_name": "recommender"})
+        )
+        on = [c for c in per_cell.columns if c != "n_users" and c in aggregated.columns]
+        aggregated = aggregated.merge(per_cell[[*on, "n_users"]], on=on, how="left")
+        keys = [k for k in (*_GROUP_KEYS, "n_users") if k in aggregated.columns]
+        aggregated = aggregated[[*keys, "mean"]]
         frames.append(aggregated)
         logger.info("  evaluation: %s rows from %s", len(aggregated), path.name)
 
