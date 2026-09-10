@@ -31,5 +31,16 @@ resources:
     prefetch_factor: 6         # auto | integer; batches prefetched per DataLoader worker
     batch_size: 192            # auto | integer; the re-extract batch (finetune, evaluate_finetuning)
   features:
-    residency: dense           # dense | lazy | auto
+    # dense | lazy | auto.  `auto` since 2026-09-09: it keeps a feature
+    # matrix resident while it fits the VRAM a worker gets, and reads
+    # rows on demand when it does not, so the small cells stay fast and
+    # the large ones stop dying on allocation.  `dense` is ~3x faster
+    # per step but its peak grows with the feature width (measured on
+    # ACF/amazon_men: 74 ms and 2.41 GB at D=128 against 113 ms and
+    # 5.23 GB at D=768, while lazy holds ~2.2 GB at both); `lazy`
+    # everywhere would pay that 3x on every cell that never needed it.
+    # `auto` only sees the RESIDENT matrix — a peak that is transient in
+    # the batch, as ACF's history staging, is not predicted here and is
+    # recovered by the OOM retry, which escalates a failed job to lazy.
+    residency: auto
     item_block: 8192           # rows per block for catalogue-sized requests

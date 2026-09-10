@@ -72,3 +72,54 @@ def test_staging_memory_scales_with_the_block_not_the_catalogue(tmp_path: Path) 
     assert largest <= 4 * block_bytes, peaks
     assert largest <= 1.5 * smallest, peaks
     assert largest < 0.05 * source_bytes(model._feature_source), peaks
+
+
+class TestOomEscalatesToLazy:
+    """An OOM retry must change the ALLOCATION, not only the ranking budget.
+
+    Found 2026-09-09: every OOM observed in production was raised while
+    allocating (~2 s after the job started, before the first epoch), and
+    the retry only shrank the ranking budget, so the job came back
+    identical, burned its retries and was lost — which fails the run.
+    """
+
+    def _job(self, **kwargs):
+        from src.utils.parallel import TrainingJob
+
+        return TrainingJob(
+            dataset_name="ds",
+            model_name="acf",
+            embedding_name="resnet50_comp",
+            hyperparams={"learning_rate": 0.001},
+            n_users=4,
+            n_items=8,
+            embeddings_path=None,
+            processed_dir="p",
+            device="cuda",
+            **kwargs,
+        )
+
+    def _registry(self, job):
+        from src.utils.parallel import _JobRegistry
+
+        return _JobRegistry([job])
+
+    def test_a_dense_job_is_retried_with_lazy_reads(self) -> None:
+        job = self._job()
+        assert job.lazy_features is False
+        registry = self._registry(job)
+
+        registry._record_oom(job, 1, {"error": "CUDA out of memory"})
+
+        assert job.lazy_features is True, "the retry repeats the same allocation"
+        assert job.retry_count == 1
+        assert job.job_id in registry._retry_pending
+
+    def test_a_job_already_lazy_still_retries(self) -> None:
+        job = self._job(lazy_features=True)
+        registry = self._registry(job)
+
+        registry._record_oom(job, 1, {"error": "CUDA out of memory"})
+
+        assert job.lazy_features is True
+        assert job.job_id in registry._retry_pending

@@ -113,3 +113,50 @@ class TestPlanPoolWorkers:
         )
 
         assert n == 2
+
+
+class TestAutoResidencyMeasuresVram:
+    """``auto`` weighs the resident feature matrix against the VRAM a worker
+    gets, not against host RAM: the matrix travels to the card with the
+    model.  Measured against the host budget, ``auto`` was unreachable —
+    amazon_women's 2.9 GB resnet50 matrix never exceeds half of a 16 GB
+    host limit, while it is a third of what the card leaves at
+    ``vram_share: 0.95`` (found 2026-09-09)."""
+
+    HOST = 16 * 1024**3
+    VRAM = int(16.3 * 1024**3 * 0.95)
+    PAYLOAD = int(2.85 * 1024**3)  # amazon_women resnet50, fp32
+
+    def test_auto_switches_on_the_vram_budget_not_the_host_one(self) -> None:
+        assert memory_mod.choose_lazy_features("auto", self.PAYLOAD, self.HOST) is False
+
+        assert (
+            memory_mod.choose_lazy_features(
+                "auto", self.PAYLOAD * 3, self.HOST, vram_budget_bytes=self.VRAM
+            )
+            is True
+        )
+
+    def test_a_payload_that_fits_the_card_stays_dense(self) -> None:
+        assert (
+            memory_mod.choose_lazy_features(
+                "auto", self.PAYLOAD, self.HOST, vram_budget_bytes=self.VRAM
+            )
+            is False
+        )
+
+    def test_the_host_budget_is_the_fallback_without_a_vram_figure(self) -> None:
+        assert (
+            memory_mod.choose_lazy_features("auto", self.HOST, self.HOST, vram_budget_bytes=0)
+            is True
+        )
+
+    def test_dense_and_lazy_ignore_every_budget(self) -> None:
+        assert (
+            memory_mod.choose_lazy_features("dense", self.PAYLOAD * 100, 1, vram_budget_bytes=1)
+            is False
+        )
+        assert (
+            memory_mod.choose_lazy_features("lazy", 0, self.HOST, vram_budget_bytes=self.VRAM)
+            is True
+        )

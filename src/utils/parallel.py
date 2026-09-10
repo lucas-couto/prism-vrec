@@ -329,6 +329,24 @@ class _JobRegistry:
     def _record_oom(self, job: TrainingJob, attempt: int, message: dict) -> None:
         if job.retry_count < MAX_OOM_RETRIES:
             job.retry_count += 1
+            # Shrinking the ranking budget (see _ranking_budget_bytes) only
+            # helps an OOM raised INSIDE the ranking loop.  A job that dies
+            # while allocating -- the resident feature matrix, the tables,
+            # the optimiser state, or a transient staged before a
+            # projection -- comes back byte-for-byte identical and OOMs
+            # again, burns its retries and is lost.  Escalating to lazy
+            # reads is what actually changes that allocation: the feature
+            # matrix stops being resident and every gather is bounded and
+            # de-duplicated.  Cheaper than losing the job, and the
+            # numerical result is unchanged
+            # (tests/recommenders/test_lazy_feature_equivalence.py).
+            if not job.lazy_features:
+                job.lazy_features = True
+                logger.info(
+                    "  Retry %d for %s: switching to lazy feature reads",
+                    job.retry_count,
+                    job.job_id,
+                )
             self._retry_pending[job.job_id] = job
             return
         self._finish(

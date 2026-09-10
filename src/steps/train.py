@@ -55,7 +55,7 @@ from src.utils.artifact_names import (
 )
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
-from src.utils.device import resolve_device
+from src.utils.device import planned_vram_bytes, resolve_device
 from src.utils.identity import (
     PROVENANCE_SUFFIX,
     SELECTION_SPLITS,
@@ -966,12 +966,22 @@ def plan_training_admission(
     residency = resources.features.residency
     headroom = resources.host.headroom_bytes
     usable = max(0, budget.limit_bytes - headroom)
+    # ``auto`` weighs the resident feature matrix against the VRAM a
+    # worker will actually get, not against host RAM: the matrix travels
+    # to the card with the model.  Planned here rather than measured,
+    # because the parent never caps itself (see planned_vram_bytes).
+    vram_budget = planned_vram_bytes(
+        resources.gpu.vram_share,
+        requested_workers if requested_workers > 0 else 1,
+    )
     admitted: list[TrainingJob] = []
     refused: list[tuple[TrainingJob, str]] = []
     heaviest = 0
     for job in jobs:
         payload, _ = feature_payload_bytes(job.embeddings_path)
-        job.lazy_features = choose_lazy_features(residency, payload, usable)
+        job.lazy_features = choose_lazy_features(
+            residency, payload, usable, vram_budget_bytes=vram_budget
+        )
         estimate = estimate_job_bytes(job, processed_dir, config, lazy=job.lazy_features)
         if estimate.total > usable:
             refused.append((job, _refusal_reason(estimate, usable, budget.source)))
@@ -1053,7 +1063,12 @@ def lazy_features_for(config: dict, embeddings_path: str | Path | None) -> bool:
     budget = resolve_host_budget(config)
     payload, _ = feature_payload_bytes(embeddings_path)
     usable = max(0, budget.limit_bytes - resources.host.headroom_bytes)
-    return choose_lazy_features(residency, payload, usable)
+    return choose_lazy_features(
+        residency,
+        payload,
+        usable,
+        vram_budget_bytes=planned_vram_bytes(resources.gpu.vram_share),
+    )
 
 
 def _legit_trial_count(study) -> int:
