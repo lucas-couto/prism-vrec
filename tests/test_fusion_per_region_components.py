@@ -254,3 +254,107 @@ def test_the_component_flag_is_not_a_fusion_ingredient(tmp_path: Path) -> None:
 
     assert with_flag == without_flag
     assert as_component == without_flag, "the route must not enter the digest"
+
+
+def test_the_lazy_loader_accepts_per_region_component_sources(tmp_path: Path) -> None:
+    """The lazy path must carry the same recipe as the eager one.
+
+    Found 2026-09-09 on the first real ACF run: ``ConcatFeatureSource``
+    refused any 3-D source, so every learned-alignment component sidecar
+    failed the moment ``features.residency`` was set to ``lazy`` -- which
+    is exactly the setting that keeps ACF inside its memory budget.
+    """
+    _sources(tmp_path)
+    (tmp_path / "sidecar.json").write_text(
+        '{"strategy": "mean", "online": true, "alignment": "learned", "dim": 12,'
+        ' "components": ["resnet50_comp.npy", "vit_b16_comp.npy"], "normalize": true}',
+        encoding="utf-8",
+    )
+
+    source = load_embedding(tmp_path / "sidecar.json", lazy=True)
+
+    assert tuple(source.shape) == (N_ITEMS, REGIONS, D_A + D_B)
+    assert list(source.source_dims) == [D_A, D_B]
+    rows = source.read_rows(np.array([3, 1, 3]))
+    assert rows.shape == (3, REGIONS, D_A + D_B)
+
+    eager = load_embedding(tmp_path / "sidecar.json")
+    np.testing.assert_allclose(
+        rows.astype("float32"),
+        np.asarray(eager)[[3, 1, 3]].astype("float32"),
+        err_msg="lazy rows must equal the eager array for the same ids",
+    )
+
+
+def test_dense_and_lazy_acf_agree_on_the_projected_components(tmp_path: Path) -> None:
+    """Found 2026-09-09: the lazy path resolves through ``_resolve_visual``,
+    which ALREADY applies the per-region fusion, so ACF must not apply it a
+    second time.  Doing so split an aligned-width tensor by the native
+    ``source_dims`` and raised on the first real lazy run."""
+    _sources(tmp_path)
+    sidecar = tmp_path / "sidecar.json"
+    sidecar.write_text(
+        '{"strategy": "mean", "online": true, "alignment": "learned", "dim": 12,'
+        ' "components": ["resnet50_comp.npy", "vit_b16_comp.npy"], "normalize": true}',
+        encoding="utf-8",
+    )
+    train = {u: {(u * 3) % N_ITEMS, (u * 5) % N_ITEMS} for u in range(8)}
+    config = {"latent_dim": 8, "att_hidden": 8, "max_history": 5, "l2_reg": 1e-4}
+    history = torch.tensor([[0, 1, 2], [3, 4, 5]])
+
+    def projected(lazy: bool) -> torch.Tensor:
+        torch.manual_seed(0)
+        model = ACF(
+            8,
+            N_ITEMS,
+            visual_embeddings=load_embedding(sidecar, lazy=lazy),
+            config=config,
+            train_interactions=train,
+        ).train()
+        with torch.no_grad():
+            return model._projected_components(history)
+
+    dense, lazy = projected(False), projected(True)
+
+    assert dense.shape == (2, 3, REGIONS, 8)
+    torch.testing.assert_close(dense, lazy)
+
+
+@pytest.mark.parametrize(
+    "strategy, kwargs",
+    [
+        ("mean", {}),
+        ("sum", {}),
+        ("prod", {}),
+        ("max_pool", {}),
+        ("weighted_mean", {"weights": [0.3, 0.7]}),
+        ("softmax_weighted", {"logits": [1.0, 0.0]}),
+        ("sigmoid_gated", {"logits": [1.0, 0.0]}),
+        ("adaptive_gated", {}),
+    ],
+)
+def test_every_strategy_fuses_per_region_rows(strategy: str, kwargs: dict) -> None:
+    """EVERY enabled strategy must accept ``(B, R, sum(D_i))``, not just the
+    plain reductions.
+
+    Found 2026-09-09: the four weight-carrying strategies reshaped their
+    per-source weights to a fixed rank, which broadcast against the wrong
+    axes once a region axis existed.  They were the only ones that failed
+    on the first real ACF run, and the unit tests missed it because they
+    exercised ``mean`` alone.
+    """
+    from src.fusions.online import LearnedAlignmentFusion
+
+    torch.manual_seed(0)
+    fusion = LearnedAlignmentFusion(
+        source_dims=[D_A, D_B], dim=12, strategy=strategy, normalize=True, **kwargs
+    )
+    pooled = torch.randn(5, D_A + D_B)
+    per_region = torch.randn(5, REGIONS, D_A + D_B)
+
+    assert fusion(pooled).shape == (5, 12)
+    assert fusion(per_region).shape == (5, REGIONS, 12)
+
+    # Region r of the batch must equal the pooled result on those rows:
+    # the fusion is last-axis-wise and must not mix regions.
+    torch.testing.assert_close(fusion(per_region)[:, 1, :], fusion(per_region[:, 1, :]))

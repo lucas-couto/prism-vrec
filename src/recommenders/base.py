@@ -389,8 +389,13 @@ class BaseRecommender(nn.Module, abc.ABC):
         return self._fuse_rows(item_ids)
 
     def _fuse_rows(self, item_ids: torch.Tensor) -> torch.Tensor:
-        """Gather the raw rows of ``item_ids`` and apply the online fusion."""
-        rows = self._raw_visual_rows(item_ids)
+        """Gather the raw rows of ``item_ids`` and apply the online fusion.
+
+        The rows are cast to float first: a component source keeps its
+        on-disk fp16 (see :meth:`_raw_visual_rows`), while the fusion's
+        projections are fp32, and ``Linear`` refuses the mix.
+        """
+        rows = self._raw_visual_rows(item_ids).float()
         from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
 
         if isinstance(self._online_fusion, LearnedAlignmentFusion):
