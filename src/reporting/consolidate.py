@@ -41,22 +41,85 @@ def _known_recommenders() -> list[str]:
         return list(_BUILTIN_RECOMMENDERS)
 
 
-def consolidate_evaluation(tables_dir: Path) -> pd.DataFrame:
-    """Aggregate per-user evaluation CSVs into one row per cell × metric × k."""
+#: Rows read per chunk when a per-user evaluation table is consolidated.
+#: Melting the whole table first is what made this step unusable: a
+#: 2.57 M-row table with 30 metric columns becomes a 77 M-row
+#: intermediate on the way to a 2 025-row output, and the step was
+#: OOM-killed at the container's 16 GB limit (found 2026-09-09).  The
+#: melt is row-wise and the aggregation is a sum plus a count, so
+#: chunking gives the same numbers at bounded memory.
+EVALUATION_CHUNK_ROWS = 200_000
+
+#: Cell identity in the consolidated evaluation file, in column order.
+_GROUP_KEYS = (
+    "dataset",
+    "file_condition",
+    "recommender",
+    "embedding_name",
+    "extractor",
+    "fusion",
+    "condition",
+    "embedding_dim",
+    "metric",
+    "k",
+)
+
+
+def _chunk_totals(long_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per cell with this chunk's ``sum`` and ``size`` of ``value``.
+
+    Accumulated with pandas rather than a dict: a cell identity can carry
+    a missing ``embedding_dim``, and ``NaN != NaN``, so dict keys never
+    matched across chunks and every chunk produced its own row (each
+    reporting its own chunk size as ``n_users``).
+    """
+    keys = [k for k in _GROUP_KEYS if k in long_df.columns]
+    return long_df.groupby(keys, dropna=False)["value"].agg(total="sum", count="size").reset_index()
+
+
+def consolidate_evaluation(
+    tables_dir: Path,
+    *,
+    datasets: set[str] | None = None,
+    conditions: set[str] | None = None,
+) -> pd.DataFrame:
+    """Aggregate per-user evaluation CSVs into one row per cell x metric x k.
+
+    ``datasets`` / ``conditions`` restrict the sweep to the run's own
+    scope.  Without them the step globbed the whole tables directory and
+    mixed a superseded run into the consolidated file: on 2026-09-09 a
+    ``frozen`` amazon_men run also consolidated amazon_fashion
+    ``finetuned`` tables written two days earlier.  ``None`` keeps the
+    historical sweep-everything behaviour for callers with no scope.
+    """
     frames: list[pd.DataFrame] = []
     for path in sorted(tables_dir.glob("*_evaluation_*.csv")):
         info = classify_table_file(path)
         if info is None or info["kind"] != "evaluation":
             continue
-        eval_df = pd.read_csv(path)
-        long_df = evaluation_to_long(
-            eval_df,
-            dataset=info["dataset"],
-            condition=info["condition"],
-        )
-        if long_df.empty:
+        if datasets is not None and info["dataset"] not in datasets:
+            logger.info("  evaluation: %s outside this run's datasets - skipped.", path.name)
             continue
-        aggregated = _aggregate_per_user(long_df)
+        if conditions is not None and info["condition"] not in conditions:
+            logger.info("  evaluation: %s outside this run's conditions - skipped.", path.name)
+            continue
+        partials: list[pd.DataFrame] = []
+        for chunk in pd.read_csv(path, chunksize=EVALUATION_CHUNK_ROWS):
+            long_df = evaluation_to_long(
+                chunk,
+                dataset=info["dataset"],
+                condition=info["condition"],
+            )
+            if not long_df.empty:
+                partials.append(_chunk_totals(long_df))
+        if not partials:
+            continue
+        combined = pd.concat(partials, ignore_index=True)
+        keys = [k for k in _GROUP_KEYS if k in combined.columns]
+        summed = combined.groupby(keys, dropna=False)[["total", "count"]].sum().reset_index()
+        aggregated = summed.assign(
+            n_users=summed["count"], mean=summed["total"] / summed["count"]
+        ).drop(columns=["total", "count"])
         frames.append(aggregated)
         logger.info("  evaluation: %s rows from %s", len(aggregated), path.name)
 
@@ -179,6 +242,9 @@ def consolidate_statistical_tests(
 def write_consolidated(
     tables_dir: Path,
     output_dir: Path | None = None,
+    *,
+    datasets: set[str] | None = None,
+    conditions: set[str] | None = None,
 ) -> dict[str, Path]:
     """Run the three consolidations and write the resulting CSVs.
 
@@ -191,7 +257,7 @@ def write_consolidated(
     known_recs = _known_recommenders()
 
     logger.info("Consolidating evaluation...")
-    eval_long = consolidate_evaluation(tables_dir)
+    eval_long = consolidate_evaluation(tables_dir, datasets=datasets, conditions=conditions)
     eval_path = out_dir / "evaluation_aggregated.csv"
     eval_long.to_csv(eval_path, index=False)
 

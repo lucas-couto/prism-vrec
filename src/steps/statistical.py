@@ -285,7 +285,14 @@ def run(condition: str = "frozen") -> None:
     try:
         from src.reporting.consolidate import write_consolidated
 
-        written = write_consolidated(results_dir)
+        # Scope the sweep to THIS run: without it the step globbed the
+        # whole tables directory and mixed a superseded run's numbers
+        # into the consolidated file (2026-09-09).
+        written = write_consolidated(
+            results_dir,
+            datasets=set(datasets) or None,
+            conditions=({"frozen", "finetuned"} if condition == "all" else {condition}),
+        )
         for label, path in written.items():
             logger.info("Long-format %s: %s", label, path)
     except Exception as exc:  # noqa: BLE001
