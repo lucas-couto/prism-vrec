@@ -8,6 +8,51 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Changed
+
+- **`main.py` takes no arguments at all.** The last flags went with the
+  step: `--battery`, `--retry-failed`, `--folds`, `--show-plan`,
+  `--battery-status`, `--report` (+ `--report-metric` / `--report-top`),
+  `--inspect-pending`, `--validate-dataset`, `--validate-features`, the
+  four `--list-*`, and `--config-dir` — the configuration directory is
+  always `configs/`, so nothing needed to replace that one. What the
+  command does is now a YAML key, `pipeline.mode`: `pipeline` (default),
+  `battery`, `show_plan`, `battery_status`, `report`, `inspect_pending`,
+  `validate_features`, `validate_datasets` or `list`; the battery's
+  re-dispatch is `pipeline.retry_failed`. There is no parser left to
+  hold a flag: any argument fails naming the key that carries its
+  behaviour, and an unknown one points at `configs/default.yaml`.
+
+- **K-fold is a pipeline step, and `--folds` is gone.** `folds.enabled`
+  was declared in the YAML but the pipeline ignored it: the only way to
+  run the folds was a CLI flag, so a config key stated an intent nothing
+  acted on. `folds` now sits in `STEP_ORDER` between `train` and
+  `evaluate` — where it belongs, because when it is enabled it REPLACES
+  the single-split evaluation as the producer of the per-user records,
+  concatenating the K partial artifacts into the canonical
+  `results/per_user/` location that `beyond_accuracy` and `statistical`
+  read. The step is inert when `folds.enabled` is false, so it can stay
+  in the order for every run, and `pipeline.start_from` / `stop_at`
+  reach it like any other step. `--folds` joins the removed flags and
+  fails naming the YAML key that replaced it.
+
+- **VBPR and AVBPR now spend the full shared budget on collaborative
+  factors, with their visual dimensions beside it instead of inside
+  it.** `dim_split` moves from `half` to `latent`, so at `total_dim` T a
+  visual model holds `latent_dim = T` and `visual_dim = T` where it
+  previously held `T/2` of each. Until now VBPR faced BPR-MF with half
+  the collaborative capacity at the same T — 64 latent factors against
+  128 at T=128 — which was the leading explanation for VBPR trailing
+  BPR rather than any property of the visual term: the earlier logs
+  already showed BPR-64 0.0033 < VBPR-64+64 0.0069 < BPR-128 0.0086,
+  VBPR winning at equal collaborative capacity and losing at equal
+  total. A comparison at fixed T is now a comparison of the visual
+  mechanism. A visual model consequently holds more parameters than
+  BPR-MF at the same T, by exactly its visual side, which is the
+  intended asymmetry. `"half"` remains a supported `dim_split`; no model
+  registers it. **Every VBPR/AVBPR result produced before this change is
+  not comparable to results produced after it** and has to be rebuilt.
+
 ### Added
 
 - **ACF joins the fusion family through early per-region fusion.** ACF
@@ -28,6 +73,31 @@ Dates are UTC.
   `docs/reliability-sdd/S05.md`.
 
 ### Fixed
+
+- **An out-of-memory job is retried with lazy feature reads instead of
+  repeating the same allocation.** Every OOM observed in production was
+  raised while ALLOCATING — about two seconds after the job started,
+  before its first epoch — and the retry only shrank the ranking budget,
+  which changes nothing outside the ranking loop. The job came back
+  byte-for-byte identical, OOM'd again, burned its two retries and was
+  marked failed, and a failed job fails the whole run. The first retry
+  now also switches the job to lazy reads, so the feature matrix stops
+  being resident and every gather is bounded and de-duplicated; the
+  numerical result is unchanged. Verified on ACF over amazon_men, where
+  9 of 11 cells died allocating under `dense` and were recovered.
+
+- **`features.residency: auto` weighs the feature matrix against VRAM,
+  not host RAM.** The resident matrix travels to the card with the
+  model, but `auto` compared it against the host budget, so it was
+  effectively unreachable: amazon_women's 2.9 GB ResNet-50 matrix never
+  exceeds half of a 16 GB host limit, while it is a third of what a
+  16 GB card leaves at `vram_share: 0.95`. `choose_lazy_features` gained
+  a keyword-only `vram_budget_bytes` (default preserves the old
+  behaviour) and the new `planned_vram_bytes` derives the per-worker
+  allowance from the card and the configured share, because the parent
+  that plans admission never caps itself and would otherwise read the
+  whole card. `auto` still only sees the RESIDENT payload: a peak that
+  is transient in the batch, as ACF's, is caught by the OOM retry above.
 
 - **VNPR collapsed to a constant score on 79 of 320 battery cells: the
   single ReLU neuron died at initialisation.** The dense bias started at

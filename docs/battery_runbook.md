@@ -10,7 +10,7 @@ failures.
    the fused matrices must exist under `data/embeddings/<dataset>/`.
 2. **Feature sanity gate** (Task G) — fails loud before burning credit:
    ```
-   uv run python main.py --validate-features
+   uv run python main.py   # configs/default.yaml -> pipeline.mode: validate_features
    ```
    Exits with a non-zero code and a clear message if any matrix is
    corrupted (NaN/Inf, wrong shape/dim/dtype, zeroed row). `train`/`fuse`
@@ -59,7 +59,7 @@ dead and the whole pipeline runs (`tests/test_local_override.py` pins
 this). `--show-plan` prints the steps the merged YAML resolves to.
 
 ```
-uv run python main.py --battery
+uv run python main.py   # configs/default.yaml -> pipeline.mode: battery
 ```
 The runner:
 - **enumerates** the cells (datasets × visual configs × recommenders ×
@@ -77,7 +77,7 @@ compose logs` — see `docs/protocol.md` about the progress bar).
 
 Just **relaunch the same command**:
 ```
-uv run python main.py --battery
+uv run python main.py   # configs/default.yaml -> pipeline.mode: battery
 ```
 `done` cells are skipped; training resumes from the last checkpoint and
 the search from the Optuna storage. Nothing completed is redone.
@@ -117,7 +117,7 @@ I03/I04, S03):
 ## Track progress and cost projection
 
 ```
-uv run python main.py --battery-status
+uv run python main.py   # configs/default.yaml -> pipeline.mode: battery-status
 ```
 Prints the count per state (`pending/running/done/failed`) and the
 **estimate of remaining hours** (average duration per cell type ×
@@ -138,7 +138,7 @@ A cell that fails is isolated (the others keep going) and marked `failed`
 in the manifest with the error message. To reprocess only the ones that
 failed:
 ```
-uv run python main.py --battery --retry-failed
+uv run python main.py   # pipeline.mode: battery + pipeline.retry_failed: true
 ```
 
 Failure semantics since 3.0.0 (task records E01/E02, M05):
@@ -147,7 +147,7 @@ Failure semantics since 3.0.0 (task records E01/E02, M05):
   returned by `run_cli`: `0` only when every required unit succeeded,
   `1` on any failure (with the traceback logged), `130` on Ctrl-C. The
   run manifest records `exit_status: "error"`.
-- `--battery` and `--folds` raise `IncompleteRunError` when any cell of
+- `pipeline.mode: battery` and the `folds` step raise `IncompleteRunError` when any cell of
   the manifest is not `done` (`failed`, `pending` or `running`), so a
   battery that lost cells cannot end with a success marker; the
   manifest is left as-is for `--retry-failed`. `run_battery` /
@@ -192,7 +192,7 @@ Failure semantics since 3.0.0 (task records E01/E02, M05):
   and `{dataset}_{condition}[_restricted]_integrity.json` — the
   latter written BEFORE the tests with the distinct-seed count, the
   shared provenance, expected / completed / missing cells and any cell
-  excluded by population, with the reason. `python main.py --report`
+  excluded by population, with the reason. `pipeline.mode: report`
   finds the partitioned files by suffix.
 
 Any accuracy metric is **recomputable** from the persisted rank, for any
@@ -255,7 +255,9 @@ After the hyperparameter search has finished (or with
 and run:
 
 ```bash
-python main.py --folds
+# configs/default.yaml -> folds.enabled: true; the `folds` STEP then runs
+# in pipeline order (start_from / stop_at reach it like any other step)
+python main.py
 ```
 
 The runner (`src/folds/runner.py`) is resumable through

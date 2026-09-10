@@ -413,7 +413,8 @@ support).
 #### Validating before you launch a multi-day run
 
 ```bash
-python main.py --validate-dataset <name>
+# configs/default.yaml -> pipeline.mode: validate_datasets
+python main.py
 ```
 
 The check fails with a non-zero exit code when the layout is broken

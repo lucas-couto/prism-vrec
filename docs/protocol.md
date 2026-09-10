@@ -209,7 +209,7 @@ user's own val/test positives are eligible to be drawn as negatives
 standard protocol, with negligible metric deflation given catalogue
 sizes.
 
-## 3b. User-level K-fold cross-validation (`python main.py --folds`)
+## 3b. User-level K-fold cross-validation (the `folds` pipeline step)
 
 Precedent: Rendle et al. (UAI 2009, §6.2) evaluate BPR with
 leave-one-out, repeat the experiment 10 times over freshly drawn splits,
@@ -475,12 +475,34 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   grid is configurable (`3` = nine regions) and recorded in the
   artifact's `.meta.json` (`component_grid`, `pooling`).
 - **Dimension parity**: every recommender draws its dimensions from one
-  budget `common.total_dim` (`RecommenderSpec.dim_split`): BPR-MF
-  `latent_dim = T`, VBPR/AVBPR `latent_dim = visual_dim = T/2` (the
-  paper's 50/50 split), DeepStyle `d = T`, ACF `k = T`, VNPR latent
-  `k = T`. `assert_dimension_parity` refuses a direct `latent_dim` /
-  `visual_dim` anywhere. VNPR's visual user vector is `D_backbone`-wide
-  by construction and is declared outside the budget.
+  budget `common.total_dim` (`RecommenderSpec.dim_split`), and that
+  budget is the **collaborative** capacity: `latent_dim = T` for BPR-MF,
+  VBPR/AVBPR, VNPR, DeepStyle (`d = T`) and ACF (`k = T`). A visual
+  model's own dimensions sit **beside** the budget rather than inside
+  it: VBPR/AVBPR get `visual_dim = T` alongside their `T` latent
+  factors, and VNPR's visual user vector is `D_backbone`-wide by
+  construction. A comparison at a fixed `T` is therefore a comparison of
+  the visual mechanism, not of how many collaborative factors each model
+  was left with. `assert_dimension_parity` refuses a direct `latent_dim`
+  / `visual_dim` anywhere.
+  **Changed 2026-09-09 (researcher's decision).** Until then VBPR/AVBPR
+  used `dim_split: half` — `latent_dim = visual_dim = T/2` — so at
+  `T = 128` VBPR competed against BPR-MF holding 64 collaborative
+  factors against BPR's 128. That accounting, not the visual term, was
+  the leading explanation for VBPR trailing BPR on amazon_fashion
+  (hypothesis H1 of the 2026-09-07 fidelity audit: the logs already
+  showed BPR-64 0.0033 < VBPR-64+64 0.0069 < BPR-128 0.0086, i.e. VBPR
+  beating BPR at equal collaborative capacity and losing at equal
+  total). Consequences, stated rather than discovered: a visual model
+  now holds more parameters than BPR-MF at the same `T`, by exactly its
+  visual side — that asymmetry is the deliberate choice, since charging
+  the visual dimensions against the collaborative budget is what made
+  the earlier comparison unfair; and **every VBPR/AVBPR result produced
+  before this change is not comparable to results produced after it**,
+  because the same `T` now resolves to different dimensions. `"half"`
+  remains a supported value of `dim_split`; no model registers it.
+  Guarded by
+  `tests/test_dimension_parity.py::TestRegisteredModelsShareTheCollaborativeBudget`.
 - **Per-paper formulations and regularisation** (2.10.0): each built-in
   reproduces its paper's score and L2 scheme rather than a shared
   convention. BPR-MF: `γ_u^T γ_i`, no item bias, `λ_W / λ_H+ / λ_H−`

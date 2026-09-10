@@ -390,7 +390,8 @@ Notes:
 ## 10. "Dry-run, what is still pending in Battery 1?"
 
 ```bash
-python main.py --inspect-pending frozen
+# configs/default.yaml -> pipeline.mode: inspect_pending (over pipeline.condition)
+python main.py
 ```
 
 Prints a per-`(dataset, model)` count of training jobs that have not
