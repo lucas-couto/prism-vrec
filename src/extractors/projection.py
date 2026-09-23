@@ -54,7 +54,7 @@ from typing import Any
 
 import numpy as np
 
-from src.utils.artifact_names import FINETUNED_MARKER
+from src.utils.artifact_names import FINETUNED_MARKER, PROJECTION_METHOD_TOKENS
 from src.utils.atomic_io import atomic_np_memmap_save, atomic_write
 from src.utils.identity import (
     check_provenance,
@@ -264,22 +264,30 @@ def projection_provenance(
     }
 
 
-def projected_path(source_npy: Path, dim: int) -> Path:
+def projected_path(source_npy: Path, cfg: ProjectionConfig) -> Path:
     """Destination of the projected artifact for *source_npy*.
 
-    The ``_p<dim>`` token goes immediately after the extractor name and
-    *before* ``_finetuned``, so the projected artifacts of both
-    conditions compose with the ``{extractor}{condition_suffix}`` naming
-    the fuse step builds its source paths from: setting
-    ``fusion_extractors: [resnet50_p128, vit_b16_p128]`` then resolves to
-    ``resnet50_p128.npy`` for the frozen condition and
-    ``resnet50_p128_finetuned.npy`` for the fine-tuned one.
+    The token is ``<method><dim>`` -- ``pca128``, ``pcaw128``,
+    ``rand128``.  The METHOD is part of it because the width is not an
+    identity: ``pca`` and ``pca_whitened`` at one width wrote the same
+    file under the old ``p<dim>`` token, so a grid could not hold both
+    and the artifact of whichever ran first was reused for the other
+    (2026-09-10).
+
+    It goes immediately after the extractor name and *before*
+    ``_finetuned``, so the projected artifacts of both conditions
+    compose with the ``{extractor}{condition_suffix}`` naming the fuse
+    step builds its source paths from: setting ``fusion_extractors:
+    [resnet50_pca128, vit_b16_pca128]`` then resolves to
+    ``resnet50_pca128.npy`` for the frozen condition and
+    ``resnet50_pca128_finetuned.npy`` for the fine-tuned one.
     """
+    token = f"{PROJECTION_METHOD_TOKENS[cfg.method]}{cfg.dim}"
     stem = source_npy.stem
     if stem.endswith(FINETUNED_MARKER):
-        stem = f"{stem[: -len(FINETUNED_MARKER)]}_p{dim}{FINETUNED_MARKER}"
+        stem = f"{stem[: -len(FINETUNED_MARKER)]}_{token}{FINETUNED_MARKER}"
     else:
-        stem = f"{stem}_p{dim}"
+        stem = f"{stem}_{token}"
     return source_npy.with_name(f"{stem}.npy")
 
 
@@ -314,7 +322,7 @@ def ensure_projected(
         from other ingredients.
     """
     source_npy = Path(source_npy)
-    output = projected_path(source_npy, cfg.dim)
+    output = projected_path(source_npy, cfg)
     expected = projection_provenance(source_npy, cfg, train_items)
     if output.exists():
         check_provenance(output, expected, label=str(output))

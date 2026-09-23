@@ -41,6 +41,7 @@ from src.utils.artifact_names import (
     COMPONENT_SUFFIX,
     FINETUNED_MARKER,
     FUSION_PREFIX,
+    PROJECTED_SEGMENT,
     is_finetuned_artifact,
 )
 from src.utils.logging import get_logger
@@ -104,9 +105,21 @@ def _embedding_kind(name: str) -> str:
 
 
 def _backbone_base(name: str) -> str:
-    """Strip routing tokens so component/finetuned variants group with
-    their base backbone (``resnet50_finetuned_comp`` → ``resnet50``)."""
-    return name.removesuffix(COMPONENT_SUFFIX).replace(FINETUNED_MARKER, "")
+    """Strip routing tokens so component/finetuned/projected variants
+    group with their base backbone (``resnet50_finetuned_comp`` →
+    ``resnet50``, ``resnet50_pcaw128`` → ``resnet50``).
+
+    The projection belongs here for the same reason the others do: it
+    says how a backbone's feature was routed to a model, not which
+    backbone it is.  VNPR reads the offline reduction its paper
+    prescribes while VBPR reads the raw feature its own paper
+    prescribes; leaving the token in would file them under two
+    different "backbones" and dissolve the model-within-backbone
+    question they exist to answer.
+    """
+    stem = name.removesuffix(COMPONENT_SUFFIX).replace(FINETUNED_MARKER, "")
+    parts = [part for part in stem.split("_") if not PROJECTED_SEGMENT.match(part)]
+    return "_".join(parts)
 
 
 def _condition_of(name: str) -> str:

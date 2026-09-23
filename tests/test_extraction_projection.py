@@ -22,6 +22,7 @@ from src.extractors.projection import (
     projected_path,
     resolve_projection_config,
 )
+from src.steps.extract import _extract_for_config
 
 
 @pytest.fixture
@@ -85,14 +86,81 @@ class TestConfigResolution:
 
 
 class TestArtifactNaming:
-    def test_token_follows_the_extractor_name(self, tmp_path):
-        assert projected_path(tmp_path / "resnet50.npy", 128).name == "resnet50_p128.npy"
+    def test_token_carries_the_method_and_the_width(self, tmp_path):
+        """Width alone is not an identity: two methods share a width.
+
+        The old ``p<dim>`` token let a ``pca`` artifact and a
+        ``pca_whitened`` one collide on the same filename, so they could
+        not coexist in a run and the stale one was silently reused
+        (2026-09-10).
+        """
+        cases = {
+            "pca": "resnet50_pca128.npy",
+            "pca_whitened": "resnet50_pcaw128.npy",
+            "random": "resnet50_rand128.npy",
+        }
+        for method, expected in cases.items():
+            cfg = ProjectionConfig(method=method, dim=128, seed=42)
+
+            assert projected_path(tmp_path / "resnet50.npy", cfg).name == expected
+
+    def test_two_methods_of_one_width_do_not_collide(self, tmp_path):
+        source = tmp_path / "resnet50.npy"
+        plain = projected_path(source, ProjectionConfig(method="pca", dim=128, seed=42))
+        whitened = projected_path(source, ProjectionConfig(method="pca_whitened", dim=128, seed=42))
+
+        assert plain != whitened
 
     def test_token_precedes_the_finetuned_marker(self, tmp_path):
         """So fuse's `{extractor}{condition_suffix}` resolves in both conditions."""
-        out = projected_path(tmp_path / "resnet50_finetuned.npy", 128)
+        cfg = ProjectionConfig(method="pca", dim=128, seed=42)
+        out = projected_path(tmp_path / "resnet50_finetuned.npy", cfg)
 
-        assert out.name == "resnet50_p128_finetuned.npy"
+        assert out.name == "resnet50_pca128_finetuned.npy"
+
+
+class TestNameClassification:
+    """``src.utils.artifact_names`` owns the parse side of the token."""
+
+    def test_every_method_token_is_recognised_as_projected(self):
+        from src.utils.artifact_names import is_projected_artifact
+
+        for name in ("resnet50_pca128", "resnet50_pcaw128", "resnet50_rand64"):
+            assert is_projected_artifact(name), name
+
+    def test_the_legacy_width_only_token_is_still_recognised(self):
+        """Read-only compatibility, and the failure it prevents.
+
+        A leftover ``resnet50_p128.npy`` is no longer written, but if one
+        survives it must not be globbed up as a native backbone of its
+        own -- it would enter the statistical families beside the real
+        ResNet-50 as a separate backbone.
+        """
+        from src.utils.artifact_names import is_projected_artifact
+
+        assert is_projected_artifact("resnet50_p128")
+
+    def test_the_width_is_parsed_from_either_token(self):
+        from src.utils.artifact_names import projection_dim
+
+        assert projection_dim("resnet50_pcaw128") == 128
+        assert projection_dim("resnet50_p128") == 128
+        assert projection_dim("resnet50") is None
+
+    def test_the_method_is_parsed_from_the_new_token_only(self):
+        from src.utils.artifact_names import projection_method
+
+        assert projection_method("resnet50_pcaw128") == "pca_whitened"
+        assert projection_method("resnet50_pca128") == "pca"
+        assert projection_method("resnet50_rand64") == "random"
+        assert projection_method("resnet50_p128") is None
+        assert projection_method("resnet50") is None
+
+    def test_an_extractor_named_like_a_token_is_not_mistaken(self):
+        from src.utils.artifact_names import is_projected_artifact
+
+        assert not is_projected_artifact("clip_patch")
+        assert not is_projected_artifact("hybrid_pca_nc128")
 
 
 class TestRandomProjection:
@@ -316,12 +384,26 @@ class TestContract:
         script = (
             "import numpy as np;"
             "from src.extractors.projection import _random_matrix;"
-            "np.save('%s', _random_matrix(512, 32, 5, 'resnet50_p32'))"
+            "np.save('%s', _random_matrix(512, 32, 5, 'resnet50_rand32'))"
         ) % (native.parent / "second.npy")
         subprocess.run([sys.executable, "-c", script], check=True)
         second = np.load(native.parent / "second.npy")
 
         np.testing.assert_array_equal(first, second)
+
+
+class _NoBackbone:
+    """Sentinel extractor: instantiating it means the cell re-extracted.
+
+    A cell whose pooled artifact is already on disk must reach the
+    projection without loading a backbone, so any construction here is
+    itself the failure.
+    """
+
+    supports_components = False
+
+    def __init__(self, *args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError("the backbone must not be instantiated for a projection-only cell")
 
 
 class TestExtractStepIntegration:
@@ -341,8 +423,11 @@ class TestExtractStepIntegration:
 
         native = self._native(tmp_path)
 
-        assert _project_pooled(native, ProjectionConfig(method="random", dim=64), None) is True
-        assert np.load(tmp_path / "resnet50_p64.npy").shape == (30, 64)
+        assert (
+            _project_pooled(native, ProjectionConfig(method="random", dim=64, seed=42), None)
+            is True
+        )
+        assert np.load(tmp_path / "resnet50_rand64.npy").shape == (30, 64)
 
     def test_the_sidecar_declares_the_projected_width(self, tmp_path):
         """Otherwise the loader's meta cross-check rejects the artifact."""
@@ -351,10 +436,10 @@ class TestExtractStepIntegration:
         native = self._native(tmp_path)
         _project_pooled(native, ProjectionConfig(method="random", dim=64), None)
 
-        meta = json.loads((tmp_path / "resnet50_p64.meta.json").read_text())
+        meta = json.loads((tmp_path / "resnet50_rand64.meta.json").read_text())
         assert meta["native_dim"] == 64
         assert meta["source_native_dim"] == 512
-        assert meta["name"] == "resnet50_p64"
+        assert meta["name"] == "resnet50_rand64"
         assert meta["projection"] == {"method": "random", "dim": 64, "source": "resnet50.npy"}
 
     def test_the_sidecar_passes_the_loader_cross_check(self, tmp_path):
@@ -363,7 +448,7 @@ class TestExtractStepIntegration:
 
         native = self._native(tmp_path)
         _project_pooled(native, ProjectionConfig(method="random", dim=64), None)
-        projected = tmp_path / "resnet50_p64.npy"
+        projected = tmp_path / "resnet50_rand64.npy"
 
         _validate_against_meta(projected, np.load(projected))
 
@@ -374,7 +459,7 @@ class TestExtractStepIntegration:
         native = self._native(tmp_path)
         _project_pooled(native, ProjectionConfig(method="random", dim=64), None)
 
-        meta = json.loads((tmp_path / "resnet50_p64.meta.json").read_text())
+        meta = json.loads((tmp_path / "resnet50_rand64.meta.json").read_text())
         assert meta["weights_id"] == "IMAGENET1K_V2"
 
     def test_no_projection_configured_writes_nothing(self, tmp_path):
@@ -384,6 +469,83 @@ class TestExtractStepIntegration:
 
         assert _project_pooled(native, None, None) is False
         assert list(tmp_path.glob("*_p*.npy")) == []
+
+    def test_a_projection_of_another_recipe_is_not_reused_by_name(self, tmp_path):
+        """The token encodes name and width, never the whole recipe.
+
+        ``_extract_for_config`` used to decide by the mere EXISTENCE of
+        the projected artifact.  The name cannot carry the fit set or
+        the seed, so a cell configured for another recipe was skipped
+        whole: ``ensure_projected`` never ran, and with it the
+        provenance check that would have caught the mismatch.  The stale
+        array then fed training as if it were the configured one
+        (amazon_women probe, 2026-09-10).
+        """
+        from src.utils.identity import ArtifactProvenanceError
+
+        self._native(tmp_path)
+        fit = list(range(30))
+        _extract_for_config(
+            extractor_cls=_NoBackbone,
+            extractor_name="resnet50",
+            dataset_name=tmp_path.name,
+            image_dir="",
+            item_ids=[],
+            embeddings_dir=str(tmp_path.parent),
+            batch_size=1,
+            checkpoint_every=1,
+            device="cpu",
+            config={},
+            projection=ProjectionConfig(method="pca", dim=64, seed=42),
+            train_items=fit,
+        )
+        assert (tmp_path / "resnet50_pca64.npy").exists()
+
+        # The METHOD no longer collides -- it is in the name since
+        # 2026-09-10, which removes that class outright.  What still
+        # shares one path is everything else in the recipe, and the
+        # skip predicate must not decide those by existence either.
+        with pytest.raises(ArtifactProvenanceError, match="seed"):
+            _extract_for_config(
+                extractor_cls=_NoBackbone,
+                extractor_name="resnet50",
+                dataset_name=tmp_path.name,
+                image_dir="",
+                item_ids=[],
+                embeddings_dir=str(tmp_path.parent),
+                batch_size=1,
+                checkpoint_every=1,
+                device="cpu",
+                config={},
+                projection=ProjectionConfig(method="pca", dim=64, seed=7),
+                train_items=fit,
+            )
+
+    def test_the_projector_sidecar_is_not_a_phantom_embedding(self, tmp_path):
+        """`.proj.json` describes a projector; it is not an online fusion.
+
+        The embedding glob reads `hybrid_*.json` as online-fusion
+        sidecars.  Projecting a FUSION output (2026-09-10) put a
+        `.proj.json` next to one for the first time, and every such file
+        became an embedding named `hybrid_*_pcaw128.proj` whose jobs
+        could only fail: "online sidecar ... lists no components; cannot
+        stack".
+        """
+        from src.steps.extract import _project_pooled
+        from src.steps.train import get_embedding_files
+
+        dataset_dir = tmp_path / "amazon_men"
+        dataset_dir.mkdir()
+        fusion = dataset_dir / "hybrid_concat.npy"
+        rng = np.random.default_rng(3)
+        np.save(fusion, rng.standard_normal((30, 128)).astype(np.float32))
+        _project_pooled(fusion, ProjectionConfig(method="random", dim=64, seed=42), None)
+
+        stems = get_embedding_files(str(tmp_path), "amazon_men")
+
+        assert (dataset_dir / "hybrid_concat_rand64.proj.json").exists(), "fixture guard"
+        assert "hybrid_concat_rand64" in stems
+        assert not any(stem.endswith(".proj") for stem in stems), stems
 
     def test_projected_artifacts_are_discovered_as_embeddings(self, tmp_path):
         """train/evaluate pick them up by globbing, so they need no registration."""
@@ -401,6 +563,6 @@ class TestExtractStepIntegration:
 
         stems = get_embedding_files(str(tmp_path), "amazon_fashion")
 
-        assert "resnet50_p128" in stems
-        assert "vit_b16_p128" in stems
+        assert "resnet50_rand128" in stems
+        assert "vit_b16_rand128" in stems
         assert "resnet50" in stems

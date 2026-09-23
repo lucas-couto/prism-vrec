@@ -27,9 +27,23 @@ from typing import Any
 import torch
 import torch.multiprocessing as mp
 
+from src.utils import timing
 from src.utils.atomic_io import atomic_write
+from src.utils.cost_labels import embedding_labels
+from src.utils.cuda_faults import CudaContextLostError, is_fatal_cuda_error
+from src.utils.job_progress import JobProgress
 from src.utils.logging import get_logger
 from src.utils.memory import AdmissionPlan, available_cpus, plan_pool_workers
+from src.utils.oom_recoveries import (
+    OUTCOME_FAILED as RECOVERY_FAILED,
+)
+from src.utils.oom_recoveries import (
+    OUTCOME_RECOVERED,
+    OUTCOME_RETRYING,
+    escalate,
+    record_recovery,
+)
+from src.utils.progress import render_cells
 from src.utils.resources import ResourcesConfig, resolve_resources
 
 logger = get_logger(__name__)
@@ -45,11 +59,32 @@ _OOM_SHRINK_PER_RETRY = 0.5
 #: parallel path alike; only ``torch.cuda.OutOfMemoryError`` is retried.
 MAX_OOM_RETRIES = 2
 
+#: Consecutive non-OOM job errors that trip the circuit breaker.  A
+#: poisoned CUDA context -- a Xid 8 launch timeout, a wedged driver --
+#: fails every job it touches within seconds of the launch, so without a
+#: breaker one hardware fault spends the entire remaining queue against
+#: it and reports thousands of "failed" cells that never really ran.
+#: Five in a row is past any plausible streak of independent per-cell
+#: faults: the grid drives every cell through the same code path, so a
+#: genuine job-specific defect does not repeat across five unrelated
+#: model x embedding x dataset combinations.  Only ``ok`` resets the
+#: streak; an ``oom`` is neutral, because it has its own
+#: retry-and-escalate path and says nothing about the context being
+#: poisoned.  The jobs left in the queue are CANCELLED rather than
+#: failed, so the manifest keeps "never attempted" distinct from
+#: "attempted and failed" -- and the step still raises, because a
+#: cancelled job is not an ``ok`` one.
+MAX_CONSECUTIVE_ERRORS = 5
+
+#: Status of the sentinel a worker publishes when its breaker trips.  It
+#: carries no ``job_id``: it is a statement about the worker, not about
+#: any one job, and the parent intercepts it before the registry sees it.
+_STATUS_ABORTED = "aborted"
+
 #: Seconds the parent waits on the result queue before it checks its
-#: workers for unexpected exits.  Progress is logged at most every
-#: ``_PROGRESS_LOG_S`` seconds regardless of this poll.
+#: workers for unexpected exits.  Progress reporting keeps its own
+#: cadence (``src.utils.job_progress.PROGRESS_LOG_S``) regardless of it.
 _RESULT_POLL_S = 5.0
-_PROGRESS_LOG_S = 30.0
 
 #: Value of a worker's slot in the shared assignment table when it is
 #: not running any job.
@@ -164,6 +199,9 @@ class TrainingJob:
     #: Read the feature artifact through bounded row access (M01/M02)
     #: instead of a resident matrix; decided by the admission planner.
     lazy_features: bool = False
+    #: Micro-batches per BPR step; raised only by an OOM retry once the
+    #: job already reads lazily (``src.utils.oom_recoveries``).
+    micro_batches: int = 1
 
     @property
     def job_id(self) -> str:
@@ -219,6 +257,24 @@ class JobOutcome:
             "error": self.error_message,
             "error_type": self.error_type,
         }
+
+
+def _record_job_recovery(job: TrainingJob, attempt: int, outcome: str, **fields: Any) -> None:
+    """Append one grid-pool event to ``oom_recoveries.csv``."""
+    record_recovery(
+        step="train",
+        dataset=job.dataset_name,
+        model=job.model_name,
+        embedding=job.embedding_name,
+        job=job.job_id,
+        hyperparams=json.dumps(job.hyperparams, sort_keys=True),
+        attempt=attempt,
+        outcome=outcome,
+        lazy_features=job.lazy_features,
+        micro_batches=job.micro_batches,
+        ranking_budget_factor=_OOM_SHRINK_PER_RETRY**job.retry_count,
+        **fields,
+    )
 
 
 def _job_identity(job: TrainingJob) -> dict[str, Any]:
@@ -308,6 +364,8 @@ class _JobRegistry:
         attempt = int(message.get("attempt", job.retry_count + 1))
         status = message.get("status")
         if status == "ok":
+            if job.retry_count:
+                _record_job_recovery(job, attempt, OUTCOME_RECOVERED)
             self._finish(
                 job,
                 attempt,
@@ -339,16 +397,19 @@ class _JobRegistry:
             # matrix stops being resident and every gather is bounded and
             # de-duplicated.  Cheaper than losing the job, and the
             # numerical result is unchanged
-            # (tests/recommenders/test_lazy_feature_equivalence.py).
-            if not job.lazy_features:
-                job.lazy_features = True
-                logger.info(
-                    "  Retry %d for %s: switching to lazy feature reads",
-                    job.retry_count,
-                    job.job_id,
-                )
+            # (tests/recommenders/test_lazy_feature_equivalence.py).  A job
+            # that was ALREADY lazy (the shipped residency) would otherwise
+            # repeat the same training step, so it halves the step's
+            # activations instead: twice the micro-batches, same gradient.
+            step = escalate(lazy_features=job.lazy_features, micro_batches=job.micro_batches)
+            job.lazy_features = step.lazy_features
+            job.micro_batches = step.micro_batches
+            _record_job_recovery(
+                job, attempt, OUTCOME_RETRYING, action=step.action, error=message.get("error")
+            )
             self._retry_pending[job.job_id] = job
             return
+        _record_job_recovery(job, attempt, RECOVERY_FAILED, error=message.get("error"))
         self._finish(
             job,
             attempt,
@@ -636,6 +697,7 @@ class _WorkerContext:
             item_categories=item_cats,
             ranking_budget_bytes=self._ranking_budget(job),
             identity_context=identity_context,
+            micro_batches=job.micro_batches,
         )
 
         experiment_key = f"{job.dataset_name}_{job.embedding_name}_{job.model_name}"
@@ -708,6 +770,7 @@ def _worker_fn(
     job_runner: JobRunner | None = None,
     assignment=None,
     config: dict | None = None,
+    on_finish: Callable[[TrainingJob, dict], None] | None = None,
 ) -> None:
     """Worker process: pulls jobs from queue, trains, reports results.
 
@@ -729,6 +792,7 @@ def _worker_fn(
 
     wlog = _get_logger(f"worker_{worker_id}", log_dir=log_dir)
     runner: JobRunner | None = job_runner
+    error_streak = 0
 
     while True:
         try:
@@ -751,21 +815,112 @@ def _worker_fn(
         )
         if assignment is not None:
             assignment[worker_id] = job.submit_index
-        result_queue.put(_run_one_job(job, runner, wlog))
+        message = _run_one_job(job, runner, wlog)
+        result_queue.put(message)
         if assignment is not None:
             assignment[worker_id] = _NO_ASSIGNMENT
+        if on_finish is not None:
+            # In-process (sequential) path only: the parent sees nothing
+            # until this loop returns, so progress has to be reported
+            # from inside it.  A spawned worker leaves this None and the
+            # parent tracks progress as it drains the result queue.
+            on_finish(job, message)
+
+        if message.get("fatal_cuda"):
+            # The context is gone: every further job would fail the same
+            # way, so stop now instead of spending the breaker's streak.
+            reason = f"CUDA context lost on worker {worker_id}: {message.get('error')}"
+            wlog.error(reason)
+            result_queue.put(
+                {
+                    "status": _STATUS_ABORTED,
+                    "worker": worker_id,
+                    "reason": reason,
+                    "fatal_cuda": True,
+                }
+            )
+            break
+
+        error_streak = _updated_error_streak(error_streak, str(message.get("status")))
+        if error_streak >= MAX_CONSECUTIVE_ERRORS:
+            reason = (
+                f"{error_streak} consecutive job errors on worker {worker_id}; "
+                "aborting before the rest of the queue is spent against the same fault"
+            )
+            wlog.error(reason)
+            result_queue.put({"status": _STATUS_ABORTED, "worker": worker_id, "reason": reason})
+            break
+
+
+def _updated_error_streak(streak: int, status: str) -> int:
+    """Advance the consecutive-error *streak* for one job *status*.
+
+    ``ok`` clears it, ``error`` extends it and ``oom`` leaves it where it
+    was: an OOM is handled by the retry-and-escalate path and is not
+    evidence that the CUDA context is unusable (see
+    :data:`MAX_CONSECUTIVE_ERRORS`).
+    """
+    if status == "ok":
+        return 0
+    if status == "error":
+        return streak + 1
+    return streak
+
+
+def _abort_reason(message: dict) -> str | None:
+    """The breaker reason *message* carries, or ``None`` for a job result."""
+    if message.get("status") != _STATUS_ABORTED:
+        return None
+    return str(message.get("reason") or "worker aborted")
+
+
+def _raise_if_context_lost(message: dict, reason: str) -> None:
+    """Escalate a worker's CUDA context fault once its queue is cancelled.
+
+    The step cannot finish in this process, so the fault leaves the
+    orchestrator as :class:`CudaContextLostError` and the supervisor
+    resumes the run in a fresh one (:mod:`src.supervisor`).
+    """
+    if message.get("fatal_cuda"):
+        raise CudaContextLostError(reason)
+
+
+def _cancel_remaining(registry: _JobRegistry, reason: str) -> int:
+    """Cancel every job the breaker denied an attempt; return how many.
+
+    Jobs owed an OOM retry are pulled back into ``open`` first, so the
+    breaker leaves no job in a non-terminal state for
+    ``_raise_if_work_failed`` to report as merely ``unaccounted``.
+    """
+    registry.take_retries()
+    cancelled = registry.cancel_open(reason)
+    logger.error("Circuit breaker: %s. %d job(s) cancelled.", reason, len(cancelled))
+    return len(cancelled)
 
 
 def _run_one_job(job: TrainingJob, runner: JobRunner, wlog) -> dict:
-    """Execute one attempt of *job* and build its result message."""
+    """Execute one attempt of *job* and build its result message.
+
+    Every message carries the attempt's wall-clock ``duration``: the
+    progress tracker projects each cell from its own observed mean, and
+    measuring the attempt here is the only place that sees a job's real
+    cost on both the sequential and the spawned path.
+    """
     attempt = job.retry_count + 1
     base = {"job_id": job.job_id, "attempt": attempt}
+    started = time.time()
     try:
         best_val = runner(job)
     except torch.cuda.OutOfMemoryError as exc:
         torch.cuda.empty_cache()
         wlog.warning("  OOM on %s (attempt %d)", job.job_id, attempt)
-        return {**base, "status": "oom", "retry_count": job.retry_count, "error": str(exc)}
+        return {
+            **base,
+            "status": "oom",
+            "retry_count": job.retry_count,
+            "error": str(exc),
+            "duration": time.time() - started,
+        }
     except Exception as exc:  # noqa: BLE001 — isolate failures per job
         wlog.error("  Error on %s: %s", job.job_id, exc, exc_info=True)
         return {
@@ -773,9 +928,16 @@ def _run_one_job(job: TrainingJob, runner: JobRunner, wlog) -> dict:
             "status": "error",
             "error": str(exc),
             "error_type": type(exc).__name__,
+            "duration": time.time() - started,
+            "fatal_cuda": is_fatal_cuda_error(exc),
         }
     wlog.info("  Done: best_metric=%.4f", best_val)
-    return {**base, "status": "ok", "best_metric": best_val}
+    return {
+        **base,
+        "status": "ok",
+        "best_metric": best_val,
+        "duration": time.time() - started,
+    }
 
 
 class TrainingOrchestrator:
@@ -823,6 +985,8 @@ class TrainingOrchestrator:
             self.n_workers = _enforce_admission(self.n_workers, admission)
         self._job_runner = job_runner
         self._config = config
+        #: Set per ``run`` call; None until a queue is submitted.
+        self._progress: JobProgress | None = None
         logger.info("Training orchestrator: %d workers", self.n_workers)
 
     def run(self, jobs: list[TrainingJob]) -> list[dict]:
@@ -840,8 +1004,10 @@ class TrainingOrchestrator:
 
     def _run_sequential(self, jobs: list[TrainingJob]) -> list[dict]:
         logger.info("Running %d jobs sequentially.", len(jobs))
+        self._progress = JobProgress.of_jobs(jobs)
         registry = _JobRegistry(jobs)
         self._run_sequential_into(registry, jobs)
+        self._log_cell_table(workers=1)
         return registry.results()
 
     def _run_sequential_into(self, registry: _JobRegistry, batch: list[TrainingJob]) -> None:
@@ -858,19 +1024,72 @@ class TrainingOrchestrator:
                 job_queue.put(job)
             job_queue.put(None)
             _worker_fn(
-                0, job_queue, result_queue, 1, self.log_dir, self._job_runner, config=self._config
+                0,
+                job_queue,
+                result_queue,
+                1,
+                self.log_dir,
+                self._job_runner,
+                config=self._config,
+                on_finish=self._report_progress,
             )
-            self._drain_sequential(registry, batch, result_queue)
+            if self._drain_sequential(registry, batch, result_queue):
+                return
             batch = registry.take_retries()
 
+    # -- progress --------------------------------------------------------
+
+    def _report_progress(self, job: TrainingJob, message: dict, *, workers: int = 1) -> None:
+        """Account one finished attempt and log a line when one is due."""
+        _record_job_cost(job, message, workers=workers)
+        progress = self._progress
+        if progress is None:
+            return
+        status = str(message.get("status"))
+        # Mirror _record_oom's rule: an OOM with retries left is not an
+        # outcome yet, and counting it would report more finished jobs
+        # than were submitted once the retry lands.
+        terminal = status != "oom" or int(message.get("retry_count", 0)) >= MAX_OOM_RETRIES
+        progress.finish(
+            job,
+            status,
+            float(message.get("duration") or 0.0),
+            terminal=terminal,
+        )
+        if progress.due():
+            logger.info("%s", progress.line(workers=workers))
+
+    def _log_cell_table(self, *, workers: int) -> None:
+        """Emit the per-(recommender, dataset) breakdown, one line each."""
+        if self._progress is None or not self._progress.cells:
+            return
+        for line in render_cells(self._progress, workers=workers):
+            logger.info("%s", line)
+
     @staticmethod
-    def _drain_sequential(registry: _JobRegistry, batch: list[TrainingJob], result_queue) -> None:
+    def _drain_sequential(registry: _JobRegistry, batch: list[TrainingJob], result_queue) -> bool:
+        """Apply the batch's messages; return True when the breaker tripped.
+
+        On an abort the jobs still queued behind the fault are cancelled
+        rather than failed for want of a result: the worker returned
+        deliberately, so ``NoResult`` would misreport why they have no
+        outcome.
+        """
+        aborted: dict | None = None
         while True:
             try:
                 message = result_queue.get_nowait()
             except Empty:
                 break
+            if _abort_reason(message) is not None:
+                aborted = message
+                continue
             registry.record(message)
+        if aborted is not None:
+            reason = str(_abort_reason(aborted))
+            _cancel_remaining(registry, reason)
+            _raise_if_context_lost(aborted, reason)
+            return True
         for job in batch:
             if job.job_id in registry.open_ids():
                 registry.fail(
@@ -878,11 +1097,13 @@ class TrainingOrchestrator:
                     error_type="NoResult",
                     error_message="worker loop returned without publishing a result",
                 )
+        return False
 
     # -- parallel --------------------------------------------------------
 
     def _run_parallel(self, jobs: list[TrainingJob]) -> list[dict]:
         logger.info("Running %d jobs with %d workers.", len(jobs), self.n_workers)
+        self._progress = JobProgress.of_jobs(jobs)
         registry = _JobRegistry(jobs)
         start_time = time.time()
 
@@ -912,10 +1133,16 @@ class TrainingOrchestrator:
         for worker in workers:
             worker.start()
 
-        self._collect(registry, workers, assignment, result_queue, start_time)
+        aborted = self._collect(registry, workers, assignment, result_queue)
+        if aborted is not None:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
 
         for worker in workers:
             worker.join(timeout=30)
+        if aborted is not None:
+            _raise_if_context_lost(aborted, str(_abort_reason(aborted)))
 
         retries = registry.take_retries()
         if retries:
@@ -926,13 +1153,20 @@ class TrainingOrchestrator:
         elapsed_h = (time.time() - start_time) / 3600
         ok = sum(1 for r in results if r.get("status") == "ok")
         logger.info("Done: %d/%d succeeded in %.1f h.", ok, len(jobs), elapsed_h)
+        self._log_cell_table(workers=self.n_workers)
         return results
 
-    def _collect(self, registry, workers, assignment, result_queue, start_time) -> None:
-        """Consume results until every job is terminal or retry-pending."""
-        total = len(registry.jobs)
+    def _collect(self, registry, workers, assignment, result_queue) -> dict | None:
+        """Consume results until every job is terminal or retry-pending.
+
+        Returns the abort sentinel when a worker's circuit breaker
+        tripped (``None`` otherwise), which the caller answers by
+        terminating the pool: the queue still holds jobs, and leaving
+        the workers to drain it is exactly the grind the breaker exists
+        to stop.
+        """
         reaped: set[int] = set()
-        last_log = start_time
+        by_id = {job.job_id: job for job in registry.jobs}
         while registry.open_ids():
             try:
                 message = result_queue.get(timeout=_RESULT_POLL_S)
@@ -946,8 +1180,16 @@ class TrainingOrchestrator:
                         logger.error("All workers exited; %d jobs cancelled.", len(cancelled))
                     break
             else:
-                registry.record(message)
-            last_log = self._maybe_log_progress(registry, workers, total, start_time, last_log)
+                reason = _abort_reason(message)
+                if reason is not None:
+                    _drain_nowait(result_queue, registry)
+                    self._reap_dead_workers(registry, workers, assignment, reaped)
+                    _cancel_remaining(registry, reason)
+                    return message
+                job = by_id.get(str(message.get("job_id")))
+                if registry.record(message) and job is not None:
+                    self._report_progress(job, message, workers=self.n_workers)
+        return None
 
     @staticmethod
     def _reap_dead_workers(registry, workers, assignment, reaped: set[int]) -> None:
@@ -965,23 +1207,29 @@ class TrainingOrchestrator:
             logger.error("%s: %s", job.job_id, message)
             registry.fail(job.job_id, error_type="WorkerExit", error_message=message)
 
-    @staticmethod
-    def _maybe_log_progress(registry, workers, total, start_time, last_log) -> float:
-        now = time.time()
-        if now - last_log < _PROGRESS_LOG_S:
-            return last_log
-        completed = len(registry.outcomes())
-        elapsed = now - start_time
-        eta_h = (elapsed / max(completed, 1)) * (total - completed) / 3600
-        logger.info(
-            "Progress: %d/%d (%.1f%%) | %d workers | ETA: ~%.1f h",
-            completed,
-            total,
-            100 * completed / total,
-            sum(1 for w in workers if w.is_alive()),
-            eta_h,
-        )
-        return now
+
+def _record_job_cost(job: TrainingJob, message: dict, *, workers: int) -> None:
+    """Write one ``train`` cost cell for a finished attempt of *job*.
+
+    Every attempt is a cell, failed ones included: an OOM that ran for
+    ten minutes drew that energy whether or not it produced a model, and
+    ``status`` / ``attempt`` let the analysis keep or drop it.  With more
+    than one worker the telemetry window is shared with the other jobs
+    running at the same time, which ``concurrent_workers`` makes explicit.
+    """
+    if message.get("duration") is None:
+        return
+    timing.record_cell(
+        "train",
+        float(message["duration"]),
+        dataset=job.dataset_name,
+        model=job.model_name,
+        **embedding_labels(job.embedding_name, job.embeddings_path),
+        hyperparams=dict(job.hyperparams),
+        status=str(message.get("status")),
+        attempt=int(message.get("attempt") or job.retry_count + 1),
+        concurrent_workers=workers,
+    )
 
 
 def _enforce_admission(n_workers: int, admission: AdmissionPlan) -> int:
@@ -1004,10 +1252,16 @@ def _enforce_admission(n_workers: int, admission: AdmissionPlan) -> int:
 
 
 def _drain_nowait(result_queue, registry: _JobRegistry) -> None:
-    """Record whatever is already queued without waiting for more."""
+    """Record whatever is already queued without waiting for more.
+
+    Breaker sentinels are skipped: they carry no ``job_id``, and the
+    caller has already acted on the one that brought it here.
+    """
     while True:
         try:
             message = result_queue.get(timeout=0.1)
         except Empty:
             return
+        if _abort_reason(message) is not None:
+            continue
         registry.record(message)

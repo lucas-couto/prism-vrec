@@ -3,7 +3,7 @@
 The pipeline encodes routing information in filenames rather than a
 sidecar manifest: a fine-tuned backbone carries ``_finetuned``, a 3-D
 per-item component artifact ends in ``_comp``, an offline fusion is
-prefixed ``hybrid_``, a projection dim is ``_D<dim>`` and the winning
+prefixed ``hybrid_``, a fixed projection is ``_<method><dim>`` and the winning
 checkpoint ends in ``_best``.  Extract, finetune, fuse, train and
 evaluate all depend on these tokens; owning the format/parse rules here
 keeps them from drifting apart (previously ``train`` matched
@@ -20,12 +20,30 @@ COMPONENT_SUFFIX = "_comp"
 FUSION_PREFIX = "hybrid_"
 BEST_SUFFIX = "_best"
 
-#: A fixed-dim projection artifact carries a ``p<dim>`` segment, written
-#: by ``src.extractors.projection`` immediately after the extractor name
-#: and before the condition suffix (``resnet50_p128_finetuned``).  Fusion
-#: outputs built from projected sources carry it too
-#: (``hybrid_mean_p128``), so one rule classifies both.
-PROJECTED_SEGMENT = re.compile(r"^p\d+$")
+#: Short token per projection method, written into the artifact name by
+#: ``src.extractors.projection``.  The width alone is NOT an identity:
+#: ``pca`` and ``pca_whitened`` at the same width produced the same
+#: filename under the old ``p<dim>`` token, so they could not coexist in
+#: a run and a stale artifact was silently reused (2026-09-10).
+PROJECTION_METHOD_TOKENS = {"pca": "pca", "pca_whitened": "pcaw", "random": "rand"}
+
+#: A fixed-dim projection artifact carries a ``<method><dim>`` segment,
+#: written immediately after the extractor name and before the condition
+#: suffix (``resnet50_pcaw128_finetuned``).  Fusion outputs built from
+#: projected sources carry it too (``hybrid_mean_pcaw128``), so one rule
+#: classifies both.
+#:
+#: The bare ``p<dim>`` alternative is the LEGACY token, recognised on
+#: read and never written: a leftover ``resnet50_p128.npy`` must still
+#: classify as a projection, or the embedding glob would pick it up as a
+#: native backbone of its own and it would enter the statistical
+#: families beside the real ResNet-50.
+PROJECTED_SEGMENT = re.compile(
+    r"^(?:p|" + "|".join(sorted(PROJECTION_METHOD_TOKENS.values())) + r")\d+$"
+)
+
+#: Method token -> config method name, for parsing a name back.
+_TOKEN_TO_METHOD = {token: method for method, token in PROJECTION_METHOD_TOKENS.items()}
 
 
 def is_finetuned_artifact(name: str) -> bool:
@@ -73,12 +91,34 @@ def is_projected_artifact(name: str) -> bool:
     return any(PROJECTED_SEGMENT.match(part) for part in name.split("_"))
 
 
-def projection_dim(name: str) -> int | None:
-    """The projected width encoded in *name*, or ``None`` if it is native."""
+def _projection_segment(name: str) -> str | None:
+    """The whole projection segment of *name*, or ``None`` if it is native."""
     for part in name.split("_"):
         if PROJECTED_SEGMENT.match(part):
-            return int(part[1:])
+            return part
     return None
+
+
+def projection_dim(name: str) -> int | None:
+    """The projected width encoded in *name*, or ``None`` if it is native."""
+    part = _projection_segment(name)
+    if part is None:
+        return None
+    return int(part.lstrip("abcdefghijklmnopqrstuvwxyz"))
+
+
+def projection_method(name: str) -> str | None:
+    """The projection method encoded in *name*.
+
+    ``None`` for a native artifact AND for the legacy ``p<dim>`` token,
+    which predates the method being part of the name: the width is
+    recoverable from it, the recipe is not.
+    """
+    part = _projection_segment(name)
+    if part is None:
+        return None
+    token = part.rstrip("0123456789")
+    return _TOKEN_TO_METHOD.get(token)
 
 
 def parse_checkpoint_stem(stem: str, known_models: list[str]) -> tuple[str, str] | None:

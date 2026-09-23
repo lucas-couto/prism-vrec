@@ -108,20 +108,19 @@ class PipelineConfig(BaseModel):
     stop_at: str | None = None
     condition: Literal["frozen", "finetuned", "both"] = "both"
     #: What ``python main.py`` does.  The command takes no arguments —
-    #: this key is how a run, a battery or an inspection is selected.
+    #: this key is how a run or an inspection is selected.  The
+    #: ``battery`` and ``battery_status`` modes were removed in 3.0.0:
+    #: the mode was never exercised, had no OOM recovery, and the
+    #: dissertation grid runs through the step plan instead.
     mode: Literal[
         "pipeline",
-        "battery",
         "show_plan",
-        "battery_status",
         "report",
         "inspect_pending",
         "validate_features",
         "validate_datasets",
         "list",
     ] = "pipeline"
-    #: ``mode: battery`` only — re-dispatch the cells that failed.
-    retry_failed: bool = False
 
     @field_validator("start_from", "stop_at")
     @classmethod

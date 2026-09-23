@@ -125,6 +125,31 @@ class TestFamilyEnumeration:
         assert "acf_resnet50_comp" in resnet.configs
         assert "vbpr_resnet50" in resnet.configs
 
+    def test_projected_artifacts_group_with_base_backbone(self) -> None:
+        """VNPR consumes the paper's offline reduction; VBPR the raw feature.
+
+        The NPR paper reduces the CNN feature offline before the model
+        sees it and explicitly rejects VBPR's learned kernel, so on one
+        backbone the two models legitimately read different artifacts
+        (``resnet50_pcaw128`` vs ``resnet50``).  The projection is a
+        routing token, not a different backbone: keeping them apart
+        would dissolve the "which model wins on ResNet-50" question.
+        """
+        cells = pd.concat(
+            [
+                _cells(),
+                pd.DataFrame([{"model_name": "vnpr", "embedding_name": "resnet50_pcaw128"}]),
+            ],
+            ignore_index=True,
+        )
+
+        instances = enumerate_family_instances(cells, ["model_within_backbone"])
+
+        resnet = next(i for i in instances if i.group == "backbone=resnet50,condition=frozen")
+        assert "vnpr_resnet50_pcaw128" in resnet.configs
+        assert "vbpr_resnet50" in resnet.configs
+        assert not any("pcaw128" in i.group for i in instances)
+
     def test_vs_baseline_is_one_instance_pairing_every_config(self) -> None:
         cells = _cells()
         instances = enumerate_family_instances(cells, ["vs_baseline"])

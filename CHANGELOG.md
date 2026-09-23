@@ -8,7 +8,161 @@ Dates are UTC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Component features reach ACF L2-normalised, so its attention no
+  longer overflows on high-magnitude backbones.** A native
+  `<extractor>_comp.npy` carries no fusion sidecar, so nothing ever
+  normalised it: ACF was the only recommender reading raw features,
+  while the pooled embeddings the others consume are normalised offline.
+  Its attention logits scaled with the backbone's native magnitude (mean
+  component norm 11.9 for CLIP ViT-B/32, 154.5 for ConvNeXt-B, 659.9 for
+  CvT-13 on Amazon Men) and overflowed to `inf` under autocast, then to
+  `NaN` through the softmax — five frozen-grid cells died with
+  `NonFiniteScoresError` at `learning_rate = 0.01` (CoAtNet-0,
+  ConvNeXt-B, 2026-09-16) while no CLIP cell failed.
+  `l2_normalize_components` (`src/fusions/strategies.py`) now scales every
+  component vector to unit norm on the way into the model — once at
+  buffer construction on the dense path, per gathered row on the lazy
+  one, in fp32 arithmetic cast back to the artifact's fp16, in chunks so
+  a catalogue-sized array is never staged whole. Dense and lazy stay
+  numerically identical, the artifacts on disk are unchanged, and pooled
+  embeddings are untouched. ACF results from before this change are not
+  comparable with later ones; the affected grid checkpoints were
+  discarded (144 cells). See `docs/protocol.md` §7.
+
+### Added
+
+- **A CUDA context fault resumes the same run instead of starting a new
+  one.** `main.py` now starts as a supervisor (`src/supervisor.py`,
+  stdlib-only, the container's PID 1) that runs the pipeline in a child
+  process. A child whose CUDA context is lost (Xid 8 "the launch timed
+  out", "unspecified launch failure", recognised by
+  `src/utils/cuda_faults.py` from the exception chain or by probing the
+  device) exits with code 75; a child killed by SIGKILL/SIGSEGV/SIGBUS/
+  SIGABRT is treated the same. The supervisor waits 30 s and launches a
+  fresh child that reopens the same `results/runs/<run_id>/`, appends to
+  the same `logs/run_<id>.log`, keeps `steps.json`, `step_timings.json`
+  and `oom_recoveries.csv`, and resumes from the checkpoints on disk.
+  The manifest gains a `restarts` list (attempt, time, previous status,
+  reason) and the `cuda_fault` exit status; raw telemetry of a later
+  attempt goes to `telemetry_samples.attempt<N>.jsonl`. The grid pool
+  stops at the first poisoned job instead of spending five on the
+  circuit breaker, and the fold runner re-raises the fault instead of
+  failing every remaining cell. An ordinary exception still ends the
+  run, and the supervisor gives up after 3 restarts in a row that
+  complete no new work. SIGTERM (`docker compose stop`) is forwarded to
+  the child and never restarts it. Inside the container Ctrl+C is ignored
+  with a hint (detach with Ctrl+P Ctrl+Q), so following the output with
+  `docker attach` can no longer end a multi-day run; outside the
+  container Ctrl+C still stops `python main.py`.
+
+- **An OOM retry of an already-lazy job now changes the training step.**
+  With `resources.features.residency: lazy` pinned, the retry's switch to
+  lazy reads was a no-op, so a job that ran out of memory while training
+  repeated the same step twice more and failed the run. Each retry now
+  escalates through `src/utils/oom_recoveries.py`: lazy reads first,
+  then twice the micro-batches per BPR step
+  (`bpr_accumulated_step`, gradient accumulation weighted by `n_k / N`),
+  so the effective batch and the optimiser step are unchanged — verified
+  against `bpr_step` for every built-in recommender. Additive contract
+  changes, approved: `TrainingJob.micro_batches` and the keyword-only
+  `train_single_run(micro_batches=1)`. The fold runner uses the same
+  escalation and now gets `MAX_OOM_RETRIES` retries instead of one.
+- **`results/runs/<run_id>/oom_recoveries.csv`.** One row per OOM retry,
+  recovery or final failure, in the grid pool and in the fold runner,
+  with the job identity, hyperparameters, attempt, action,
+  `lazy_features`, `micro_batches`, `ranking_budget_factor` and the OOM
+  message; mirrored at WARNING as `OOM recovery: ...`. Micro-batching is
+  outside the scientific identity, so this file is how a result computed
+  under recovery is identified. The Optuna strategy's cell retry is not
+  covered (it runs inside worker processes and is not the grid path).
+
+### Fixed
+
+- **A configured projection is no longer skipped by file existence.**
+  `_extract_for_config` decided `need_projection` from
+  `projected_path(...).exists()`. The name carried the width but not the
+  recipe, so a cell configured for `pca_whitened` was satisfied by a
+  `pca` artifact of the same width: the extractor was skipped whole,
+  `ensure_projected` never ran, and with it the provenance check that
+  compares method, seed and fit set. The stale array then fed training
+  as the configured one — observed on an amazon_women probe, where a
+  whitening arm silently reported the plain-PCA numbers. A configured
+  projection now always routes through `ensure_projected`, which is
+  idempotent and raises `ArtifactProvenanceError` on a mismatch; only a
+  cell with no projection may skip on existence. Downstream steps were
+  never at risk: `resolve_data_identity` digests the feature *content*,
+  so a rebuilt array changes the cell identity and train/evaluate re-run.
+
+### Removed
+
+- **`pipeline.mode: battery` and `battery_status`.** The mode was never
+  exercised on a real run, carried no OOM recovery, and the dissertation
+  grid is driven by the ordinary step plan, where `train` enumerates and
+  checkpoints every cell and `folds` runs the K-fold manifest. The mode
+  dispatch, `pipeline.retry_failed` and both `Literal` members are gone,
+  so selecting either now fails as an unknown mode; `--battery`,
+  `--battery-status` and `--retry-failed` report that nothing replaces
+  them. `src/battery/` stays as the cell-enumeration and manifest
+  library `src/folds/runner.py` imports (`cells`, `manifest` and
+  `execute._embedding_path`), so the package name outlives the mode.
+  Resuming a run that lost cells is a relaunch of the same command,
+  which is what the checkpoints and the manifest were already for. The
+  manifest-completion boundary (audit F04) is pinned through the `folds`
+  step instead.
+
 ### Changed
+
+- **`docker-compose.yml` no longer restarts the container (`restart: "no"`,
+  was `on-failure:3`).** A policy restart began a new run directory and
+  session log on every fault; faults are now resumed inside the container
+  by the supervisor, and a new run begins only on `docker compose up -d`.
+- **The per-region component fusion streams, and every PCA fit is
+  capped.** `_fuse_component_rows` materialised every source in float32
+  before fusing: on amazon_women that is 14.59 GiB of input alone, plus
+  an equal-sized output for `concat`, against a 16 GiB container — the
+  fuse step OOM-killed its worker on every attempt, deterministically,
+  with tradesy at 13.70 GiB behind it. A contiguous `(n, R, D)` memmap
+  reshapes to `(n*R, D)` as a view, so the three heavy strategies
+  (`concat`, `pca`, `pca_per_model` — exactly the streamable ones) now
+  route through the chunked kernels, writing `(n, R, D_fused)` in the
+  sources' dtype directly. Same arithmetic, same bytes.
+  `PCA_FIT_MAX_ROWS = 750_000` then bounds the fit set of every PCA in
+  the framework, applied to the indices before the matrix is assembled;
+  it binds only on the per-region pass, so no pooled artifact changes.
+  The provenance does not cover the cap — see `docs/protocol.md`.
+  Verified end-to-end on amazon_women: peak 9.97 GiB, fusion complete.
+
+- **A projection artifact carries its method, not just its width**
+  (`resnet50_pcaw128`, `_pca128`, `_rand128`, replacing `_p128`).
+  Two methods at one width wrote the same file, so they could not
+  coexist in a run. The bare `p<dim>` token is still recognised on read
+  and never written, so a leftover artifact classifies as a projection
+  instead of being globbed up as a native backbone of its own.
+  **Reproducibility note:** the `random` projector is derived from the
+  artifact name as its salt, so a `random` artifact rebuilt under the
+  new name has a different matrix. No `random` artifact existed when
+  this landed.
+
+- **VNPR consumes the offline reduction its paper prescribes.** New
+  `vnpr.visual_input` (`configs/recommenders.yaml`) routes VNPR to
+  `<source>_pcaw128`; every other recommender keeps the native feature
+  its own paper prescribes. Written per backbone by `extract` and per
+  offline fusion by `fuse` — after the fusion, over the vector the model
+  receives, since whitening each source and then mixing is a different
+  transform from whitening the mixture. Fixes an all-tied score list for
+  4-6% of users on unfused backbones and lifts recall@10 by 10-61%;
+  `pca_whitened` rather than the paper's plain PCA is a declared,
+  measured divergence. The routing SUPERSEDES rather than requires: an
+  input is dropped only when a projected counterpart of it exists, so
+  the nine online fusions — JSON sidecars with no array to project, and
+  a 0.00% degenerate tail to begin with — stay in VNPR's grid, which
+  keeps it at 20 cells like every other visual model instead of 3
+  fusion strategies against their 12. Full account in
+  `docs/protocol.md`. **Every VNPR result on a native artifact is
+  invalidated.**
+
 
 - **`main.py` takes no arguments at all.** The last flags went with the
   step: `--battery`, `--retry-failed`, `--folds`, `--show-plan`,
@@ -54,6 +208,46 @@ Dates are UTC.
   not comparable to results produced after it** and has to be rebuilt.
 
 ### Added
+
+- **A repeating non-OOM fault now stops the queue instead of consuming
+  it.** Each job's failure was isolated per job and nothing watched the
+  sequence, so a fault that outlives one job -- a poisoned CUDA context
+  from a Xid 8 launch timeout, a wedged driver -- failed every job it
+  touched within seconds of the launch and the orchestrator kept
+  pulling: one hardware fault spent the entire remaining queue against
+  itself, and a 13 068-job grid reported thousands of cells as `failed`
+  that were never really attempted. Five consecutive `error` outcomes on
+  one worker (`MAX_CONSECUTIVE_ERRORS`) now trip a circuit breaker: the
+  worker publishes an abort sentinel and stops, the parent cancels every
+  job still queued behind it, and the pool path terminates its workers
+  rather than letting them drain the queue. The jobs denied an attempt
+  are `cancelled`, not `failed`, so the outcome ledger keeps "never
+  attempted" distinct from "attempted and failed"; the step still raises
+  through the same reconciliation, because a cancelled job is not an
+  `ok` one. Only a success clears the streak. An OOM is deliberately
+  neutral: it has its own retry-and-escalate path and says nothing about
+  the context being poisoned.
+
+- **The run prints its plan, its step timeline and a per-cell ETA.**
+  Progress reporting lived only on the pool path (`_maybe_log_progress`
+  was reachable from `_collect` alone), so a run with the pinned
+  `resources.workers.training: 1` went from the first job to the last
+  without a single progress or ETA line: 13 068 jobs followed by
+  counting `Starting:` lines by eye. `src.utils.job_progress` is now the
+  shared accounting both paths feed, and three blocks render from it
+  (`src.utils.progress`): the resolved plan with each step's scale,
+  printed before the first step runs; the step timeline with elapsed
+  time, printed as each step finishes; and the `(recommender, dataset)`
+  breakdown of a training queue. Each attempt's wall clock travels in
+  its result message, so a cell is projected from its OWN observed mean
+  -- a global mean is confidently wrong for a grid whose per-job cost
+  spans an order of magnitude -- and a cell with no sample borrows the
+  global mean marked `~` rather than showing a dash next to a total that
+  charged it anyway. The denominator is SUCCESSES: three fast crashes
+  must not advertise 594 pending ACF jobs as an hour of work, while the
+  numerator still carries every attempt so a cell that burns retries is
+  projected as costing that time. Nothing redraws itself -- the log is
+  append-only.
 
 - **ACF joins the fusion family through early per-region fusion.** ACF
   consumes per-item component maps, so the pooled `hybrid_*` artifacts

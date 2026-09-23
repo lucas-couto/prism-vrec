@@ -227,7 +227,7 @@ diagnostics:
 # pins, feature residency) live ONLY in configs/resources.yaml; see below.
 ```
 
-The YAML is the only control surface, and `main.py` takes **no arguments**: `pipeline.mode` chooses what the command does (`pipeline`, `battery`, `show_plan`, `battery_status`, `report`, `inspect_pending`, `validate_features`, `validate_datasets`, `list`), and `pipeline.{run_all,start_from,stop_at,condition}` decide which steps run (`start_from` / `stop_at` are ignored while `run_all: true`). Every former flag — the 3.0.0 batch plus `--battery`, `--folds`, `--show-plan`, `--report`, the `--list-*` / `--validate-*` pair and `--config-dir`, whose directory is always `configs/` — fails naming the key that replaced it.
+The YAML is the only control surface, and `main.py` takes **no arguments**: `pipeline.mode` chooses what the command does (`pipeline`, `show_plan`, `report`, `inspect_pending`, `validate_features`, `validate_datasets`, `list`), and `pipeline.{run_all,start_from,stop_at,condition}` decide which steps run (`start_from` / `stop_at` are ignored while `run_all: true`). Every former flag — the 3.0.0 batch plus `--battery`, `--folds`, `--show-plan`, `--report`, the `--list-*` / `--validate-*` pair and `--config-dir`, whose directory is always `configs/` — fails naming the key that replaced it.
 
 Three blocks were added in 3.0.0 (details in the YAML comments and in `docs/reliability-sdd/`): `diagnostics` (task S04) records bounded, detached probes per training run without changing the trajectory; `resources` (tasks M05/M06, key names approved 2026-09-07 and moved to `configs/resources.yaml`) is the host budget the training jobs are admitted against — a job whose analytic memory ledger does not fit is recorded as failed and never launched, and `features.residency: auto` / `lazy` gathers visual rows per forward from a bounded `FeatureSource` instead of holding the catalogue in a module buffer (numerically identical by test; page-cache residency on real catalogues unmeasured); `statistical.population` lives in `configs/evaluation.yaml` below.
 
@@ -299,7 +299,7 @@ projection:
   seed: 42 # method: random only
 ```
 
-This writes `<extractor>_p128.npy` **alongside** the native artifact, never in place of it, so native and projected can be trained and compared in the same battery. Two flags then decide what *consumes* them:
+This writes `<extractor>_pcaw128.npy` **alongside** the native artifact, never in place of it, so native and projected can be trained and compared in the same battery. Two flags then decide what *consumes* them:
 
 ```yaml
 # configs/recommenders.yaml — which variants the recommenders train on
@@ -309,7 +309,7 @@ embedding_variants: both # native | projected | both
 extractor_variants: native # native | projected | both
 ```
 
-`extractor_variants: projected` is the shortcut this feature exists for: the sources already share a width, so the whole `alignment:` block is bypassed — nothing learned online, no PCA fit inside the fuse step. Outputs stay apart by the same token (`hybrid_mean` vs `hybrid_mean_p128`), and a hybrid built from projected sources is classified with them by `embedding_variants`. `random` is a seeded semi-orthogonal matrix (data-independent, so it cannot leak val/test items); `pca` is fit on train items only, like the fusion alignment; `pca_whitened` adds per-component variance equalisation on the same fit set. Any extractor overrides the block under `extractors.<name>.projection`. Already-extracted embeddings are projected in a linear pass — the backbone is not loaded again. Read [`docs/protocol.md` §1b](docs/protocol.md) before reporting a comparison run on projected artifacts: a fixed projection is a variable, not a free normalisation.
+`extractor_variants: projected` is the shortcut this feature exists for: the sources already share a width, so the whole `alignment:` block is bypassed — nothing learned online, no PCA fit inside the fuse step. Outputs stay apart by the same token (`hybrid_mean` vs `hybrid_mean_pcaw128`), and a hybrid built from projected sources is classified with them by `embedding_variants`. `random` is a seeded semi-orthogonal matrix (data-independent, so it cannot leak val/test items); `pca` is fit on train items only, like the fusion alignment; `pca_whitened` adds per-component variance equalisation on the same fit set. Any extractor overrides the block under `extractors.<name>.projection`. Already-extracted embeddings are projected in a linear pass — the backbone is not loaded again. Read [`docs/protocol.md` §1b](docs/protocol.md) before reporting a comparison run on projected artifacts: a fixed projection is a variable, not a free normalisation.
 
 To ablate an extractor, just remove its name from `extractors_enabled`, its block under `extractors:` stays as catalogue but the pipeline skips it (and the fine-tuning step skips it too).
 
@@ -796,7 +796,7 @@ Each method is toggled individually in `configs/evaluation.yaml` -> `statistical
 
 ### Need a process supervisor?
 
-The previous `scripts/watchdog.sh` supervisor (RunPod-era operational scaffolding) has been removed in favour of platform-native supervisors. For long runs on cloud pods, use the host's own facilities (systemd unit, Kubernetes liveness probe, `tini --restart-on-exit`, Docker `restart: unless-stopped`). The pipeline is idempotent: a hard kill followed by `python main.py` resumes from the last checkpoint regardless of which supervisor restarted it.
+`python main.py` supervises itself: the pipeline runs in a child process, and when a CUDA context fault (for example an NVRM Xid 8 launch timeout) or a SIGKILL ends that child, a fresh child resumes **the same run** (same `results/runs/<run_id>/`, same `logs/run_<id>.log`, a `restarts` entry in the manifest) after 30 s. An ordinary error still ends the run, and 3 restarts in a row without new work give up. Inside the container Ctrl+C (for example in `docker attach`) does not stop the run: detach with Ctrl+P Ctrl+Q and stop it with `docker compose stop`. For that reason `docker-compose.yml` sets `restart: "no"`: a new run begins only on `docker compose up -d`. Outside the fault path the pipeline stays idempotent, so a hard kill followed by `python main.py` resumes from the last checkpoint as a new run.
 
 ---
 

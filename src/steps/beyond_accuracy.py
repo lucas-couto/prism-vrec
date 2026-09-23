@@ -45,9 +45,11 @@ from src.evaluation.beyond_accuracy import (
 )
 from src.evaluation.paired_loader import discover_cells
 from src.evaluation.persistence import read_cell_artifact
-from src.steps.evaluate import _route_targets, _write_mean_table
+from src.steps.evaluate import _embedding_artifact, _route_targets, _write_mean_table
 from src.utils.config import load_config
+from src.utils.cost_labels import embedding_labels
 from src.utils.logging import get_logger
+from src.utils.timing import time_cell
 
 logger = get_logger(__name__)
 
@@ -224,6 +226,32 @@ def _cell_frames(
     return pd.DataFrame(user_rows), pd.DataFrame(coverage_rows)
 
 
+def _timed_cell_frames(
+    cell_paths: list[Path],
+    dataset_name: str,
+    embeddings_dir: str,
+    frame_args: tuple,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """:func:`_cell_frames` one cell at a time, each timed as a cost cell.
+
+    *frame_args* are :func:`_cell_frames`'s arguments after the paths.
+    The dataset-wide statistics are computed once by the caller and
+    charged to no cell; each cell is charged only for its own metrics.
+    """
+    user_frames: list[pd.DataFrame] = []
+    coverage_frames: list[pd.DataFrame] = []
+    for path in cell_paths:
+        with time_cell("beyond_accuracy", dataset=dataset_name) as cell:
+            users, coverage = _cell_frames([path], *frame_args)
+            if not coverage.empty:
+                model, embedding = coverage.iloc[0][["model_name", "embedding_name"]]
+                artifact = _embedding_artifact(embeddings_dir, dataset_name, str(embedding))
+                cell.label(model=str(model), **embedding_labels(str(embedding), artifact))
+        user_frames.append(users)
+        coverage_frames.append(coverage)
+    return pd.concat(user_frames, ignore_index=True), pd.concat(coverage_frames, ignore_index=True)
+
+
 def _merge_into_table(table_path: Path, ba_frame: pd.DataFrame) -> None:
     """Merge the beyond-accuracy columns into an evaluation CSV in place.
 
@@ -334,14 +362,11 @@ def run() -> None:
         embeddings = _load_reference_embeddings(embeddings_dir, dataset_name, reference, n_items)
         categories = _load_categories(config, dataset_name)
 
-        ba_frame, coverage = _cell_frames(
+        ba_frame, coverage = _timed_cell_frames(
             cell_paths,
-            popularity,
-            embeddings,
-            categories,
-            n_catalog_items,
-            k_values,
-            use_rank_relevance,
+            dataset_name,
+            embeddings_dir,
+            (popularity, embeddings, categories, n_catalog_items, k_values, use_rank_relevance),
         )
         logger.info(
             "  computed beyond-accuracy metrics for %d cell(s), %d user rows.",

@@ -32,7 +32,11 @@ import main
         (["--eval-protocol=sampled"], "evaluation.protocol"),
         (["--seeds", "1,2"], "seeds"),
         (["--config-dir", "other"], "always `configs/`"),
-        (["--battery"], "pipeline.mode: battery"),
+        # The battery mode was removed in 3.0.0, so its flags name no
+        # replacement key: nothing carries that behaviour any more.
+        (["--battery"], "nothing replaces it"),
+        (["--battery-status"], "nothing replaces it"),
+        (["--retry-failed"], "nothing replaces it"),
         (["--show-plan"], "pipeline.mode: show_plan"),
         (["--folds"], "folds.enabled: true"),
         (["--list-datasets"], "pipeline.mode: list"),

@@ -100,6 +100,7 @@ from src.steps.statistical_integrity import (
 )
 from src.utils.config import load_config
 from src.utils.logging import get_logger
+from src.utils.timing import time_cell
 
 logger = get_logger(__name__)
 
@@ -188,84 +189,85 @@ def run(condition: str = "frozen") -> None:
         aggregated_frames: list[pd.DataFrame] = []
 
         for metric in metrics:
-            logger.info("  --- %s ---", metric)
-            metric_name, _, metric_k = metric.partition("@")
+            with time_cell("statistical", dataset=dataset_name, metric=metric):
+                logger.info("  --- %s ---", metric)
+                metric_name, _, metric_k = metric.partition("@")
 
-            if per_user:
-                if bootstrap_enabled:
-                    summary = per_model_summary(
-                        eval_df,
-                        metric=metric,
-                        n_iterations=bootstrap_iters,
-                        alpha=alpha,
-                    )
-                    summary_frames.append(_tag_metric(summary, metric_name, metric_k))
-
-                fried_rows: list[dict] = []
-                if friedman_enabled and instances:
-                    fried_rows = _family_friedman_rows(
-                        eval_df, instances, metric, alpha, population=population
-                    )
-                    if fried_rows:
-                        friedman_frames.append(
-                            _tag_metric(pd.DataFrame(fried_rows), metric_name, metric_k)
-                        )
-                        n_sig = sum(1 for r in fried_rows if r["significant"])
-                        logger.info(
-                            "    friedman: %d/%d family instances significant",
-                            n_sig,
-                            len(fried_rows),
-                        )
-                    else:
-                        logger.info(
-                            "    friedman skipped: no family with a defined "
-                            "omnibus among the enabled families."
-                        )
-
-                if instances:
-                    pair_frames = [
-                        pairwise_significance(
+                if per_user:
+                    if bootstrap_enabled:
+                        summary = per_model_summary(
                             eval_df,
                             metric=metric,
-                            alpha=alpha,
-                            correction=correction,
-                            include_effect_size=effect_size,
-                            pairs=inst.pairs,
-                            family=inst.family,
-                            group=inst.group,
-                            include_cohens_d=include_cohens_d,
-                            diff_ci=bootstrap_enabled,
                             n_iterations=bootstrap_iters,
-                            population=population,
+                            alpha=alpha,
                         )
-                        for inst in instances
-                    ]
-                    pairs_df = pd.concat(pair_frames, ignore_index=True)
-                    pairs_df["omnibus_significant"] = _omnibus_column(pairs_df, fried_rows)
-                    pairwise_frames.append(_tag_metric(pairs_df, metric_name, metric_k))
-                    logger.info(
-                        "    pairwise (%s correction, per family): %d pairs across "
-                        "%d family instances",
-                        correction,
-                        len(pairs_df),
-                        len(instances),
+                        summary_frames.append(_tag_metric(summary, metric_name, metric_k))
+
+                    fried_rows: list[dict] = []
+                    if friedman_enabled and instances:
+                        fried_rows = _family_friedman_rows(
+                            eval_df, instances, metric, alpha, population=population
+                        )
+                        if fried_rows:
+                            friedman_frames.append(
+                                _tag_metric(pd.DataFrame(fried_rows), metric_name, metric_k)
+                            )
+                            n_sig = sum(1 for r in fried_rows if r["significant"])
+                            logger.info(
+                                "    friedman: %d/%d family instances significant",
+                                n_sig,
+                                len(fried_rows),
+                            )
+                        else:
+                            logger.info(
+                                "    friedman skipped: no family with a defined "
+                                "omnibus among the enabled families."
+                            )
+
+                    if instances:
+                        pair_frames = [
+                            pairwise_significance(
+                                eval_df,
+                                metric=metric,
+                                alpha=alpha,
+                                correction=correction,
+                                include_effect_size=effect_size,
+                                pairs=inst.pairs,
+                                family=inst.family,
+                                group=inst.group,
+                                include_cohens_d=include_cohens_d,
+                                diff_ci=bootstrap_enabled,
+                                n_iterations=bootstrap_iters,
+                                population=population,
+                            )
+                            for inst in instances
+                        ]
+                        pairs_df = pd.concat(pair_frames, ignore_index=True)
+                        pairs_df["omnibus_significant"] = _omnibus_column(pairs_df, fried_rows)
+                        pairwise_frames.append(_tag_metric(pairs_df, metric_name, metric_k))
+                        logger.info(
+                            "    pairwise (%s correction, per family): %d pairs across "
+                            "%d family instances",
+                            correction,
+                            len(pairs_df),
+                            len(instances),
+                        )
+                else:
+                    logger.warning(
+                        "    aggregated evaluation only — emitting comparative table "
+                        "without inferential statistics (re-run step 06 with "
+                        "evaluate_per_user to enable Wilcoxon/Friedman/bootstrap)."
                     )
-            else:
-                logger.warning(
-                    "    aggregated evaluation only — emitting comparative table "
-                    "without inferential statistics (re-run step 06 with "
-                    "evaluate_per_user to enable Wilcoxon/Friedman/bootstrap)."
-                )
-                comp = (
-                    eval_df[["model_name", "embedding_name", metric]]
-                    .copy()
-                    .assign(
-                        config=lambda df: df["model_name"] + "_" + df["embedding_name"],
+                    comp = (
+                        eval_df[["model_name", "embedding_name", metric]]
+                        .copy()
+                        .assign(
+                            config=lambda df: df["model_name"] + "_" + df["embedding_name"],
+                        )
+                        .loc[:, ["config", metric]]
+                        .rename(columns={metric: "value"})
                     )
-                    .loc[:, ["config", metric]]
-                    .rename(columns={metric: "value"})
-                )
-                aggregated_frames.append(_tag_metric(comp, metric_name, metric_k))
+                    aggregated_frames.append(_tag_metric(comp, metric_name, metric_k))
 
         for kind, frames in (
             ("summary", summary_frames),

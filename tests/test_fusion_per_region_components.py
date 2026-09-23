@@ -358,3 +358,96 @@ def test_every_strategy_fuses_per_region_rows(strategy: str, kwargs: dict) -> No
     # Region r of the batch must equal the pooled result on those rows:
     # the fusion is last-axis-wise and must not mix regions.
     torch.testing.assert_close(fusion(per_region)[:, 1, :], fusion(per_region[:, 1, :]))
+
+
+# ---------------------------------------------------------------------
+# Streaming (2026-09-10): the per-region pass used to materialise EVERY
+# source in float32 before fusing.  On amazon_women that is 14.59 GiB of
+# input alone -- 11.39 for resnet50_comp, 4.27 for vit_b16_comp -- plus
+# an equal-sized output for concat, against a 16 GiB container: the fuse
+# step OOM-killed its worker on every attempt, deterministically, and
+# tradesy is close behind at 13.70 GiB.  The three heavy strategies are
+# exactly the ones `is_streamable` already covers, and a contiguous
+# (n, R, D) memmap reshapes to (n*R, D) as a VIEW, so the rows the
+# chunked kernels want are already there.
+# ---------------------------------------------------------------------
+
+
+def test_a_streamed_component_fusion_matches_the_dense_result(tmp_path: Path) -> None:
+    """Same arithmetic, same bytes -- only the peak differs."""
+    from src.steps.fuse import _fuse_component_rows, _fuse_component_streamed
+
+    paths = _sources(tmp_path)
+    dense = _fuse_component_rows("concat", paths, normalize=True, train_items=None)
+
+    out = tmp_path / "streamed.npy"
+    _fuse_component_streamed("concat", str(out), paths, normalize=True, train_items=None)
+
+    np.testing.assert_array_equal(np.load(out), dense)
+
+
+def test_a_streamed_component_fusion_keeps_layout_and_dtype(tmp_path: Path) -> None:
+    from src.steps.fuse import _fuse_component_streamed
+
+    paths = _sources(tmp_path)
+    out = tmp_path / "streamed.npy"
+
+    _fuse_component_streamed("concat", str(out), paths, normalize=True, train_items=None)
+
+    written = np.load(out)
+    assert written.shape == (N_ITEMS, REGIONS, D_A + D_B)
+    assert written.dtype == np.float16, "the fp16 the component grid was sized on must survive"
+
+
+def test_a_streamed_pca_shares_one_basis_across_regions(tmp_path: Path) -> None:
+    """The reason regions are flattened together rather than fused apart."""
+    from src.steps.fuse import _fuse_component_rows, _fuse_component_streamed
+
+    paths = _sources(tmp_path)
+    train = list(range(N_ITEMS // 2))
+    dense = _fuse_component_rows("pca", paths, normalize=True, train_items=train, n_components=4)
+
+    out = tmp_path / "streamed_pca.npy"
+    _fuse_component_streamed(
+        "pca", str(out), paths, normalize=True, train_items=train, n_components=4
+    )
+
+    written = np.load(out)
+    assert written.shape == dense.shape
+    np.testing.assert_allclose(written, dense, rtol=1e-2, atol=1e-2)
+
+
+def test_the_dense_path_is_not_taken_for_a_streamable_strategy(tmp_path: Path, monkeypatch) -> None:
+    """The guard on the OOM itself, not on its symptom.
+
+    Asserting a byte count would test the fixture; asserting that the
+    materialising function is never reached tests the routing.
+    """
+    import src.steps.fuse as fuse
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("the dense per-region path must not run for a streamable strategy")
+
+    monkeypatch.setattr(fuse, "_fuse_component_rows", _boom)
+    paths = _sources(tmp_path)
+
+    fuse._fuse_single(
+        "concat",
+        str(tmp_path / "out.npy"),
+        paths,
+        normalize=True,
+        component=True,
+    )
+
+    assert (tmp_path / "out.npy").exists()
+
+
+def test_a_non_streamable_strategy_still_uses_the_dense_path(tmp_path: Path) -> None:
+    """`mean` and friends have no chunked kernel; they must keep working."""
+    from src.steps.fuse import _fuse_component_rows
+
+    paths = _sources(tmp_path)[:1] * 2  # equal dims, so `mean` is defined
+
+    fused = _fuse_component_rows("mean", paths, normalize=True, train_items=None)
+
+    assert fused.shape == (N_ITEMS, REGIONS, D_A)

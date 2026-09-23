@@ -4,6 +4,15 @@ Operational guide to run the full battery on interruptible (spot)
 instances, resume after an interruption, track progress, and handle
 failures.
 
+> **`pipeline.mode: battery` was removed in 3.0.0.** The mode and its
+> `battery_status` companion were never exercised on a real run and had
+> no OOM recovery, so the battery is driven by the ordinary step plan
+> (`pipeline.mode: pipeline`) instead: `train` enumerates and
+> checkpoints every cell of the grid, and `folds` runs the K-fold
+> manifest. "Battery" below means the full experiment, not that mode.
+> `src/battery/` survives as the cell-enumeration and manifest library
+> that `src/folds/runner.py` imports.
+
 ## Before launching
 
 1. **Extraction ready.** The features for every `(dataset, backbone)` and
@@ -28,7 +37,9 @@ failures.
 ## Launch
 
 The run takes half the host by default (`mem_limit` 16g and 8 cores in
-`docker-compose.yml`) and, since the batteries run overnight, 0.95 of
+`docker-compose.yml`; the untracked `.env` raises the memory limit to
+24g on the 31 GiB workstation, after the 16 GiB cgroup OOM-killed a
+fusion worker mid-step) and, since the batteries run overnight, 0.95 of
 the card (`resources.gpu.vram_share` in `configs/resources.yaml`, which
 also holds the worker counts, the host headroom, the DataLoader pins
 and the feature residency). Above ~0.85 the desktop's own GPU
@@ -59,9 +70,9 @@ dead and the whole pipeline runs (`tests/test_local_override.py` pins
 this). `--show-plan` prints the steps the merged YAML resolves to.
 
 ```
-uv run python main.py   # configs/default.yaml -> pipeline.mode: battery
+uv run python main.py   # configs/default.yaml -> pipeline.mode: pipeline
 ```
-The runner:
+The `folds` runner:
 - **enumerates** the cells (datasets × visual configs × recommenders ×
   seeds) with the built-in rules: BPR runs once per `(dataset, seed)`;
   AVBPR is excluded; DeepStyle runs on Tradesy; the **primary seed carries
@@ -77,7 +88,7 @@ compose logs` — see `docs/protocol.md` about the progress bar).
 
 Just **relaunch the same command**:
 ```
-uv run python main.py   # configs/default.yaml -> pipeline.mode: battery
+uv run python main.py   # configs/default.yaml -> pipeline.mode: pipeline
 ```
 `done` cells are skipped; training resumes from the last checkpoint and
 the search from the Optuna storage. Nothing completed is redone.
@@ -116,13 +127,18 @@ I03/I04, S03):
 
 ## Track progress and cost projection
 
+The `battery_status` mode was removed with `mode: battery`. Follow a
+run through its own log, which reports the admitted job count, a
+periodic `Progress:` line with an ETA, and one line per finished cell:
+
+```bash
+docker logs -f prism-vrec          # or: tail -f logs/run_<timestamp>.log
 ```
-uv run python main.py   # configs/default.yaml -> pipeline.mode: battery-status
-```
-Prints the count per state (`pending/running/done/failed`) and the
-**estimate of remaining hours** (average duration per cell type ×
-pending). Roles without a completed sample yet are reported as "no
-estimate", never guessed.
+
+For what is still owed before a launch, `pipeline.mode: inspect_pending`
+lists the pending cells for the configured `condition`, and
+`results/runs/<id>/manifest.json` records the state of the run that
+wrote it.
 
 ## Failures and retry
 
@@ -136,10 +152,9 @@ estimate", never guessed.
 
 A cell that fails is isolated (the others keep going) and marked `failed`
 in the manifest with the error message. To reprocess only the ones that
-failed:
-```
-uv run python main.py   # pipeline.mode: battery + pipeline.retry_failed: true
-```
+failed, **relaunch the same command**: `train` rebuilds its pending list
+from the grid checkpoints and `folds` from its manifest, so a completed
+cell is never redone and `pipeline.retry_failed` is no longer needed.
 
 Failure semantics since 3.0.0 (task records E01/E02, M05):
 
@@ -147,11 +162,11 @@ Failure semantics since 3.0.0 (task records E01/E02, M05):
   returned by `run_cli`: `0` only when every required unit succeeded,
   `1` on any failure (with the traceback logged), `130` on Ctrl-C. The
   run manifest records `exit_status: "error"`.
-- `pipeline.mode: battery` and the `folds` step raise `IncompleteRunError` when any cell of
-  the manifest is not `done` (`failed`, `pending` or `running`), so a
-  battery that lost cells cannot end with a success marker; the
-  manifest is left as-is for `--retry-failed`. `run_battery` /
-  `run_folds` log `INCOMPLETE` at error level with the counts.
+- The `folds` step raises `IncompleteRunError` when any cell of the
+  manifest is not `done` (`failed`, `pending` or `running`), so a run
+  that lost cells cannot end with a success marker; the manifest is
+  left as-is for the relaunch. `run_folds` logs `INCOMPLETE` at error
+  level with the counts.
 - Every submitted training job has exactly one terminal outcome
   (`succeeded` / `failed` / `cancelled`, with `attempts` and
   `error_type`). A worker that dies before publishing is reaped from
@@ -159,10 +174,33 @@ Failure semantics since 3.0.0 (task records E01/E02, M05):
   started is `cancelled` (`PoolExited`). The train step then raises
   `TrainingJobsFailedError` naming the failed and unaccounted units —
   completed jobs keep their checkpoints and grid progress.
+- **A repeating non-OOM fault stops the queue.** Five consecutive
+  `error` outcomes on one worker (`MAX_CONSECUTIVE_ERRORS`) trip a
+  circuit breaker: the worker stops pulling and every job still queued
+  behind it is `cancelled`, not `failed`. A poisoned CUDA context (a
+  Xid 8 launch timeout) fails each job it touches in seconds, so
+  without the breaker one hardware fault spent the whole remaining
+  queue against itself. Only a success clears the streak; an OOM is
+  neutral, having its own path below. The step still raises, because a
+  cancelled job is not an `ok` one.
 - **OOM retries: 3 attempts.** Only `torch.cuda.OutOfMemoryError` is
-  retried (`MAX_OOM_RETRIES = 2`, so at most three attempts, in both
-  the sequential and the pool path), each retry halving the ranking
-  budget. Any other exception fails the job after one attempt.
+  retried (`MAX_OOM_RETRIES = 2`, so at most three attempts, in the
+  sequential path, the pool path and the fold runner), each retry
+  halving the ranking budget. Any other exception fails the job after
+  one attempt. Each retry also escalates how the job runs
+  (`src/utils/oom_recoveries.py`): a job that read features densely
+  switches to lazy reads; a job already lazy (the shipped residency)
+  splits every BPR step into twice as many micro-batches with gradient
+  accumulation — 4096 → 2 × 2048 → 4 × 1024 — keeping one optimiser
+  step over the full batch.
+- **Every OOM recovery is recorded** in
+  `results/runs/<run_id>/oom_recoveries.csv`, one row per event:
+  `retrying` (with the `action` the next attempt takes), `recovered`
+  (the attempt that succeeded) or `failed`, with the job identity,
+  hyperparameters, `lazy_features`, `micro_batches`,
+  `ranking_budget_factor` and the first line of the OOM message. The
+  same event is logged at WARNING as `OOM recovery: ...`; the file is
+  absent when no job ran out of memory.
 - A job whose memory ledger exceeds the resolved host budget is
   recorded as `failed` with `error_type: AdmissionRefused` and a
   reason naming every term; it is never launched, and the run fails

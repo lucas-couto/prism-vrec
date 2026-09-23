@@ -116,6 +116,48 @@ def start_run(
     return run_dir
 
 
+def resume_run(run_dir: str | Path, *, attempt: int, reason: str | None) -> None:
+    """Reopen the manifest of a run the supervisor is resuming after a fault.
+
+    The run keeps its id, its ``started_at`` and its config snapshot;
+    ``duration_seconds`` therefore still spans every attempt once
+    :func:`finish_run` closes it.  Each resume appends one entry to
+    ``restarts`` and clears the finish fields the faulted attempt wrote,
+    so the manifest reads as open again until the run really ends.
+
+    :param run_dir: Directory created by :func:`start_run` on attempt 1.
+    :param attempt: Number of the attempt that is starting (2 or more).
+    :param reason: The supervisor's description of the fault.
+    """
+    run_dir = Path(run_dir)
+    manifest_path = run_dir / "manifest.json"
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not reopen manifest %s: %s", manifest_path, exc)
+        return
+
+    manifest.setdefault("restarts", []).append(
+        {
+            "attempt": attempt,
+            "resumed_at": _now_iso(),
+            "previous_exit_status": manifest.get("exit_status"),
+            "reason": reason,
+        }
+    )
+    manifest.update(
+        {
+            "finished_at": None,
+            "finished_at_epoch": None,
+            "duration_seconds": None,
+            "exit_status": None,
+        }
+    )
+    _write_manifest(run_dir, manifest)
+    logger.warning("Run manifest reopened at %s (attempt %d: %s)", manifest_path, attempt, reason)
+
+
 def finish_run(
     run_dir: str | Path,
     *,

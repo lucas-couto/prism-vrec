@@ -53,7 +53,7 @@ class TestProjectionReuse:
         second = ensure_projected(source, cfg, TRAIN)
 
         assert first is not None and second is None
-        record = read_provenance(projected_path(source, 4))
+        record = read_provenance(projected_path(source, cfg))
         assert record["kind"] == "projection" and record["fit_set_digest"]
 
     def test_changed_source_content_is_refused(self, tmp_path) -> None:
@@ -81,12 +81,25 @@ class TestProjectionReuse:
         with pytest.raises(ArtifactProvenanceError, match="seed"):
             ensure_projected(source, ProjectionConfig(method="random", dim=4, seed=2), None)
 
-    def test_changed_method_is_refused(self, tmp_path) -> None:
-        source = _native(tmp_path)
-        ensure_projected(source, ProjectionConfig(method="pca", dim=4), TRAIN)
+    def test_two_methods_of_one_width_coexist(self, tmp_path) -> None:
+        """The method is in the NAME, so it never needs the refusal.
 
-        with pytest.raises(ArtifactProvenanceError, match="method"):
-            ensure_projected(source, ProjectionConfig(method="pca_whitened", dim=4), TRAIN)
+        Until 2026-09-10 both wrote ``resnet50_p4.npy``: the second call
+        hit the provenance guard and the pair could not coexist in a
+        grid.  Carrying the method in the token makes them different
+        artifacts, and the guard is left to cover what still shares a
+        path -- source content, fit set, seed.
+        """
+        source = _native(tmp_path)
+        plain = ProjectionConfig(method="pca", dim=4)
+        whitened = ProjectionConfig(method="pca_whitened", dim=4)
+
+        ensure_projected(source, plain, TRAIN)
+        ensure_projected(source, whitened, TRAIN)
+
+        assert projected_path(source, plain).exists()
+        assert projected_path(source, whitened).exists()
+        assert projected_path(source, plain) != projected_path(source, whitened)
 
     def test_identical_content_moved_elsewhere_is_reused(self, tmp_path) -> None:
         source = _native(tmp_path / "a")
@@ -102,7 +115,7 @@ class TestProjectionReuse:
         source = _native(tmp_path)
         cfg = ProjectionConfig(method="random", dim=4)
         ensure_projected(source, cfg, None)
-        output = projected_path(source, 4)
+        output = projected_path(source, cfg)
         provenance_path(output).unlink()
 
         status = check_provenance(output, projection_provenance(source, cfg, None), label="p")

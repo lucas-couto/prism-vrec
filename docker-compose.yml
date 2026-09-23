@@ -65,7 +65,11 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    restart: on-failure:3
+    # No restart policy: a CUDA context fault is resumed INSIDE the container
+    # by the supervisor main.py starts as PID 1 (src/supervisor.py), in the
+    # same run directory and session log.  A policy restart would begin a
+    # new run instead, and a new run begins only on `docker compose up -d`.
+    restart: "no"
     shm_size: "4g"
     # Hard cap on container memory.  Without it the container's cgroup is
     # unlimited: a runaway worker pool then exhausts the *host's* RAM and

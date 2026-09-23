@@ -74,12 +74,10 @@ dataset_contracts:
 # results/per_user/ location that beyond_accuracy and statistical read.
 pipeline:
   # What `python main.py` does.  The command takes NO arguments: this is
-  # the only way to choose between running the plan, running the battery
-  # and the read-only inspections.
+  # the only way to choose between running the plan and the read-only
+  # inspections.
   #   pipeline           run the plan below (default)
-  #   battery            run the battery protocol (see `retry_failed`)
   #   show_plan          print the resolved plan and exit
-  #   battery_status     print the battery manifest summary and exit
   #   report             write results/report.md from results/tables
   #   inspect_pending    list the pending cells for `condition`
   #   validate_features  gate every dataset x enabled extractor
@@ -87,7 +85,6 @@ pipeline:
   #   list               print the registered extractors, fusions,
   #                      recommenders and datasets
   mode: pipeline
-  retry_failed: false   # `mode: battery` only
   # When true the entire pipeline runs end-to-end (Battery 1 + Battery 2).
   # Set to false to honour ``start_from`` / ``stop_at`` instead.
   run_all: true

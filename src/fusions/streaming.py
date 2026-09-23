@@ -38,6 +38,7 @@ import numpy as np
 from src.fusions.strategies import (
     _validate_embeddings,
     _warn_ignored_kwargs,
+    cap_fit_indices,
     fit_pca_on_rows,
     l2_normalize,
 )
@@ -124,10 +125,61 @@ def run_streamed(
     _warn_ignored_kwargs(strategy_name, kwargs)
 
     sources = [np.load(path, mmap_mode="r") for path in emb_list_paths]
+    return run_streamed_arrays(
+        strategy_name,
+        sources,
+        output_path,
+        normalize=normalize,
+        train_items=train_items,
+        n_components=n_components,
+        random_state=random_state,
+        chunk_rows=chunk_rows,
+    )
+
+
+def run_streamed_arrays(
+    strategy_name: str,
+    sources: list[np.ndarray],
+    output_path: str | Path,
+    *,
+    normalize: bool,
+    train_items: np.ndarray | None = None,
+    n_components: int | None = None,
+    random_state: int | None = 42,
+    chunk_rows: int = CHUNK_ROWS,
+    out_groups: int | None = None,
+    out_dtype: np.dtype | None = None,
+    compute_dtype: np.dtype | type | None = None,
+) -> tuple[int, int]:
+    """:func:`run_streamed` over already-opened 2-D sources.
+
+    Split out for the per-region component pass, whose sources are
+    ``(n_items, R, D)`` on disk: a contiguous memmap reshapes to
+    ``(n_items * R, D)`` as a VIEW, so the rows the chunked kernels read
+    are already there and nothing is copied to get them.
+
+    *compute_dtype* materialises every chunk in that dtype before the
+    arithmetic, for a caller whose in-memory counterpart upcasts the
+    whole matrix first (see :class:`AsDtype`).
+
+    *out_groups* and *out_dtype* override what the destination is
+    allocated as, leaving the fill order untouched -- the caller gets
+    ``(n_items, R, D_fused)`` written directly instead of reshaping a
+    materialised 2-D result, and keeps the sources' fp16 instead of the
+    float32 the fusion computes in.  The row-major bytes are identical
+    either way; only the header and the on-write cast differ.
+    """
     _validate_embeddings(sources)
+    if compute_dtype is not None:
+        # After the validation, never before: the guard is there to
+        # reject anything that is not a real array, and the adapter is
+        # deliberately not one.
+        sources = [AsDtype(src, compute_dtype) for src in sources]
 
     if strategy_name == "concat":
-        return _stream_concat(sources, output_path, normalize, chunk_rows)
+        return _stream_concat(
+            sources, output_path, normalize, chunk_rows, out_groups=out_groups, out_dtype=out_dtype
+        )
 
     if train_items is None:
         raise ValueError(
@@ -142,16 +194,69 @@ def run_streamed(
 
     if strategy_name == "pca":
         return _stream_pca(
-            sources, output_path, normalize, chunk_rows, fit_idx, n_components, random_state
+            sources,
+            output_path,
+            normalize,
+            chunk_rows,
+            fit_idx,
+            n_components,
+            random_state,
+            out_groups=out_groups,
+            out_dtype=out_dtype,
         )
     return _stream_pca_per_model(
-        sources, output_path, normalize, chunk_rows, fit_idx, n_components, random_state
+        sources,
+        output_path,
+        normalize,
+        chunk_rows,
+        fit_idx,
+        n_components,
+        random_state,
+        out_groups=out_groups,
+        out_dtype=out_dtype,
     )
 
 
 # ---------------------------------------------------------------------
 # Row-wise building blocks
 # ---------------------------------------------------------------------
+
+
+class AsDtype:
+    """A source whose slices materialise in *dtype*.
+
+    The chunked kernels read rows out of their sources and normalise
+    whatever comes back, so the arithmetic happens in the SOURCE dtype.
+    That is right for the pooled path, whose in-memory counterpart does
+    the same -- but the per-region component path upcasts the whole
+    matrix to float32 first and casts back only at the end, and its
+    fp16 sources make the difference visible (~5e-4 per element).
+    Wrapping a source states that intent at the boundary instead of
+    threading a compute dtype through every streamer.
+
+    Only what the kernels touch is forwarded: slicing, ``shape`` and
+    ``dtype``.
+    """
+
+    __slots__ = ("_source", "_dtype")
+
+    def __init__(self, source: np.ndarray, dtype: np.dtype | type) -> None:
+        self._source = source
+        self._dtype = np.dtype(dtype)
+
+    def __getitem__(self, rows) -> np.ndarray:
+        return np.asarray(self._source[rows], dtype=self._dtype)
+
+    def __len__(self) -> int:
+        return len(self._source)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._source.shape
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._dtype
 
 
 def _prepare(source: np.ndarray, rows: slice | np.ndarray, normalize: bool) -> np.ndarray:
@@ -196,25 +301,57 @@ def _output_dtype(sources: list[np.ndarray], normalize: bool) -> np.dtype:
 # ---------------------------------------------------------------------
 
 
+def _destination(
+    shape: tuple[int, int],
+    dtype: np.dtype,
+    out_groups: int | None,
+    out_dtype: np.dtype | None,
+) -> tuple[tuple[int, ...], np.dtype]:
+    """Resolve the destination allocation, honouring caller overrides.
+
+    *out_groups* folds the rows back into groups -- the per-region
+    component pass fuses ``(n_items * R, D)`` rows and wants
+    ``(n_items, R, D_fused)`` on disk.  It is a GROUP COUNT rather than
+    a full shape because the fused width is only known after a PCA fit,
+    inside this module: handing the caller's shape in would have made it
+    duplicate the component-count clamping.  Same row-major bytes, one
+    different header.
+    """
+    resolved_dtype = dtype if out_dtype is None else np.dtype(out_dtype)
+    if out_groups is None:
+        return shape, resolved_dtype
+    n_rows, width = shape
+    if n_rows % out_groups:
+        raise ValueError(f"{n_rows} rows do not divide into {out_groups} groups.")
+    return (n_rows // out_groups, out_groups, width), resolved_dtype
+
+
 def _stream_concat(
     sources: list[np.ndarray],
     output_path: str | Path,
     normalize: bool,
     chunk_rows: int,
+    *,
+    out_groups: int | None = None,
+    out_dtype: np.dtype | None = None,
 ) -> tuple[int, int]:
     """Chunked ``np.concatenate`` along the feature axis (bit-identical)."""
     n_rows = sources[0].shape[0]
     total_dim = sum(int(src.shape[1]) for src in sources)
     shape = (n_rows, total_dim)
+    dest_shape, dest_dtype = _destination(
+        shape, _output_dtype(sources, normalize), out_groups, out_dtype
+    )
 
     def _fill(out: np.memmap) -> None:
+        flat = out.reshape(n_rows, total_dim)
         for rows in _chunks(n_rows, chunk_rows):
-            out[rows] = _concat_rows(sources, rows, normalize)
+            flat[rows] = _concat_rows(sources, rows, normalize)
 
     atomic_np_memmap_save(
         output_path,
-        dtype=_output_dtype(sources, normalize),
-        shape=shape,
+        dtype=dest_dtype,
+        shape=dest_shape,
         fill=_fill,
     )
     _log_done("concat", shape, chunk_rows)
@@ -229,6 +366,9 @@ def _stream_pca(
     fit_idx: np.ndarray,
     n_components: int,
     random_state: int | None,
+    *,
+    out_groups: int | None = None,
+    out_dtype: np.dtype | None = None,
 ) -> tuple[int, int]:
     """PCA over the concatenation of all sources, fit on train rows only.
 
@@ -242,6 +382,7 @@ def _stream_pca(
     total_dim = sum(int(src.shape[1]) for src in sources)
     input_dtype = _output_dtype(sources, normalize)
 
+    fit_idx = cap_fit_indices(fit_idx, random_state, "pca")
     fit_rows = _assemble_fit_matrix(
         sources, fit_idx, normalize, total_dim, input_dtype, chunk_rows=chunk_rows
     )
@@ -256,12 +397,15 @@ def _stream_pca(
     # The dtype of a *transform*, not of the input: scikit-learn decides
     # it, so probe one row rather than predict it.
     dtype = pca.transform(_concat_rows(sources, slice(0, min(1, n_rows)), normalize)).dtype
+    dest_shape, dest_dtype = _destination(shape, dtype, out_groups, out_dtype)
+    n_components_out = int(pca.n_components_)
 
     def _fill(out: np.memmap) -> None:
+        flat = out.reshape(n_rows, n_components_out)
         for rows in _chunks(n_rows, chunk_rows):
-            out[rows] = pca.transform(_concat_rows(sources, rows, normalize))
+            flat[rows] = pca.transform(_concat_rows(sources, rows, normalize))
 
-    atomic_np_memmap_save(output_path, dtype=dtype, shape=shape, fill=_fill)
+    atomic_np_memmap_save(output_path, dtype=dest_dtype, shape=dest_shape, fill=_fill)
     _log_done("pca", shape, chunk_rows)
     return shape
 
@@ -274,9 +418,13 @@ def _stream_pca_per_model(
     fit_idx: np.ndarray,
     n_components: int,
     random_state: int | None,
+    *,
+    out_groups: int | None = None,
+    out_dtype: np.dtype | None = None,
 ) -> tuple[int, int]:
     """Independent PCA per source, then concatenation of the reductions."""
     n_rows = sources[0].shape[0]
+    fit_idx = cap_fit_indices(fit_idx, random_state, "pca_per_model")
 
     fitted = []
     for i, src in enumerate(sources):
@@ -303,12 +451,16 @@ def _stream_pca_per_model(
         ]
     )
 
+    dest_shape, dest_dtype = _destination(shape, dtype, out_groups, out_dtype)
+    width_out = cursor
+
     def _fill(out: np.memmap) -> None:
+        flat = out.reshape(n_rows, width_out)
         for rows in _chunks(n_rows, chunk_rows):
             for src, pca, (lo, hi) in zip(sources, fitted, offsets, strict=True):
-                out[rows, lo:hi] = pca.transform(_prepare(src, rows, normalize))
+                flat[rows, lo:hi] = pca.transform(_prepare(src, rows, normalize))
 
-    atomic_np_memmap_save(output_path, dtype=dtype, shape=shape, fill=_fill)
+    atomic_np_memmap_save(output_path, dtype=dest_dtype, shape=dest_shape, fill=_fill)
     _log_done("pca_per_model", shape, chunk_rows)
     return shape
 
@@ -342,7 +494,8 @@ def stream_pca_align(
     source = np.load(source_path, mmap_mode="r")
     _validate_embeddings([source])
     n_rows = int(source.shape[0])
-    fit_idx = np.asarray(train_items)
+    label_for_cap = f"pca_align[{Path(source_path).name}]"
+    fit_idx = cap_fit_indices(np.asarray(train_items), random_state, label_for_cap)
 
     fit_rows = np.asarray(source[fit_idx])
     k = min(dim, n_rows, int(source.shape[1]))

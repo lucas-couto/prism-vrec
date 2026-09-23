@@ -31,13 +31,18 @@ Two conditions are supported:
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import numpy as np
 
-from src.extractors.projection import resolve_projection_config
+from src.extractors.projection import (
+    ProjectionConfig,
+    ensure_projected,
+    resolve_projection_config,
+)
 from src.fusions import (
     get_fusion_strategy,
     is_registered,
@@ -49,11 +54,19 @@ from src.fusions.streaming import (
     CHUNK_ROWS,
     is_streamable,
     run_streamed,
+    run_streamed_arrays,
     stream_pca_align,
 )
-from src.utils.artifact_names import COMPONENT_SUFFIX
+from src.utils import timing
+from src.utils.artifact_names import (
+    COMPONENT_SUFFIX,
+    FUSION_PREFIX,
+    is_component_artifact,
+    is_projected_artifact,
+)
 from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
+from src.utils.cost_labels import source_labels
 from src.utils.identity import (
     check_provenance,
     feature_recipe,
@@ -300,6 +313,78 @@ def _fuse_component_rows(
     return fused.reshape(n_items, regions, -1).astype(dtype, copy=False)
 
 
+def _fuse_component_streamed(
+    strategy_name: str,
+    output_path: str,
+    emb_list_paths: list[str],
+    normalize: bool,
+    train_items: list[int] | None,
+    **kwargs,
+) -> tuple[int, ...]:
+    """Per-region fusion of a STREAMABLE strategy, chunk-bounded.
+
+    Same arithmetic and same bytes as :func:`_fuse_component_rows`, with
+    the peak bounded by the chunk instead of the catalogue.  The dense
+    path materialises every source in float32 up front: on amazon_women
+    that is 14.59 GiB of input alone, plus an equal-sized output for
+    ``concat``, against a 16 GiB container -- it OOM-killed its worker on
+    every attempt, and tradesy sits at 13.70 GiB behind it (2026-09-10).
+
+    Two properties make the reuse exact rather than approximate:
+
+    * a contiguous ``(n_items, R, D)`` memmap reshapes to
+      ``(n_items * R, D)`` as a VIEW, so the 2-D rows the chunked
+      kernels read are the same bytes, uncopied.  That is why "the
+      chunked kernels read 2-D rows" was never the obstacle it was
+      taken for;
+    * the writer allocates ``(n_items, R, D_fused)`` in the sources'
+      dtype, so the region layout and the fp16 the component grid was
+      sized on come out of the destination header rather than a trailing
+      reshape-and-cast over a materialised result.
+
+    ``train_items`` is expanded to the rows those items own
+    (``i * R + r``) exactly as the dense path does, so a PCA fit still
+    never sees a validation or test item and one basis is still shared
+    by every region.
+    """
+    sources = [np.load(path, mmap_mode="r") for path in emb_list_paths]
+    layouts = {arr.shape[:-1] for arr in sources}
+    if len(layouts) != 1:
+        raise ValueError(
+            f"component fusion {strategy_name!r}: sources disagree on the "
+            f"item/region layout ({sorted(layouts)}).",
+        )
+    if len(sources[0].shape) != 3:
+        raise ValueError(
+            f"component fusion {strategy_name!r}: expected 3-D "
+            f"(n_items, R, D) sources, got shape {sources[0].shape}.",
+        )
+
+    n_items, regions = int(sources[0].shape[0]), int(sources[0].shape[1])
+    dtype = np.result_type(*[arr.dtype for arr in sources])
+    flat = [arr.reshape(n_items * regions, arr.shape[-1]) for arr in sources]
+
+    rows = None
+    if strategy_name in _PCA_STRATEGIES and train_items is not None:
+        base = np.asarray(train_items, dtype=np.int64) * regions
+        rows = (base[:, None] + np.arange(regions, dtype=np.int64)[None, :]).ravel()
+
+    return run_streamed_arrays(
+        strategy_name,
+        flat,
+        output_path,
+        normalize=normalize,
+        train_items=rows,
+        n_components=kwargs.get("n_components"),
+        out_groups=regions,
+        out_dtype=dtype,
+        # float32 for the arithmetic, as the dense path gets by upcasting
+        # the whole matrix; the cast happens per chunk here and the
+        # result comes back to the sources' dtype on write.
+        compute_dtype=np.float32,
+    )
+
+
 def _fuse_single(
     strategy_name: str,
     output_path: str,
@@ -334,8 +419,16 @@ def _fuse_single(
         return f"{strategy_name} (online): sidecar written -> {out}"
 
     if component:
-        # Per-region fusion never streams: the chunked kernels read 2-D
-        # rows, and a component source is (n_items, R, D).
+        if is_streamable(strategy_name):
+            # The heavy three (concat, pca, pca_per_model) are exactly
+            # the streamable ones, and a component source's rows are a
+            # free reshape away -- so the per-region pass is bounded by
+            # the chunk instead of the catalogue.
+            shape = _fuse_component_streamed(
+                strategy_name, str(out), emb_list_paths, normalize, train_items, **kwargs
+            )
+            _inherit_item_order(out, emb_list_paths, strategy_name)
+            return f"{strategy_name} (per-region, streamed): {tuple(shape)} -> {out}"
         fused = _fuse_component_rows(
             strategy_name, emb_list_paths, normalize, train_items, **kwargs
         )
@@ -732,6 +825,42 @@ def _fuse_components_enabled(config: dict) -> bool:
     return False
 
 
+def project_fusion_outputs(
+    dataset_dir: Path,
+    projection: ProjectionConfig | None,
+    train_items: list[int] | None,
+) -> int:
+    """Write the fixed projection of every OFFLINE fusion in *dataset_dir*.
+
+    The extract step projects a single backbone's artifact; a fusion has
+    to be projected here, AFTER it is built, because whitening each
+    source and then mixing them is not the same transform as whitening
+    the mixture -- and it is the mixture the recommender receives
+    (VNPR, whose paper prescribes the offline reduction and which has no
+    learned projection to absorb the input scale).
+
+    Two families are skipped and both are skips of substance:
+
+    * an online fusion is a JSON sidecar whose mixing happens inside the
+      recommender at train time, so there is no array here to project.
+      Under ``alignment: learned`` that is most of them;
+    * a component fusion is ``(n_items, R, D)`` and the projector reads
+      2-D rows.
+
+    :returns: How many projected artifacts were written.
+    """
+    if projection is None:
+        return 0
+
+    written = 0
+    for source in sorted(dataset_dir.glob(f"{FUSION_PREFIX}*.npy")):
+        if is_component_artifact(source.stem) or is_projected_artifact(source.stem):
+            continue
+        if ensure_projected(source, projection, train_items) is not None:
+            written += 1
+    return written
+
+
 def run(condition: str = "frozen") -> None:
     """Run all fusion strategies for the given condition.
 
@@ -877,18 +1006,57 @@ def run(condition: str = "frozen") -> None:
                 Path(task["output_path"]), task["emb_list_paths"], task["strategy_name"]
             )
     skipped = len(all_tasks) - len(pending)
+    for _ in range(skipped):
+        timing.note_skipped_cell()
     if skipped:
         logger.info("Skipping %d already existing fusions.", skipped)
 
-    if not pending:
+    if pending:
+        n_workers = _plan_fusion_workers(pending, resolve_resources(config))
+        logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
+        _run_fusion_pool(pending, n_workers)
+    else:
         logger.info("All fusions already exist.")
-        return
 
-    n_workers = _plan_fusion_workers(pending, resolve_resources(config))
-    logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
-
-    _run_fusion_pool(pending, n_workers)
+    # NOT inside the `pending` branch: a rerun whose fusions are all
+    # cached must still project them, or the projected artifacts would
+    # exist only on the run that happened to build the fusions.
+    _project_every_dataset(datasets, embeddings_dir, processed_dir, config)
     logger.info("Embedding fusion complete.")
+
+
+def _project_every_dataset(
+    datasets: list[str],
+    embeddings_dir: str,
+    processed_dir: str,
+    config: dict,
+) -> None:
+    """Run the fusion-output projection for every dataset, when configured."""
+    projection = resolve_projection_config(config, FUSION_PREFIX.rstrip("_"))
+    if projection is None:
+        return
+    for dataset_name in datasets:
+        dataset_dir = Path(embeddings_dir) / dataset_name
+        if not dataset_dir.exists():
+            continue
+        with timing.time_cell(
+            "fuse", dataset=dataset_name, stage="projection", method=projection.method
+        ) as cell:
+            train_items = (
+                train_item_indices(processed_dir, dataset_name) if projection.needs_fit else None
+            )
+            written = project_fusion_outputs(dataset_dir, projection, train_items)
+            if not written:
+                cell.skip("projected fusions exist")
+            cell.label(written=written, dim=projection.dim)
+        if written:
+            logger.info(
+                "  %s: projected %d offline fusion(s) to %s dim %d.",
+                dataset_name,
+                written,
+                projection.method,
+                projection.dim,
+            )
 
 
 class FusionWorkerLostError(RuntimeError):
@@ -908,6 +1076,36 @@ def _cgroup_oom_kills() -> int | None:
     return None
 
 
+def _timed_fusion(worker, task: dict) -> tuple[str | None, float]:
+    """Run *worker* on *task* inside the pool; return ``(result, seconds)``.
+
+    Timed in the worker, not the parent, so a task that waited in the
+    queue behind busier workers is not charged for the wait.
+    """
+    started = time.perf_counter()
+    result = worker(**task)
+    return result, time.perf_counter() - started
+
+
+def _record_fusion_cost(task: dict, result: str | None, seconds: float, n_workers: int) -> None:
+    """One ``fuse`` cost cell per fusion that did work (``None`` = output existed)."""
+    if result is None:
+        timing.note_skipped_cell()
+        return
+    output = Path(task.get("output_path") or "")
+    timing.record_cell(
+        "fuse",
+        seconds,
+        dataset=output.parent.name,
+        extractors=source_labels(task.get("emb_list_paths") or []),
+        fusion=task.get("strategy_name"),
+        embedding=output.name.rsplit(".", 1)[0],
+        online=task.get("sidecar_payload") is not None,
+        component=bool(task.get("component")),
+        concurrent_workers=n_workers,
+    )
+
+
 def _run_fusion_pool(pending: list[dict], n_workers: int, worker=_fuse_single) -> int:
     """Run *pending* fusions on a process pool; return how many completed.
 
@@ -923,9 +1121,10 @@ def _run_fusion_pool(pending: list[dict], n_workers: int, worker=_fuse_single) -
     completed = 0
     try:
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(worker, **task): task for task in pending}
+            futures = {pool.submit(_timed_fusion, worker, task): task for task in pending}
             for future in as_completed(futures):
-                result = future.result()
+                result, seconds = future.result()
+                _record_fusion_cost(futures[future], result, seconds, n_workers)
                 completed += 1
                 if result:
                     logger.info("  [%d/%d] %s", completed, len(pending), result)

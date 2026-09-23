@@ -18,6 +18,7 @@ from src.recommenders.registry import registered_recommender_names
 from src.utils.artifact_names import BEST_SUFFIX, parse_checkpoint_stem
 from src.utils.config import load_config
 from src.utils.logging import get_logger
+from src.utils.timing import time_cell
 
 logger = get_logger(__name__)
 
@@ -122,4 +123,5 @@ def run(output: str | None = None) -> None:
     results_root = Path(config.get("paths", {}).get("results", "results"))
     models_root = results_root / "models"
     output_path = Path(output) if output else results_root / "best_hyperparams.json"
-    export_best_hyperparams(models_root, output_path)
+    with time_cell("export_best", output=str(output_path)):
+        export_best_hyperparams(models_root, output_path)

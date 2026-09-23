@@ -12,13 +12,16 @@ Captures wall-clock durations at two granularities:
   ``results/runs/<run_id>/steps.json``.  That is what a researcher
   reads while the pipeline is still running, and what survives a run
   that is killed before ``finish_run`` — steps with no cells at all
-  (``preprocess``, ``report``) have no other trace.
+  (``report``) have no other trace.
 * **Per cell**, opt-in finer-grained log written to
   ``results/runs/<run_id>/step_timings.json``.  Hot loops in the
-  expensive steps (download, extract, finetune, ...) wrap each cell
+  pipeline steps (download through export_best) wrap each cell
   with the :func:`time_cell` context manager so a researcher can
   audit how long every ``(dataset, extractor)`` or
-  ``(dataset, embedding, recommender)`` combination took.
+  ``(dataset, embedding, recommender)`` combination took.  The same
+  cells are flattened into ``cell_costs.csv`` next to it, one row per
+  cell with time, mean RAM / GPU / VRAM / power and energy (see
+  :mod:`src.utils.cell_costs`).
 
 A cell that found its output already on disk did no work, so timing
 and costing it is meaningless: it would report a fraction of a second
@@ -35,9 +38,10 @@ every function signature.  The recorder is thread-safe (multiple
 threads within one process append concurrently), but it is **not**
 subprocess-safe, a worker spawned via :mod:`multiprocessing` or
 joblib runs in its own process and has its own (empty) singleton.
-Per-cell timings for parallel hyperparameter search are therefore
-deliberately omitted; Optuna's own study database covers that
-breakdown.
+A spawned training job is therefore recorded by the *parent*, from the
+wall-clock duration its result message carries, through
+:func:`record_cell`: the parent owns the sampler, so the job's window is
+sliced from the same run-wide series.
 """
 
 from __future__ import annotations
@@ -51,8 +55,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from src import supervisor
 from src.utils import telemetry
 from src.utils.atomic_io import atomic_write
+from src.utils.cell_costs import render_csv
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -113,9 +119,14 @@ class _TimingRecorder:
         self._run_dir: Path | None = None
         self._lock = Lock()
 
-    def bind(self, run_dir: Path | str) -> None:
+    def bind(self, run_dir: Path | str, *, resume: bool = False) -> None:
         with self._lock:
             self._run_dir = Path(run_dir)
+            if resume:
+                # A resumed attempt starts with an empty singleton; without
+                # this its first flush would erase every earlier entry.
+                self._steps = _load_entries(self._run_dir / "steps.json") + self._steps
+                self._cells = _load_entries(self._run_dir / "step_timings.json") + self._cells
             # Anything recorded before the bind (nothing today, but the
             # order in ``main`` is not this module's to guarantee) is
             # persisted now rather than waiting for the next entry.
@@ -176,69 +187,103 @@ class _TimingRecorder:
         started_at = _now_iso()
         start_perf = time.perf_counter()
         marker = telemetry.mark()
+        failed = False
         try:
             yield cell
+        except BaseException:
+            failed = True
+            raise
         finally:
             if cell.skipped:
                 # Nothing ran: counted, not recorded.  The count is what
                 # lets ``_run_step`` tell "step did no new work" from
-                # "step has no cells at all" (preprocess, report).
+                # "step has no cells at all" (report).
                 with self._lock:
                     self._skipped_cells += 1
             else:
-                duration = round(time.perf_counter() - start_perf, 3)
-                entry: dict[str, Any] = {
-                    "step": step,
-                    "started_at": started_at,
-                    "duration_seconds": duration,
-                    "labels": {**labels, **cell.extra_labels},
-                }
+                duration = time.perf_counter() - start_perf
                 # The cell slices the same run-wide sample series the
                 # enclosing step will slice, so nesting costs nothing extra.
-                metrics = telemetry.summarise_since(marker)
-                if metrics:
-                    entry["telemetry"] = metrics
-                with self._lock:
-                    self._cells.append(entry)
-                    self._flush_cells_unsafe()
+                self.append_cell(
+                    step,
+                    started_at,
+                    duration,
+                    {**labels, **cell.extra_labels},
+                    telemetry.summarise_since(marker),
+                )
+                if not failed and step not in supervisor.NON_PROGRESS_STEPS:
+                    supervisor.note_progress()
+
+    def append_cell(
+        self,
+        step: str,
+        started_at: str,
+        duration_seconds: float,
+        labels: dict[str, Any],
+        metrics: dict[str, Any] | None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "step": step,
+            "started_at": started_at,
+            "duration_seconds": round(duration_seconds, 3),
+            "labels": labels,
+        }
+        if metrics:
+            entry["telemetry"] = metrics
+        with self._lock:
+            self._cells.append(entry)
+            self._flush_cells_unsafe()
 
     def _flush_cells_unsafe(self) -> None:
         """Persist the cell list to disk; caller already holds the lock."""
         self._write_unsafe("step_timings.json", self._cells)
+        self._write_unsafe("cell_costs.csv", self._cells, render=render_csv)
 
     def _flush_steps_unsafe(self) -> None:
         """Persist the step list to disk; caller already holds the lock."""
         self._write_unsafe("steps.json", self._steps)
 
-    def _write_unsafe(self, filename: str, entries: list[dict[str, Any]]) -> None:
+    def _write_unsafe(self, filename: str, entries: list[dict[str, Any]], render=None) -> None:
         """Atomically dump *entries* into ``<run_dir>/<filename>``.
 
         An empty list writes nothing: a run that recorded no cells
         should leave no sidecar behind rather than an empty array
-        that reads as "measured, found nothing".
+        that reads as "measured, found nothing".  *render* turns the
+        entries into the file's text; the default is indented JSON.
         """
         if self._run_dir is None or not entries:
             return
         path = self._run_dir / filename
-        payload = json.dumps(entries, indent=2)
+        payload = render(entries) if render else json.dumps(entries, indent=2)
         try:
             atomic_write(lambda tmp: Path(tmp).write_text(payload), path)
         except OSError as exc:
             logger.warning("failed to write %s: %r", path, exc)
 
 
+def _load_entries(path: Path) -> list[dict[str, Any]]:
+    """Entries an earlier attempt of the same run flushed to *path*."""
+    try:
+        entries = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+
+
 _RECORDER = _TimingRecorder()
 
 
-def bind_run_dir(run_dir: Path | str) -> None:
+def bind_run_dir(run_dir: Path | str, *, resume: bool = False) -> None:
     """Bind the global recorder to a run directory.
 
     Called once by :func:`main.main` right after :func:`start_run`.
     The path is where :func:`time_cell` writes ``step_timings.json``
     and :func:`record_step` writes ``steps.json``.  Until bound, both
-    levels are still accumulated in memory but not persisted.
+    levels are still accumulated in memory but not persisted.  With
+    *resume* (a supervisor restart reopening the same run) the entries
+    earlier attempts flushed are loaded first, so they are kept.
     """
-    _RECORDER.bind(run_dir)
+    _RECORDER.bind(run_dir, resume=resume)
 
 
 def record_step(
@@ -295,6 +340,39 @@ def time_cell(step: str, **labels: Any):
     without inferring it from a position-encoded string.
     """
     return _RECORDER.time_cell(step, **labels)
+
+
+def record_cell(
+    step: str,
+    duration_seconds: float,
+    ended_perf: float | None = None,
+    **labels: Any,
+) -> None:
+    """Record a cell whose work ran somewhere this process could not wrap.
+
+    A spawned worker has no sampler and no bound run directory, so its
+    jobs cannot use :func:`time_cell`.  The parent calls this instead
+    when the job's result arrives, with the duration the worker measured:
+    the window ``[end - duration, end]`` is sliced from the parent's own
+    sample series, so the entry carries the same telemetry block a
+    wrapped cell would.
+
+    :param step: Pipeline step the cell belongs to (``"train"``).
+    :param duration_seconds: Wall-clock seconds the work took.
+    :param ended_perf: ``time.perf_counter()`` at the moment the work
+        ended; defaults to now.
+    :param labels: Keyword labels, as for :func:`time_cell`.
+    """
+    end = time.perf_counter() if ended_perf is None else ended_perf
+    marker = end - max(0.0, float(duration_seconds)) if telemetry.is_active() else None
+    started_at = datetime.fromtimestamp(time.time() - duration_seconds, UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    _RECORDER.append_cell(
+        step, started_at, duration_seconds, labels, telemetry.summarise_since(marker)
+    )
+    if labels.get("status", "ok") == "ok" and step not in supervisor.NON_PROGRESS_STEPS:
+        supervisor.note_progress()
 
 
 def step_timings() -> list[dict[str, Any]]:

@@ -77,7 +77,7 @@ fusion_extractors:
 # =============================================================================
 # Fixed linear projection to a common dimension (optional)
 # =============================================================================
-# Writes <extractor>_p<dim>.npy next to each native artifact, so every
+# Writes <extractor>_<method><dim>.npy next to each native artifact, so every
 # extractor also exists in ONE shared dim-dimensional space. The native
 # .npy is never touched: both live side by side and can be compared in
 # the same battery.
@@ -110,10 +110,17 @@ fusion_extractors:
 # Any extractor may override the block under `extractors.<name>.projection`
 # (e.g. `method: none` to keep one backbone native-only).
 #
-# The projector itself is written to <extractor>_p<dim>.proj.npz plus a
+# The projector itself is written to <extractor>_<method><dim>.proj.npz plus a
 # .proj.json describing it, so the map is auditable and reproducible.
 projection:
-  method: none
+  # Enabled for VNPR: its paper reduces the CNN feature offline, before
+  # the model sees it (see the `visual_input` block in
+  # recommenders.yaml).  The artifacts are written beside the native
+  # ones -- `<extractor>_pcaw128.npy` and, after fusion,
+  # `hybrid_*_pcaw128.npy` -- and only a recommender that asks for them
+  # reads them: `embedding_variants: native` keeps every other model on
+  # the native feature its own paper prescribes.
+  method: pca_whitened
   dim: 128
   seed: 42
 

@@ -42,5 +42,17 @@ resources:
     # `auto` only sees the RESIDENT matrix — a peak that is transient in
     # the batch, as ACF's history staging, is not predicted here and is
     # recovered by the OOM retry, which escalates a failed job to lazy.
-    residency: auto
+    # `lazy` since 2026-09-11 (researcher's decision), not `auto`.
+    # ACF over a per-region component fusion stacks its sources at load:
+    # resnet50_comp (5.3 GiB) + vit_b16_comp (2.0 GiB) in float32 is
+    # 14.6 GiB against a 16 GiB cgroup, and the kill is a host-RAM
+    # SIGKILL -- which takes the ORCHESTRATOR down with the job, so the
+    # run cannot mark that cell failed and carry on.  Measured on
+    # amazon_women: peak 14.6 GiB (killed) against 1.92 GiB with lazy,
+    # and the admission planner's heaviest job drops 10.01 -> 3.40 GB.
+    # `auto` cannot see this peak: it predicts the RESIDENT matrix in
+    # VRAM, and the online stacking is host RAM.  The ~3x per-step cost
+    # on the cells that never needed it is accepted: losing the whole
+    # run to one cell is worse than every cell being slower.
+    residency: lazy
     item_block: 8192           # rows per block for catalogue-sized requests

@@ -29,7 +29,7 @@ untracked ``configs/zz_local.yaml`` of the night.  Example::
 
 ``python main.py`` (and ``docker compose up -d --build``) runs that
 plan; ``python main.py --show-plan`` prints it without running.  The
-remaining flags are tools around the run (``--battery``, ``--folds``,
+remaining flags are tools around the run (``--folds``,
 ``--report``, ``--inspect-pending``, ``--validate-*``, ``--list-*``,
 ``--config-dir``).  The former step / condition / search / protocol /
 seed flags were removed (3.0.0, by the researcher's decision); passing
@@ -55,6 +55,14 @@ from typing import Any
 # ``os._exit(0)``, which lands on the terminal *after* the shell prompt
 # returned and leaves the cursor parked on the warning text.
 os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
+
+if __name__ == "__main__" and os.environ.get("PRISM_SUPERVISED") != "1":
+    # PID 1 of the container: launch the pipeline as a child and resume
+    # the same run in a fresh one after a CUDA context fault.  This runs
+    # before the step imports below, so the supervisor never loads torch.
+    from src.supervisor import supervise
+
+    os._exit(supervise([sys.executable, *sys.argv]))
 
 from src.steps import (  # noqa: E402
     beyond_accuracy,
@@ -245,7 +253,7 @@ def _did_no_new_work(before: tuple[int, int], after: tuple[int, int]) -> bool:
     *before* / *after* are ``(recorded, skipped)`` snapshots from
     :func:`src.utils.timing.cell_counts`.  Requiring at least one
     skipped cell is what keeps steps that emit no cells at all
-    (``preprocess``, ``report``) out of the skipped bucket: they are
+    (``report``) out of the skipped bucket: they are
     timed as usual.  ``download`` does emit cells, but never skips
     them, so it is never marked skipped either.
     """
@@ -288,6 +296,37 @@ def _log_step_telemetry(label: str, metrics: dict[str, Any] | None) -> None:
         logger.info("      %s telemetry: %s", label, " | ".join(parts))
 
 
+def _log_plan_table(
+    steps: list[str], config: dict[str, Any], condition: str | None, run_both: bool
+) -> None:
+    """Print the resolved plan as a table before the first step runs.
+
+    The single-line ``Pipeline plan:`` above stays (scripts and the
+    existing tests read it); this block is for the person watching
+    ``docker logs -f``, who otherwise learns what the run decided to do
+    only as each step happens to start.
+    """
+    from src.utils.progress import render_plan
+
+    for line in render_plan(
+        steps,
+        config,
+        condition=condition or "both",
+        run_both=run_both,
+        condition_steps=sorted(CONDITION_STEPS),
+    ):
+        logger.info("%s", line)
+
+
+def _log_step_timeline(steps: list[str], current: str | None) -> None:
+    """Print which steps are done, with elapsed time, and what is left."""
+    from src.utils.progress import render_timeline
+    from src.utils.timing import step_timings
+
+    for line in render_timeline(steps, step_timings(), current=current):
+        logger.info("%s", line)
+
+
 def _run_steps(names: list[str], condition: str | None, run_both_conditions: bool) -> None:
     """Run a sequence of steps, expanding condition steps when requested."""
     for name in names:
@@ -298,6 +337,7 @@ def _run_steps(names: list[str], condition: str | None, run_both_conditions: boo
             _run_step(name, "all")
         else:
             _run_step(name, condition)
+        _log_step_timeline(names, current=None)
 
 
 #: Flags removed in 3.0.0 (the YAML is the only control surface) and
@@ -316,10 +356,12 @@ REMOVED_FLAGS: dict[str, str | None] = {
     "--folds": "folds.enabled: true (configs/default.yaml); the folds STEP then runs "
     "in pipeline order, and start_from / stop_at reach it like any other step",
     "--config-dir": None,  # nothing replaces it: the directory is always `configs/`
-    "--battery": "pipeline.mode: battery (configs/default.yaml)",
-    "--retry-failed": "pipeline.retry_failed: true, with pipeline.mode: battery",
+    # The battery mode was removed in 3.0.0: it was never exercised, carried no
+    # OOM recovery, and the frozen grid runs through the step plan instead.
+    "--battery": None,
+    "--retry-failed": None,
     "--show-plan": "pipeline.mode: show_plan",
-    "--battery-status": "pipeline.mode: battery_status",
+    "--battery-status": None,
     "--report": "pipeline.mode: report",
     "--report-metric": "report.metric (configs/evaluation.yaml)",
     "--report-top": "report.top_n (configs/evaluation.yaml)",
@@ -345,6 +387,8 @@ def _reject_arguments(argv: list[str]) -> None:
         flag = token.split("=", 1)[0]
         if flag == "--config-dir":
             detail = "the configuration directory is always `configs/`"
+        elif flag in REMOVED_FLAGS and REMOVED_FLAGS[flag] is None:
+            detail = "nothing replaces it: the behaviour it selected no longer exists"
         elif flag in REMOVED_FLAGS:
             detail = f"set {REMOVED_FLAGS[flag]} instead"
         else:
@@ -576,9 +620,9 @@ def _filter_steps_by_condition(steps: list[str], condition: str) -> list[str]:
 def _run_mode(mode: str, config: dict[str, Any]) -> None:
     """Execute a non-``pipeline`` ``pipeline.mode`` and return.
 
-    Each of these prints something, or runs the battery, instead of the
-    step plan.  None of them takes a parameter here: what they operate on
-    comes from the same YAML that selected them.
+    Each of these prints something instead of running the step plan.
+    None of them takes a parameter here: what they operate on comes from
+    the same YAML that selected them.
     """
     if mode == "list":
         _list_extractors()
@@ -596,11 +640,6 @@ def _run_mode(mode: str, config: dict[str, Any]) -> None:
         return
     if mode == "validate_features":
         raise SystemExit(validate_features.run(dataset=None, backbone=None))
-    if mode == "battery_status":
-        from src.battery.runner import battery_status
-
-        battery_status(config["paths"]["results"])
-        return
     if mode == "inspect_pending":
         _inspect_pending(config.get("pipeline", {}).get("condition", "frozen"))
         return
@@ -616,19 +655,6 @@ def _run_mode(mode: str, config: dict[str, Any]) -> None:
             top_n=report_cfg.get("top_n"),
         )
         print(f"Report written to {written}")
-        return
-    if mode == "battery":
-        from src.battery.execute import execute_cell
-        from src.battery.runner import run_battery
-
-        _log_resource_plan(config)
-        manifest = run_battery(
-            config,
-            config["paths"]["results"],
-            execute_cell,
-            retry_failed=bool(config.get("pipeline", {}).get("retry_failed", False)),
-        )
-        _require_complete(manifest, label="battery")
         return
     raise SystemExit(f"unknown pipeline.mode {mode!r}")
 
@@ -657,6 +683,7 @@ def main(argv: list[str] | None = None) -> None:
         condition if condition is not None else "(both)",
         run_both,
     )
+    _log_plan_table(steps, config, condition, run_both)
 
     seeds = config.get("seeds")
     if seeds:
@@ -666,12 +693,12 @@ def main(argv: list[str] | None = None) -> None:
 
 
 class IncompleteRunError(RuntimeError):
-    """A battery / K-fold manifest still holds cells that did not finish.
+    """A K-fold manifest still holds cells that did not finish.
 
-    The runners return their manifest even when cells failed; without
-    this check ``main.py`` exited zero on a battery with failed cells
-    (audit F04).  The manifest itself is untouched, so ``--battery
-    --retry-failed`` resumes exactly the cells listed here.
+    The runner returns its manifest even when cells failed; without this
+    check ``main.py`` exited zero on a run with failed cells (audit
+    F04).  The manifest itself is untouched, so re-running the step
+    resumes exactly the cells listed here.
     """
 
 
@@ -704,10 +731,27 @@ def run_cli(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
         return 130
-    except Exception:  # noqa: BLE001 — the boundary must yield a code, not a traceback
+    except Exception as exc:  # noqa: BLE001 — the boundary must yield a code, not a traceback
+        if _is_cuda_fault(exc):
+            from src import supervisor
+
+            logger.error("Pipeline stopped by a CUDA context fault.", exc_info=True)
+            supervisor.note_fault(str(exc))
+            return supervisor.EXIT_CUDA_FAULT
         logger.error("Pipeline failed.", exc_info=True)
         return 1
     return 0
+
+
+def _is_cuda_fault(exc: BaseException) -> bool:
+    """True when *exc* came from a lost CUDA context rather than from the code.
+
+    The chain is read first; a step that summarised per-cell failures
+    into its own exception has lost it, so the device is probed too.
+    """
+    from src.utils.cuda_faults import cuda_context_lost, is_fatal_cuda_error
+
+    return is_fatal_cuda_error(exc) or cuda_context_lost()
 
 
 def _exit_code(code: object) -> int:
@@ -720,25 +764,47 @@ def _exit_code(code: object) -> int:
     return 1
 
 
+def _open_run(config: dict[str, Any], plan: dict[str, Any], run_key: str) -> tuple[Path, bool]:
+    """Create this invocation's run directory, or reopen it after a fault.
+
+    A run directory is created once per supervisor.  A child the
+    supervisor launched again after a CUDA context fault finds the
+    directory its predecessor recorded under *run_key* and reopens it,
+    so the whole run keeps one id, one manifest and one set of sidecars.
+
+    :returns: The run directory and whether it was reopened.
+    """
+    from src import supervisor
+    from src.utils.manifest import resume_run, start_run
+
+    previous = supervisor.recorded_run_dir(run_key)
+    if previous is not None and (previous / "manifest.json").exists():
+        resume_run(previous, attempt=supervisor.attempt(), reason=supervisor.restart_reason())
+        return previous, True
+    results_root = Path(config.get("paths", {}).get("results", "results"))
+    run_dir = start_run(config_snapshot=config, results_root=results_root / "runs", plan=plan)
+    supervisor.remember_run_dir(run_key, run_dir)
+    return run_dir, False
+
+
 def _run_single(
     config: dict[str, Any],
     steps: list[str],
     condition: str | None,
     run_both: bool,
+    *,
+    run_key: str = "single",
 ) -> Path:
     """Execute the full pipeline once and return the run directory."""
     from src.utils import telemetry
     from src.utils.carbon import tracker as carbon_tracker
-    from src.utils.manifest import finish_run, start_run
+    from src.utils.manifest import finish_run
+    from src.utils.oom_recoveries import bind_run_dir as bind_oom_recoveries
     from src.utils.timing import bind_run_dir
 
-    results_root = Path(config.get("paths", {}).get("results", "results"))
-    run_dir = start_run(
-        config_snapshot=config,
-        results_root=results_root / "runs",
-        plan=_plan_record(steps, condition, run_both),
-    )
-    bind_run_dir(run_dir)
+    run_dir, resumed = _open_run(config, _plan_record(steps, condition, run_both), run_key)
+    bind_run_dir(run_dir, resume=resumed)
+    bind_oom_recoveries(run_dir, resume=resumed)
     # One sampler for the whole invocation; every step and cell slices its
     # own window out of the shared series.
     telemetry.start(config, run_dir)
@@ -750,8 +816,8 @@ def _run_single(
     except KeyboardInterrupt:
         exit_status = "interrupted"
         raise
-    except Exception:
-        exit_status = "error"
+    except Exception as exc:
+        exit_status = "cuda_fault" if _is_cuda_fault(exc) else "error"
         raise
     finally:
         # Stop before finish_run: the manifest records the probe backends
@@ -786,7 +852,7 @@ def _run_multi_seed(
         seed_config = derive_seed_config(base_config, seed)
         set_config_override(seed_config)
         try:
-            _run_single(seed_config, steps, condition, run_both)
+            _run_single(seed_config, steps, condition, run_both, run_key=f"seed{seed}")
         finally:
             set_config_override(None)
 
