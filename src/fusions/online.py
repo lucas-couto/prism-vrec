@@ -68,10 +68,14 @@ class RaggedSources(np.ndarray):
     """Concatenated native sources ``(n_items, sum(D_i))`` + metadata.
 
     Produced by :func:`load_embedding` for learned-alignment fusion
-    sidecars.  The array itself is the axis-1 concatenation of the M
-    native source matrices; the attached attributes let the recommender
-    build a :class:`LearnedAlignmentFusion` that splits, projects and
-    combines them at every forward pass:
+    sidecars.  The array itself is the LAST-axis concatenation of the M
+    native source matrices -- ``(n_items, sum(D_i))`` for pooled sources
+    and ``(n_items, R, sum(D_i))`` for the per-region component
+    artifacts ACF consumes, where the fusion is applied region by region
+    and the projections are shared by every region.  The attached
+    attributes let the recommender build a
+    :class:`LearnedAlignmentFusion` that splits, projects and combines
+    them at every forward pass:
 
     * ``source_dims`` — the native dim of each source, in concat order.
     * ``strategy`` — the element-wise fusion op to apply after
@@ -256,13 +260,25 @@ class LearnedAlignmentFusion(nn.Module):
             aligned = [nn.functional.normalize(a, p=2, dim=-1, eps=1e-12) for a in aligned]
         return aligned
 
+    def _per_source(self, weights: torch.Tensor, stacked: torch.Tensor) -> torch.Tensor:
+        """Broadcast one weight per source over ``stacked`` of any rank.
+
+        ``stacked`` is ``(M, B, D)`` for pooled rows and ``(M, B, R, D)``
+        for the per-region component rows, so the number of trailing axes
+        is not fixed.  Reshaping the weights to a fixed rank broadcast
+        them against the wrong axes and raised (found 2026-09-09 on the
+        first real ACF run: only the four weight-carrying strategies
+        failed, the plain reductions were fine).
+        """
+        return weights.view(-1, *([1] * (stacked.dim() - 1)))
+
     def forward(self, concat: torch.Tensor) -> torch.Tensor:
         aligned = self._aligned(concat)
 
         if self.strategy == "adaptive_gated":
             return self.gate(aligned[0], aligned[1])
 
-        stacked = torch.stack(aligned, dim=0)  # (M, B, D)
+        stacked = torch.stack(aligned, dim=0)  # (M, B, [R,] D)
         if self.strategy == "mean":
             return stacked.mean(dim=0)
         if self.strategy == "sum":
@@ -272,14 +288,14 @@ class LearnedAlignmentFusion(nn.Module):
         if self.strategy == "max_pool":
             return stacked.max(dim=0).values
         if self.strategy == "weighted_mean":
-            w = self.fixed_weights.view(-1, 1, 1)
+            w = self._per_source(self.fixed_weights, stacked)
             return (stacked * w).sum(dim=0)
         if self.strategy == "softmax_weighted":
-            alphas = torch.softmax(self.fixed_logits, dim=0).view(-1, 1, 1)
+            alphas = self._per_source(torch.softmax(self.fixed_logits, dim=0), stacked)
             return (stacked * alphas).sum(dim=0)
         if self.strategy == "sigmoid_gated":
             gates = torch.sigmoid(self.fixed_logits)
-            gates = (gates / gates.sum()).view(-1, 1, 1)
+            gates = self._per_source(gates / gates.sum(), stacked)
             return (stacked * gates).sum(dim=0)
         raise RuntimeError(f"unreachable op {self.strategy!r}")
 
@@ -478,14 +494,14 @@ def load_embedding(path: str | Path, *, lazy: bool = False):
             # feature axis and attach the metadata the recommender needs
             # to build a LearnedAlignmentFusion (per-source learned
             # projections co-trained via BPR).
-            n_rows = {arr.shape[0] for arr in loaded}
-            if len(n_rows) != 1:
+            leading = {arr.shape[:-1] for arr in loaded}
+            if len(leading) != 1:
                 raise ValueError(
-                    f"sidecar {p}: components disagree on n_items ({sorted(n_rows)}).",
+                    f"sidecar {p}: components disagree on item/region layout ({sorted(leading)}).",
                 )
             return RaggedSources(
-                np.concatenate(loaded, axis=1),
-                source_dims=[int(arr.shape[1]) for arr in loaded],
+                np.concatenate(loaded, axis=-1),
+                source_dims=[int(arr.shape[-1]) for arr in loaded],
                 strategy=sidecar["strategy"],
                 aligned_dim=int(sidecar["dim"]),
                 normalize=bool(sidecar.get("normalize", True)),

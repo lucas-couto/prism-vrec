@@ -281,7 +281,7 @@ projection:
 pipeline: { run_all: false, start_from: extract, stop_at: extract, condition: frozen }
 ```
 
-Writes `<extractor>_p128.npy` next to each native artifact. The native
+Writes `<extractor>_pcaw128.npy` next to each native artifact. The native
 files are untouched, so this costs a linear pass over matrices already
 on disk — the backbones are not loaded again — and the run that follows
 can compare native against projected.
@@ -301,13 +301,13 @@ extractor_variants: projected # native | projected | both
 already share a width, so the `alignment:` block is bypassed entirely —
 no `Linear(D_i -> D)` co-trained by BPR, no PCA fit inside the fuse
 step. Outputs carry the token so both families coexist:
-`hybrid_mean.npy` next to `hybrid_mean_p128.npy`. `both` runs one pass
+`hybrid_mean.npy` next to `hybrid_mean_pcaw128.npy`. `both` runs one pass
 each.
 
 The projected stems are picked up as ordinary embeddings by `train` and
 `evaluate`, no registration needed, and the same names resolve in the
-fine-tuned condition (`resnet50_p128_finetuned.npy`) because the
-`_p<dim>` token sits before the condition suffix.
+fine-tuned condition (`resnet50_pcaw128_finetuned.npy`) because the
+`_<method><dim>` token sits before the condition suffix.
 
 Two caveats worth stating in the dissertation before reporting numbers
 from these artifacts:
@@ -390,7 +390,8 @@ Notes:
 ## 10. "Dry-run, what is still pending in Battery 1?"
 
 ```bash
-python main.py --inspect-pending frozen
+# configs/default.yaml -> pipeline.mode: inspect_pending (over pipeline.condition)
+python main.py
 ```
 
 Prints a per-`(dataset, model)` count of training jobs that have not

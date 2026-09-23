@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from src.steps.fuse import _resolve_extractor_variants
-from src.steps.train import filter_by_variant
+from src.steps.train import filter_by_variant, route_visual_input
 
 
 class TestRecommenderVariantFilter:
@@ -58,6 +58,110 @@ class TestRecommenderVariantFilter:
 
         assert filter_by_variant(names, "native") == ["resnet50_finetuned"]
         assert filter_by_variant(names, "projected") == ["resnet50_p128_finetuned"]
+
+
+class TestPerModelVisualInput:
+    """A recommender may declare the input transform its own paper prescribes.
+
+    VNPR is the case that forced this: the NPR paper reduces the CNN
+    feature offline before the model sees it and explicitly rejects
+    VBPR's learned kernel (Niu et al. WSDM 2018, section 5), and VNPR is
+    the only recommender here with no learned projection to absorb the
+    backbone's native scale.  Routing is per model precisely so VBPR and
+    DeepStyle keep reading the raw feature THEIR papers prescribe.
+    """
+
+    NAMES = [
+        "none",
+        "resnet50",
+        "resnet50_pcaw128",
+        "hybrid_concat",
+        "hybrid_concat_pcaw128",
+    ]
+
+    def test_a_model_with_the_key_prefers_the_projection_where_one_exists(self):
+        """The rule is SUPERSEDE, not require.
+
+        An input is dropped only when a projected counterpart of it is
+        on disk.  Requiring the projection outright silently removed
+        every online fusion from VNPR -- they are JSON sidecars fused
+        inside the recommender, so no array of theirs can be projected
+        -- and those were exactly the inputs that never degenerated
+        (0.00% of users in a tie block, amazon_women): they arrive
+        normalised and already at the paper's width.
+        """
+        config = {"vnpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+        names = [
+            "none",
+            "resnet50",
+            "resnet50_pcaw128",
+            "hybrid_concat",
+            "hybrid_concat_pcaw128",
+            "hybrid_mean_learned_D128",
+        ]
+
+        assert route_visual_input(names, "vnpr", config, "native") == [
+            "none",
+            "resnet50_pcaw128",
+            "hybrid_concat_pcaw128",
+            "hybrid_mean_learned_D128",
+        ]
+
+    def test_an_input_with_no_projected_counterpart_survives(self):
+        config = {"vnpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+
+        assert route_visual_input(["hybrid_mean_learned_D128"], "vnpr", config, "native") == [
+            "hybrid_mean_learned_D128"
+        ]
+
+    def test_an_input_whose_projection_exists_is_superseded(self):
+        config = {"vnpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+        names = ["resnet50", "resnet50_pcaw128"]
+
+        assert route_visual_input(names, "vnpr", config, "native") == ["resnet50_pcaw128"]
+
+    def test_a_model_without_the_key_follows_the_global_variant(self):
+        """VBPR must not inherit VNPR's routing."""
+        config = {"vnpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+
+        assert route_visual_input(self.NAMES, "vbpr", config, "native") == [
+            "none",
+            "resnet50",
+            "hybrid_concat",
+        ]
+
+    def test_another_method_of_the_same_width_is_not_accepted(self):
+        """A wrong-recipe projection is not a fallback; it is superseded."""
+        config = {"vnpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+        names = ["resnet50", "resnet50_pca128", "resnet50_pcaw128"]
+
+        assert route_visual_input(names, "vnpr", config, "native") == ["resnet50_pcaw128"]
+
+    def test_another_width_of_the_same_method_is_not_accepted(self):
+        config = {"vnpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+        names = ["resnet50_pcaw64", "resnet50_pcaw128"]
+
+        assert route_visual_input(names, "vnpr", config, "native") == ["resnet50_pcaw128"]
+
+    def test_several_recipes_yield_several_cells(self):
+        """Each recipe is a CELL, not a hyperparameter.
+
+        The artifact is part of the cell's identity -- its name, its
+        per-user records, its checkpoint -- so two projections of one
+        backbone are two cells, never two points inside one.
+        """
+        config = {"vnpr": {"visual_input": {"projection": ["pca", "pca_whitened"], "dim": [128]}}}
+        names = ["resnet50_pca128", "resnet50_pcaw128", "resnet50"]
+
+        assert route_visual_input(names, "vnpr", config, "native") == [
+            "resnet50_pca128",
+            "resnet50_pcaw128",
+        ]
+
+    def test_the_non_visual_baseline_is_never_routed_away(self):
+        config = {"bpr": {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}}
+
+        assert "none" in route_visual_input(self.NAMES, "bpr", config, "native")
 
 
 class TestFusionVariantResolution:

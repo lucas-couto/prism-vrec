@@ -672,7 +672,13 @@ def _integrate(series: list[tuple[float, float]]) -> float:
 
 def _flush_samples(sampler: _Sampler, run_dir: Path) -> None:
     """Write the raw series to ``telemetry_samples.jsonl`` for plotting."""
-    path = run_dir / "telemetry_samples.jsonl"
+    # Each process samples its own series from its own origin; a resumed
+    # attempt writes beside the earlier one instead of over it.
+    from src import supervisor
+
+    number = supervisor.attempt()
+    name = "telemetry_samples.jsonl" if number == 1 else f"telemetry_samples.attempt{number}.jsonl"
+    path = run_dir / name
     samples = sampler.all_samples()
     if not samples:
         return

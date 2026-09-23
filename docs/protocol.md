@@ -53,7 +53,7 @@ recipe); the loader cross-checks features against it.
 ### 1b. Optional fixed projection to a common dimension (opt-in, off by default)
 
 `projection:` in `configs/extractors.yaml` writes an *additional*
-artifact per extractor, `<extractor>_p<dim>.npy`, carrying a fixed
+artifact per extractor, `<extractor>_<method><dim>.npy`, carrying a fixed
 linear map of the native feature to one shared width. It exists so the
 element-wise fusion family can consume equal-dim sources without an
 alignment learned online, and so a reviewer who asks for "every
@@ -63,7 +63,7 @@ and both are trainable side by side.
 **This re-enables, as an explicit variable, the very thing §1 rejected
 as a default.** `method: random` is the seeded random projection the v1
 protocol was criticised for: a comparison run *only* on
-`<extractor>_p128` artifacts compares "backbone × fixed compression",
+`<extractor>_pcaw128` artifacts compares "backbone × fixed compression",
 not backbones, and the narrower `dim` is, the more of the difference
 between backbones the compression can absorb. That is a legitimate
 experiment — it is not the headline benchmark. The defensible uses are:
@@ -95,7 +95,7 @@ learned alignment from the recommender's gradient and makes the
 projection the only compression in the pipeline.
 
 Provenance is on disk: the projector is saved as
-`<extractor>_p<dim>.proj.npz` with a `.proj.json` describing method,
+`<extractor>_<method><dim>.proj.npz` with a `.proj.json` describing method,
 dim, seed and fit set, and the artifact's own `.meta.json` records
 `source_native_dim` alongside the projected `native_dim`.
 
@@ -209,7 +209,7 @@ user's own val/test positives are eligible to be drawn as negatives
 standard protocol, with negligible metric deflation given catalogue
 sizes.
 
-## 3b. User-level K-fold cross-validation (`folds.enabled`, the evaluate step)
+## 3b. User-level K-fold cross-validation (the `folds` pipeline step)
 
 Precedent: Rendle et al. (UAI 2009, §6.2) evaluate BPR with
 leave-one-out, repeat the experiment 10 times over freshly drawn splits,
@@ -217,15 +217,7 @@ and run the hyperparameter grid search **once, on the first round**,
 keeping the winners constant afterwards. Section 2 of the same paper
 notes that the fold-in strategy known for MF applies to BPR. The
 `folds:` block of `configs/default.yaml` reproduces that procedure with
-users as the partition unit. `folds.enabled` selects the protocol of the
-`evaluate` step (researcher decision, 2026-09-07): `true` — the shipped
-default, so a plain run evaluates by K-fold — runs the procedure below
-over every battery cell; `false` runs the single leave-one-out split of
-§3. Exactly one of the two scores the winners in a run and writes the
-canonical per-user artifact; the resolved choice is printed by
-`--show-plan` and recorded in the run manifest (`evaluation_protocol`)
-as execution metadata, outside the scientific identity. The former
-`--folds` mode was removed.
+users as the partition unit:
 
 - Users are split into `k` mutually exclusive, balanced folds
   (`src/folds/partition.py`, seeded). A user is eligible when it has
@@ -268,14 +260,6 @@ as execution metadata, outside the scientific identity. The former
   seed or the split re-runs every cell. Each fold's training carries
   `fold={index, k, partition_seed, min_profile}` in its scientific
   identity, so its resume envelope and winner are bound to the fold.
-- **Battery tables.** After every cell is `done`, the step derives the
-  per-user rows of `results/tables/{dataset}_evaluation_{frozen|finetuned}.csv`
-  from the concatenated artifacts' held-out ranks (the same five metric
-  families the single-split evaluator writes, routed by embedding,
-  tagged `fold_policy: kfold_k<K>`), writes the completion record
-  `{dataset}_evaluation_done.csv` the statistical step reconciles its
-  expected cells against (§5, R05) and the mean tables. A failed cell
-  fails the step before any table exists.
 
 ## 3c. Scientific identity (v2) versus execution metadata
 
@@ -299,10 +283,14 @@ bool/int/float distinction). Selection identity uses train+val splits;
 evaluation identity adds the test split and the streamed digest of the
 exact `_best.pt` evaluated. **Execution metadata is deliberately
 outside the identity**: block and batch sizes used for ranking, worker
-count, device, filesystem roots, the lazy/dense feature residency and
+count, device, filesystem roots, the lazy/dense feature residency, the
+number of gradient-accumulation micro-batches of an OOM retry and
 wall-clock time change how a result is computed, not what it is (the
-lazy path is verified numerically equivalent; ranking layouts are
-verified against a golden fixture). Identical content under another
+lazy path is verified numerically equivalent; the accumulated step is
+verified to take the same optimiser step as the full batch for every
+recommender; ranking layouts are verified against a golden fixture).
+Because they are outside the identity, every OOM retry that changes
+them is listed in `results/runs/<run_id>/oom_recoveries.csv` (§10.8). Identical content under another
 root therefore has the same identity; another seed, split, feature
 content, budget or protocol does not, and legacy artifacts without an
 identity are identified as such and never reused as if they matched.
@@ -490,13 +478,57 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   chunks), so the catalogue costs half the VRAM of an fp32 copy. The
   grid is configurable (`3` = nine regions) and recorded in the
   artifact's `.meta.json` (`component_grid`, `pooling`).
+- **ACF component vectors are L2-normalised on the way into the model
+  (declared divergence from the raw artifact; 2026-09-16).** Each of the
+  `M` component vectors of a native `*_comp.npy` is scaled to unit norm
+  as it reaches the recommender — once at buffer construction on the
+  dense path, per gathered row on the lazy one, so residency stays an
+  execution detail (`l2_normalize_components`, the same rule
+  `l2_normalize` applies to a pooled row). Without it ACF was the only
+  model reading unnormalised features: the pooled embeddings the other
+  recommenders consume are L2-normalised offline by the fusion step,
+  while a single-extractor component artifact carries no sidecar and so
+  was never normalised. ACF's attention logits therefore scaled with the
+  backbone's native magnitude — mean component norm 11.9 for CLIP
+  ViT-B/32 but 154.5 for ConvNeXt-B and 659.9 for CvT-13 on Amazon Men —
+  and overflowed to `inf` under autocast, then to `NaN` through the
+  softmax: five cells of the frozen grid died with `NonFiniteScoresError`
+  at `learning_rate = 0.01` (CoAtNet-0 and ConvNeXt-B, 2026-09-16), while
+  no CLIP cell ever failed. The normalisation makes the comparison
+  between backbones a comparison of *direction*, which is what the
+  attention is meant to weigh, instead of one confounded by each
+  backbone's activation scale. The artifacts on disk are unchanged; ACF
+  results produced before this date are not comparable with later ones
+  and were discarded.
 - **Dimension parity**: every recommender draws its dimensions from one
-  budget `common.total_dim` (`RecommenderSpec.dim_split`): BPR-MF
-  `latent_dim = T`, VBPR/AVBPR `latent_dim = visual_dim = T/2` (the
-  paper's 50/50 split), DeepStyle `d = T`, ACF `k = T`, VNPR latent
-  `k = T`. `assert_dimension_parity` refuses a direct `latent_dim` /
-  `visual_dim` anywhere. VNPR's visual user vector is `D_backbone`-wide
-  by construction and is declared outside the budget.
+  budget `common.total_dim` (`RecommenderSpec.dim_split`), and that
+  budget is the **collaborative** capacity: `latent_dim = T` for BPR-MF,
+  VBPR/AVBPR, VNPR, DeepStyle (`d = T`) and ACF (`k = T`). A visual
+  model's own dimensions sit **beside** the budget rather than inside
+  it: VBPR/AVBPR get `visual_dim = T` alongside their `T` latent
+  factors, and VNPR's visual user vector is `D_backbone`-wide by
+  construction. A comparison at a fixed `T` is therefore a comparison of
+  the visual mechanism, not of how many collaborative factors each model
+  was left with. `assert_dimension_parity` refuses a direct `latent_dim`
+  / `visual_dim` anywhere.
+  **Changed 2026-09-09 (researcher's decision).** Until then VBPR/AVBPR
+  used `dim_split: half` — `latent_dim = visual_dim = T/2` — so at
+  `T = 128` VBPR competed against BPR-MF holding 64 collaborative
+  factors against BPR's 128. That accounting, not the visual term, was
+  the leading explanation for VBPR trailing BPR on amazon_fashion
+  (hypothesis H1 of the 2026-09-07 fidelity audit: the logs already
+  showed BPR-64 0.0033 < VBPR-64+64 0.0069 < BPR-128 0.0086, i.e. VBPR
+  beating BPR at equal collaborative capacity and losing at equal
+  total). Consequences, stated rather than discovered: a visual model
+  now holds more parameters than BPR-MF at the same `T`, by exactly its
+  visual side — that asymmetry is the deliberate choice, since charging
+  the visual dimensions against the collaborative budget is what made
+  the earlier comparison unfair; and **every VBPR/AVBPR result produced
+  before this change is not comparable to results produced after it**,
+  because the same `T` now resolves to different dimensions. `"half"`
+  remains a supported value of `dim_split`; no model registers it.
+  Guarded by
+  `tests/test_dimension_parity.py::TestRegisteredModelsShareTheCollaborativeBudget`.
 - **Per-paper formulations and regularisation** (2.10.0): each built-in
   reproduces its paper's score and L2 scheme rather than a shared
   convention. BPR-MF: `γ_u^T γ_i`, no item bias, `λ_W / λ_H+ / λ_H−`
@@ -536,26 +568,167 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   `tests/recommenders/test_vnpr_paper.py::test_adam_training_keeps_rows_outside_the_batch_at_their_initial_norm`.
   Every VNPR checkpoint trained before this change is visual-only and
   must be discarded.
-  **Status after 3.0.0 (task record S04): the collapse is NOT declared
-  fixed.** The BPR-Opt reading removed the whole-matrix mechanism
-  described above, but the 2026-09 battery still finished 55 of 354
-  jobs at `best_metric = 0.0000` with every catalogue item tied —
-  VBPR 0/96, VNPR native 3/112, VNPR × hybrid 52/146 (35.6 %), worst on
-  scale-distorting fusions — and no historical log carries the probes
-  needed to attribute it. 3.0.0 therefore (a) keeps zero cells visible
-  in every table (§3, first-observation rule), (b) ships opt-in
-  training diagnostics (`diagnostics:` in `configs/default.yaml`) and a
-  controlled driver (`scripts/vnpr_collapse_diagnostic.py`: seven
-  visual-input conditions, ≥ 3 seeds, same split/sampler/budget) whose
-  synthetic run observed none of the candidate mechanisms (dead ReLU,
-  skipped optimizer steps, scale, evaluation-only ties, data error),
-  and (c) makes no claim about amazon_women / tradesy until the same
-  probes are recorded there. The paragraph above is the historical
-  finding; the "‖f‖ ≈ 1 flattens the visual term" reading is a
-  hypothesis the synthetic ablation did not support (unit-norm input
-  lowered the metric, not viability). No activation, regularisation or
-  normalisation change is proposed; any such change is a separately
-  versioned experiment.
+  **Status: RESOLVED 2026-09-09 — dead ReLU at initialisation.** The
+  BPR-Opt reading removed the whole-matrix mechanism described above,
+  but the 2026-09 battery still finished cells at `best_metric =
+  0.0000` with every catalogue item tied. Over the complete 3.0.0-rc.1
+  grid (320 VNPR jobs, four datasets) that is 79 cells: 76 of 192
+  fused/hybrid (39.6 %) and 3 of 128 native (2.3 %, all amazon_women
+  with `lr = 0.01`); VBPR, DeepStyle and BPR never collapse. The cause
+  is the interaction between the initialisation and the single ReLU
+  neuron of Eq. 3, and it is attributable and reproducible per cell:
+  * the branch pre-activation at initialisation is a sum of products of
+    two Xavier-uniform rows, whose bound `sqrt(6/(n+k))` shrinks with
+    the vocabulary; on the real catalogues its spread is ~3e-4 to 1e-3
+    on fused (unit-norm) features and ~5e-3 on native ones, while one
+    Adam step moves the unpenalised bias `b` by ≈ `learning_rate`;
+  * a single adverse step therefore drives EVERY item's pre-activation
+    below zero, `ReLU` returns a constant 0, and the data gradient
+    vanishes for every parameter — the ranking is exactly flat and the
+    loss sits at `ln 2` plus the L2 term. The model cannot recover: the
+    surviving L2 gradient then decays the online-fusion projections to
+    exactly 0.0 (the same Adam-plus-L2 mechanism as above);
+  * the outcome is decided by the sign of the first applied bias step,
+    so it is deterministic per cell and invisible to a seed sweep. The
+    aggravation by `lr = 0.01` (50 of the 79) and by the fused features
+    is exactly the ratio `learning_rate / pre-activation spread`.
+  Fix adopted: `VNPR.DENSE_BIAS_INIT = 1.0` — the dense bias starts
+  positive instead of at the customary zero, so every unit fires before
+  the first step and one adverse step cannot silence the neuron. The
+  value is where healthy cells converge on their own (`+0.4` to `+2.2`).
+  Initialisation is declared framework-side, not a property of the
+  paper, so this changes no architecture, score function or
+  regularisation term, and touches no other recommender (VNPR is the
+  only built-in with a non-linearity over the merged vector). Guarded
+  by `tests/recommenders/test_vnpr_paper.py::test_dense_bias_starts_positive_so_every_branch_is_active_at_initialisation`
+  and `::test_a_bias_step_larger_than_the_preactivation_range_is_unrecoverable`.
+  Verified end-to-end before adoption on tradesy
+  `hybrid_sigmoid_gated_l1_0_learned_D128` (`lr` 1e-3, `T` 64, 30
+  epochs, selection Evaluator): `0.0000` with the zero bias — including
+  the same final `b = -0.006` as the battery checkpoint — against
+  `0.0026` with the positive one, in the band of that dataset's healthy
+  hybrid cells. **Every VNPR result produced before this change is
+  invalid and was deleted**; the earlier "‖f‖ ≈ 1 flattens the visual
+  term" reading was a hypothesis and is superseded by the account above.
+  The opt-in training diagnostics (`diagnostics:` in
+  `configs/default.yaml`) and `scripts/vnpr_collapse_diagnostic.py`
+  remain available; note that the driver's synthetic default (300
+  users) has a Xavier bound an order of magnitude larger than a real
+  catalogue and therefore cannot reproduce this failure — use
+  `--processed-dir` with real features.
+- **One sampling cap for every PCA fit (2026-09-10).**
+  `PCA_FIT_MAX_ROWS = 750_000` (`src/fusions/strategies.py`) bounds the
+  fit set of EVERY PCA in the framework — fusion strategies, the
+  per-region component pass, the fusion alignment and the extractors'
+  fixed projection — because an estimator that saw 1.17 M rows and one
+  that saw 300 k are not the same estimator, and a battery that mixes
+  them is not a fair comparison. Larger fit sets are sampled without
+  replacement, indices sorted, seeded by the caller's `random_state`
+  (42 when unset), and the sampling is logged with both counts.
+
+  The value is a byte budget in rows: 8 GB of host RAM over the widest
+  fit matrix in the battery, the per-region `concat` of the two fusion
+  extractors at 2048 + 768 = 2816 float32 columns (750,000 × 2816 × 4 B
+  = 7.87 GiB). The fit is scikit-learn on CPU and never touches the GPU.
+  Measured process peak on amazon_women: 9.97 GiB, the extra ≈2 GiB
+  being the randomized-SVD workspace, the gather chunk and the output
+  memmap pages.
+
+  It was forced by the per-region pass, which multiplies the fit set by
+  the region count: amazon_women is 291,812 train items × 4 regions =
+  1,167,248 rows, a 13.1 GiB matrix against a 16 GiB container.
+  Statistically the cap is slack rather than a compromise — 128
+  components over 2,816 dimensions are estimated from a sample two
+  orders of magnitude larger than the dimension either way — and **every
+  pooled fit in the battery is already below it** (one row per train
+  item), so no pooled fusion, alignment or projection artifact changes.
+
+  The cap is applied to the INDICES, before the fit matrix is assembled.
+  Capping the assembled rows is worse than useless: the matrix is
+  already allocated and the sample adds a copy on top (a 21 GiB peak,
+  measured, against 13.1 uncapped). `fit_pca_on_rows` therefore WARNS on
+  an oversized fit set instead of sampling it, so a caller that forgets
+  is loud rather than silently unbounded.
+
+  **Known limitation:** the artifact provenance does NOT cover the cap.
+  `fit_set_digest` records `train_items`, which does not change when
+  `PCA_FIT_MAX_ROWS` does. Recording it would change the digest of every
+  PCA artifact already on disk and refuse to reuse ones that are in fact
+  identical (the same argument the `component` flag is excluded for). If
+  the cap is ever changed, **delete the PCA artifacts by hand** — the
+  pipeline will not detect that they are stale.
+
+- **VNPR visual input: the paper's offline reduction (2026-09-10).**
+  The dead-ReLU fix above removed the *global* collapse; a per-user tail
+  survived it on unfused backbones. On amazon_women, 4-6% of users got
+  an all-tied score list — for them the single ReLU is negative over the
+  whole catalogue, so every item ranks by the tie-break — while the
+  fused cells were clean (0.00%). Fraction of users with a tie block
+  above 10, single split, 97,678 users: `levit_256` 6.10%, `cvt_13`
+  5.13%, `dinov2_vitb14` 4.47%, `vit_b16` 0.92%, `resnet50` 0.65%,
+  `convnext_base` 0.42%, `coatnet_0` 0.02%, `clip_vitb32` and every
+  hybrid 0.00%. **Report this as the FRACTION of affected users**: the
+  mean tie block is driven by the tail and overstates it by orders of
+  magnitude.
+
+  VNPR is the only recommender exposed. VBPR (`E`) and DeepStyle
+  (`visual_projection`) learn a projection that absorbs the input scale
+  and score 1.00-1.01 mean tie blocks on the SAME embeddings; VNPR has
+  none by construction of its paper. Niu et al. (WSDM 2018) §5 and
+  footnote 2 are explicit that the reduction happens *before* the model:
+  fc6 is 4,096-d, "dimension reduction is further applied ... separately
+  from model training", by PCA (compared against a stacked
+  auto-encoder), and the learned kernel of visual BPR is rejected as
+  "less efficient". The framework implemented the architecture and
+  omitted that data step, feeding the raw native feature.
+
+  Adopted: `vnpr.visual_input` (`configs/recommenders.yaml`) routes VNPR
+  to `<source>_pcaw128` artifacts — the extract step writes them per
+  backbone, the fuse step per offline fusion, after fusion, over the
+  vector the model receives. **`pca_whitened` instead of the paper's
+  plain PCA is a declared divergence**, measured rather than assumed:
+  on `cvt_13`, plain PCA takes the tail from 5.13% only to 0.89% and
+  *raises* the per-component magnitude (‖f‖/√dim 3.709 → 3.812), while
+  dropping the width to 64 leaves the tail flat (0.96%) and costs 38% of
+  recall@10 — the dimension is not the lever, the per-component variance
+  is. Whitening takes the tail to 0.01% on all three worst backbones and
+  lifts recall@10 by 10-61% (`cvt_13` 0.00648 → 0.01046, `levit_256`
+  0.00738 → 0.01107, `dinov2_vitb14` 0.01266 → 0.01396). The width is
+  the paper's 128.
+
+  Scope and consequences: the routing is per recommender, so VBPR,
+  DeepStyle and ACF keep reading the native feature their own papers
+  prescribe — the projection axis was deliberately NOT extended to them.
+  A projected artifact is a routing variant of its backbone, not a
+  backbone of its own, so `_backbone_base` strips the token and
+  `model_within_backbone` still asks "which model wins on ResNet-50"
+  with each model on its own input. **Every VNPR result on a native
+  artifact produced before this change is invalid**; the hybrid cells
+  are unaffected.
+
+  **The rule is SUPERSEDE, not require (corrected 2026-09-11).** An
+  input is dropped only when a projected counterpart of it exists.
+  Online fusions (`alignment: learned`) are JSON sidecars whose mixing
+  happens inside the recommender at train time, so no array of theirs
+  can be projected — and they never needed it: their degenerate-user
+  tail is 0.00%, because the alignment already delivers a normalised
+  vector at the paper's width. Requiring the projection outright left
+  VNPR with 3 fusion strategies where every other model has 12, gutting
+  the `fusion_within_model` family for it and removing VNPR entirely
+  from `model_within_backbone` on the other nine. VNPR therefore runs
+  on 8 projected backbones, 3 projected offline fusions and 9 online
+  sidecars — 20 cells, the same count as every other visual model.
+
+  The two routes answer different questions and both are in the grid:
+  an online fusion learns a per-source projection and mixes on top of
+  it, while an offline one mixes first and reduces afterwards. On the
+  amazon_women smoke grid (one HP point, selection metric, no folds)
+  the offline `hybrid_concat_pcaw128` leads at 0.00861 against 0.00662
+  for the best online fusion and 0.00679 for the best single backbone,
+  with the nine online strategies clustered between 0.00474 and
+  0.00662 — the order of operations separates the routes more than the
+  choice of strategy does. Indicative only; the folds decide.
+
 - **DeepStyle (paper formulation)**: the item style term is
   `s_i = E·f_i − l_cat(i)` — a linear projection `E` (`D_backbone → d`)
   minus a **learned category embedding** subtracted in the style space,
@@ -572,6 +745,32 @@ Sources: ResNet-50 (2048) + ViT-B/16 (768), native.
   `tests/recommenders/test_deepstyle_paper.py::TestTradesyDegeneration`),
   not a bug. An earlier MLP-style variant (which did not subtract a
   category vector) was removed in commit `60c7436`.
+- **ACF per-region fusion (3.0.0-rc.2)**: ACF consumes per-item
+  component maps, so it could not read the pooled `hybrid_*` artifacts
+  and was absent from the 3.0.0-rc.1 battery. It now joins the fusion
+  family through **early per-region fusion**: each component source
+  `(n_items, R, D_i)` is flattened to `(n_items · R, D_i)`, the same
+  strategy that the pooled recommenders use runs on those rows, and the
+  result is folded back to `(n_items, R, D_fused)`. The artifacts are
+  named `hybrid_<strategy>…_comp.npy` (offline) and
+  `hybrid_<strategy>_learned_D<dim>_comp.json` (online), with `_comp`
+  last so they stay routed to component models only, and the pass is
+  gated by the recommender roster — no separate configuration key.
+  Three properties make the axis comparable with the pooled models and
+  are pinned by tests
+  (`tests/test_fusion_per_region_components.py`): every region is fused
+  independently of the others; any fitted parameter (a PCA basis, the
+  learned projections `D_backbone → D`) is ONE, shared by every region,
+  so the regions stay in a common space and the component attention
+  keeps comparing like with like; and a PCA fit sees only the rows owned
+  by training items (`i · R + r`), never a validation or test item. The
+  `alignment: pca` route is not built for components and is skipped with
+  a log rather than emitting a wrong artifact. Both `sum` and `mean` are
+  kept for symmetry with the other recommenders even though they are the
+  same model here (`mean = ½·sum`, absorbed by the unpenalised `W_c`);
+  `concat` and the aligned additive strategies are NOT equivalent,
+  because each aligned source is L2-normalised before the operation.
+  Full record: `docs/reliability-sdd/S05.md`.
 - **ACF history**: the paper sums over the full `R(u)`; `max_history`
   (H = 50) is an implementation bound. When `|R(u)| > H` the profile is a
   **seeded uniform subsample** (`history_seed` = the run seed), never the
@@ -752,3 +951,47 @@ unidade dos testes pareados; a média e o desvio-padrão entre folds são
 reportados apenas como variabilidade descritiva, combinada (partição e
 otimização). A busca de hiperparâmetros não é aninhada nos folds, por
 reprodução do procedimento original.
+
+### 10.8. Recuperação de falta de memória de GPU (OOM)
+
+Quando um treinamento esgota a memória da GPU
+(`torch.cuda.OutOfMemoryError`), o job é repetido até duas vezes, e cada
+repetição altera apenas a forma de execução, nunca o que é calculado.
+Primeiro, as features visuais passam a ser lidas sob demanda, em vez de
+residirem inteiras na memória (caminho verificado como numericamente
+equivalente). Se a leitura sob demanda já estava ativa, cada passo de
+otimização passa a ser dividido em micro-batches com acumulação de
+gradiente: o batch de 4096 triplas vira 2 × 2048 e depois 4 × 1024, com
+um único passo do otimizador sobre o batch inteiro. Como a perda BPR e o
+termo L2 das linhas amostradas são médias sobre as triplas e o termo L2
+compartilhado é somado uma única vez, a ponderação de cada micro-batch
+por `n_k / N` reproduz exatamente o gradiente do batch completo
+(verificado por teste para todos os recomendadores). A única diferença
+estocástica é que as máscaras de dropout (VNPR) são sorteadas por
+micro-batch. O orçamento de memória do ranking de validação também cai
+pela metade a cada repetição. Toda ativação é registrada em
+`results/runs/<run_id>/oom_recoveries.csv`, com a identidade do job, a
+tentativa, a ação tomada e o desfecho (`retrying`, `recovered` ou
+`failed`), para que os resultados obtidos sob recuperação possam ser
+identificados.
+
+### Expanded frozen grid (2026-09-12)
+
+The full frozen run searches `total_dim = [64, 128, 256]`,
+`learning_rate = [0.0003, 0.001, 0.01]`, and
+`l2_reg = [0.00001, 0.0001, 0.001]`. BPR, VBPR and DeepStyle receive
+27 selection trials per dataset/embedding cell. VNPR additionally searches
+`dropout = [0.0, 0.5]`; ACF searches `att_hidden = [64, 128]` with
+`max_history = 50`, giving each 54 trials. AVBPR, when enabled, also has
+54 trials through its attention-width axis; it is excluded from this run.
+Model-specific regularization coefficients remain fixed as declared in
+`configs/recommenders.yaml`. Thus the common L2 axis does not vary every
+regularization group in BPR or VBPR.
+
+These are unequal search budgets: VNPR and ACF receive twice as many
+validation selection opportunities. Comparisons must disclose this budget
+alongside model quality and measured search cost. Counts exclude fusion
+parameter variants and subsequent fold retraining. The local full-run
+configuration covers all four datasets, frozen features only, and two
+folds. Optuna has no separate ACF search-space override and derives its
+categorical axes from the same declarations.

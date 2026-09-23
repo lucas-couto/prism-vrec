@@ -231,11 +231,44 @@ class ACF(BaseRecommender):
             if cache is not None:
                 return cache[item_ids]
         if not self.is_lazy_visual:
-            return self.comp_projection(self.visual_features[item_ids].float())
+            return self.comp_projection(self._fuse_components(self.visual_features[item_ids]))
         flat = item_ids.reshape(-1)
         unique, inverse = torch.unique(flat, return_inverse=True)
+        # ``_map_visual`` resolves through ``_resolve_visual``, so these rows
+        # are already fused; only ``W_c`` is left to apply.
         projected = self._map_visual(unique, lambda f, _ids: self.comp_projection(f.float()))
         return projected[inverse].reshape(*item_ids.shape, *projected.shape[1:])
+
+    def _fuse_components(self, rows: torch.Tensor) -> torch.Tensor:
+        """Per-region fusion of RAW component rows ``(..., R, sum(D_i))``.
+
+        When the artifact is a per-region fusion sidecar,
+        :attr:`_online_fusion` is a ``LearnedAlignmentFusion``: it splits
+        by ``source_dims``, projects each source to the aligned dim and
+        combines them.  Every operation is last-axis-wise, so applying it
+        to ``(..., R, sum(D_i))`` fuses each region independently while
+        ONE set of projections is shared by every region -- the regions
+        stay in a common space, which is what ACF's component attention
+        compares.  A native ``<extractor>_comp.npy`` has no fusion module
+        and the rows pass through unchanged.
+
+        Call this ONLY on raw rows.  Rows obtained through
+        :meth:`BaseRecommender._resolve_visual` (which
+        :meth:`BaseRecommender._map_visual` uses, i.e. the whole lazy
+        path) are ALREADY fused -- fusing them twice makes the module
+        split an aligned-width tensor by the native ``source_dims`` and
+        raises (found 2026-09-09 on the first lazy ACF run).
+        """
+        features = rows.float()
+        if self._online_fusion is not None:
+            features = self._online_fusion(features)
+        return features
+
+    def _fusion_parameter_versions(self) -> tuple[int, ...]:
+        """Version counters of the per-region fusion's parameters, if any."""
+        if self._online_fusion is None:
+            return ()
+        return tuple(int(p._version) for p in self._online_fusion.parameters())
 
     def _catalogue_projection(self) -> torch.Tensor | None:
         """Eval-mode ``W_c f`` over the catalogue, or ``None`` when not admitted.
@@ -249,6 +282,10 @@ class ACF(BaseRecommender):
         key = (
             self._visual_generation(),
             int(self.comp_projection.weight._version),
+            # A per-region fusion sits BEFORE W_c, so its projections
+            # move the cached values too; an optimiser step must
+            # invalidate the cache through them as well.
+            self._fusion_parameter_versions(),
             str(self._device()),
         )
         if self._comp_cache is not None and self._comp_cache_key == key:
@@ -283,7 +320,7 @@ class ACF(BaseRecommender):
                 rows = self._raw_visual_rows(torch.arange(start, stop, device=self._device()))
             else:
                 rows = self.visual_features[start:stop]
-            chunks.append(self.comp_projection(rows.float()))
+            chunks.append(self.comp_projection(self._fuse_components(rows)))
         return torch.cat(chunks, dim=0)
 
     def _augmented_user(self, user_ids: torch.Tensor, gamma_u: torch.Tensor) -> torch.Tensor:

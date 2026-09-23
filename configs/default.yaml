@@ -66,8 +66,25 @@ dataset_contracts:
 #
 # Available step names:
 #   download, preprocess, extract, finetune, evaluate_finetuning,
-#   fuse, train, evaluate, beyond_accuracy, statistical, export_best
+#   fuse, train, folds, evaluate, beyond_accuracy, statistical, export_best
+#
+# `folds` is inert unless `folds.enabled` below is true.  When it is on
+# it REPLACES `evaluate` as the producer of the per-user records: the K
+# partial artifacts are concatenated into the canonical
+# results/per_user/ location that beyond_accuracy and statistical read.
 pipeline:
+  # What `python main.py` does.  The command takes NO arguments: this is
+  # the only way to choose between running the plan and the read-only
+  # inspections.
+  #   pipeline           run the plan below (default)
+  #   show_plan          print the resolved plan and exit
+  #   report             write results/report.md from results/tables
+  #   inspect_pending    list the pending cells for `condition`
+  #   validate_features  gate every dataset x enabled extractor
+  #   validate_datasets  validate every dataset in `datasets`
+  #   list               print the registered extractors, fusions,
+  #                      recommenders and datasets
+  mode: pipeline
   # When true the entire pipeline runs end-to-end (Battery 1 + Battery 2).
   # Set to false to honour ``start_from`` / ``stop_at`` instead.
   run_all: true

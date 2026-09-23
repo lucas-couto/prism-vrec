@@ -494,6 +494,59 @@ def bpr_step(
     return loss.detach()
 
 
+def bpr_accumulated_step(
+    model,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    users: torch.Tensor,
+    pos: torch.Tensor,
+    neg: torch.Tensor,
+    *,
+    device: str,
+    use_cuda: bool,
+    micro_batches: int,
+) -> torch.Tensor:
+    """:func:`bpr_step` split into ``micro_batches`` with gradient accumulation.
+
+    The OOM recovery of last resort (:mod:`src.utils.oom_recoveries`):
+    activations and the autograd graph shrink by ``micro_batches`` while
+    the optimiser still takes ONE step per batch.  Each micro-batch loss
+    is weighted by ``n_k / N``, so the accumulated objective is exactly
+    the full-batch :meth:`bpr_loss`: the log-loss and the gathered L2
+    rows are means over the triples (``Σ n_k/N · mean_k = mean``) and
+    the shared L2 term is counted ``Σ n_k/N = 1`` time.  Dropout masks
+    are drawn per micro-batch, the only stochastic difference.
+
+    @param micro_batches - Micro-batches per step; ``<= 1`` is :func:`bpr_step`.
+    @returns The DETACHED full-batch loss, still on ``device``.
+    """
+    if micro_batches <= 1:
+        return bpr_step(model, optimizer, scaler, users, pos, neg, device=device, use_cuda=use_cuda)
+    users = users.to(device, non_blocking=True)
+    pos = pos.to(device, non_blocking=True)
+    neg = neg.to(device, non_blocking=True)
+    n_total = int(users.shape[0])
+
+    optimizer.zero_grad(set_to_none=True)
+    total = torch.zeros((), device=users.device)
+    for u, p, n in zip(
+        users.tensor_split(micro_batches),
+        pos.tensor_split(micro_batches),
+        neg.tensor_split(micro_batches),
+        strict=True,
+    ):
+        if u.shape[0] == 0:
+            continue
+        with cuda_autocast(enabled=use_cuda):
+            score_pos, score_neg = model(u, p, n)
+            loss = model.bpr_loss(score_pos, score_neg) * (u.shape[0] / n_total)
+        scaler.scale(loss).backward()
+        total = total + loss.detach()
+    scaler.step(optimizer)
+    scaler.update()
+    return total
+
+
 def resolve_training_identity(
     *,
     model_cls,
@@ -726,6 +779,7 @@ def train_single_run(
     *,
     log_context: str = "",
     identity_context: dict | None = None,
+    micro_batches: int = 1,
 ) -> float:
     """Train a single model with one hyperparameter configuration.
 
@@ -746,6 +800,12 @@ def train_single_run(
         (e.g. ``"fold=2/5"`` from the K-fold runner) so a run that
         trains the same cell several times stays readable in the log.
         Empty by default: the line is unchanged for every other caller.
+    micro_batches:
+        Micro-batches per BPR step (gradient accumulation, see
+        :func:`bpr_accumulated_step`).  ``1`` by default; only an OOM
+        retry raises it, and the retry is recorded in
+        ``oom_recoveries.csv``.  Not part of the training identity: the
+        effective batch and the objective are unchanged.
     optuna_trial:
         Optional ``optuna.Trial``.  When supplied, the validation
         metric is reported every ``eval_every_epochs`` and the loop
@@ -785,6 +845,12 @@ def train_single_run(
     budget = resolve_hp_budget(config, dataset_name)
     epochs = budget["epochs"]
     batch_size = config.get("common", {}).get("batch_size", 4096)
+    if micro_batches > 1:
+        logger.warning(
+            "OOM recovery active: batch %d split into %d micro-batches (gradient accumulation)",
+            batch_size,
+            micro_batches,
+        )
     # Patience is measured in EPOCHS (the counter advances by
     # eval_every_epochs per evaluation): patience=20 with eval_every=10
     # stops after 2 consecutive non-improving evaluations.
@@ -960,7 +1026,7 @@ def train_single_run(
                 pos_items = pos_items.to(device, non_blocking=True)
                 neg_items = neg_items.to(device, non_blocking=True)
 
-                loss = bpr_step(
+                loss = bpr_accumulated_step(
                     model,
                     optimizer,
                     scaler,
@@ -969,6 +1035,7 @@ def train_single_run(
                     neg_items,
                     device=device,
                     use_cuda=use_cuda,
+                    micro_batches=micro_batches,
                 )
                 # Telemetry stays outside the step: the fold-in routine
                 # reuses ``bpr_step`` and must not be attributed to the

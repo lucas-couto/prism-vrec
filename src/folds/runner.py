@@ -47,6 +47,8 @@ from src.folds.partition import FoldPlan, FoldSplit, build_fold_plan, fold_split
 from src.folds.splits_io import load_split_frames
 from src.recommenders.hp_search import assert_dimension_parity
 from src.recommenders.hp_source import HyperparamOrigin, resolve_cell_hyperparams
+from src.utils.cost_labels import embedding_labels
+from src.utils.cuda_faults import is_fatal_cuda_error
 from src.utils.identity import (
     EVALUATION_SPLITS,
     IdentityError,
@@ -54,6 +56,17 @@ from src.utils.identity import (
     resolve_data_identity,
 )
 from src.utils.logging import get_logger
+from src.utils.oom_recoveries import (
+    OUTCOME_FAILED as RECOVERY_FAILED,
+)
+from src.utils.oom_recoveries import (
+    OUTCOME_RECOVERED,
+    OUTCOME_RETRYING,
+    RECOVERY_CONFIG_KEY,
+    Escalation,
+    escalate,
+    record_recovery,
+)
 from src.utils.resources import resolve_resources
 from src.utils.timing import note_skipped_cell, time_cell
 
@@ -71,12 +84,23 @@ def manifest_path(results_dir: str | Path) -> Path:
 
 
 def _fold_paths(config: dict, fold_index: int) -> dict:
-    """Seed-isolated results/checkpoint roots for one fold."""
+    """Seed-isolated results/checkpoint roots for one fold.
+
+    NESTED under the configured roots, never siblings of them: a sibling
+    (``results_fold0`` next to ``results``) lands outside every mount a
+    container is given, and the run dies with ``Permission denied`` on
+    the image's own read-only working directory (found 2026-09-09 on the
+    first real fold run).  Nesting also matches the layout
+    :mod:`src.folds.aggregate` documents for the partial artifacts,
+    ``folds/fold<k>/`` under the results root.
+    """
     paths = config["paths"]
+    results = Path(paths["results"])
+    checkpoints = Path(paths.get("checkpoints", "checkpoints"))
     return {
         **paths,
-        "results": f"{paths['results']}_fold{fold_index}",
-        "checkpoints": f"{paths.get('checkpoints', 'checkpoints')}_fold{fold_index}",
+        "results": str(results / "folds" / f"fold{fold_index}"),
+        "checkpoints": str(checkpoints / "folds" / f"fold{fold_index}"),
     }
 
 
@@ -198,6 +222,7 @@ def _train_fold_model(
         device=device,
         item_categories=kwargs.get("item_categories"),
         log_context=f"fold={fold_index + 1}/{k}",
+        micro_batches=_micro_batches_of(cfg),
         identity_context=identity_context_for(
             processed_dir,
             cell.dataset,
@@ -321,53 +346,61 @@ def run_cell_folds(
 
     fold_entries: list[dict] = []
     for fold_index in range(plan.k):
-        cfg = _fold_config(config, fold_index)
-        split = fold_split(plan, fold_index, train, val, test, dataset_name=cell.dataset)
-        started = time.perf_counter()
-        logger.info(
-            "Fold %d/%d of %s: training on %d users, folding in %d held-out users",
-            fold_index + 1,
-            plan.k,
-            cell.key(),
-            len(split.train_interactions),
-            len(split.test_users),
-        )
-        best_val = _train_fold_model(
-            cell,
-            split,
-            origin,
-            cfg,
-            n_users=n_users,
-            n_items=n_items,
-            visual=visual,
-            device=device,
-            fold_index=fold_index,
+        with time_cell(
+            "folds",
+            dataset=cell.dataset,
+            model=cell.recommender,
+            **embedding_labels(cell.visual_config, emb_path),
+            fold=fold_index,
             k=plan.k,
-        )
-        model, hyperparams = _load_best_model(
-            cell, split, cfg, n_users=n_users, n_items=n_items, visual=visual, device=device
-        )
-        report = fold_in_users(
-            model,
-            split.profile_interactions,
-            _fold_in_config(config, hyperparams, cfg["seed"]),
-            n_items=n_items,
-            device=device,
-        )
-        _evaluate_fold(model, split, cfg, metadata, fold_index, artifact_root, device, k=plan.k)
-        fold_entries.append(
-            {
-                "fold": fold_index,
-                "seed": cfg["seed"],
-                "n_test_users": len(split.test_users),
-                "best_val_metric": float(best_val),
-                "fold_in": report.__dict__,
-                "duration_seconds": round(time.perf_counter() - started, 3),
-            }
-        )
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        ):
+            cfg = _fold_config(config, fold_index)
+            split = fold_split(plan, fold_index, train, val, test, dataset_name=cell.dataset)
+            started = time.perf_counter()
+            logger.info(
+                "Fold %d/%d of %s: training on %d users, folding in %d held-out users",
+                fold_index + 1,
+                plan.k,
+                cell.key(),
+                len(split.train_interactions),
+                len(split.test_users),
+            )
+            best_val = _train_fold_model(
+                cell,
+                split,
+                origin,
+                cfg,
+                n_users=n_users,
+                n_items=n_items,
+                visual=visual,
+                device=device,
+                fold_index=fold_index,
+                k=plan.k,
+            )
+            model, hyperparams = _load_best_model(
+                cell, split, cfg, n_users=n_users, n_items=n_items, visual=visual, device=device
+            )
+            report = fold_in_users(
+                model,
+                split.profile_interactions,
+                _fold_in_config(config, hyperparams, cfg["seed"]),
+                n_items=n_items,
+                device=device,
+            )
+            _evaluate_fold(model, split, cfg, metadata, fold_index, artifact_root, device, k=plan.k)
+            fold_entries.append(
+                {
+                    "fold": fold_index,
+                    "seed": cfg["seed"],
+                    "n_test_users": len(split.test_users),
+                    "best_val_metric": float(best_val),
+                    "fold_in": report.__dict__,
+                    "duration_seconds": round(time.perf_counter() - started, 3),
+                }
+            )
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     _, aggregate = concatenate_fold_artifacts(
         artifact_root, metadata, plan.k, k_values=list(config.get("k_values", [5, 10, 20]))
@@ -442,6 +475,88 @@ def _fold_provenance_mismatch(
     return None
 
 
+def _escalated_config(config: dict, step: Escalation) -> dict:
+    """*config* with the residency and micro-batches of an OOM escalation."""
+    forced = copy.deepcopy(config)
+    resources = forced.setdefault("resources", {})
+    if step.lazy_features:
+        resources.setdefault("features", {})["residency"] = "lazy"
+    forced[RECOVERY_CONFIG_KEY] = {"micro_batches": step.micro_batches}
+    return forced
+
+
+def _micro_batches_of(config: dict) -> int:
+    """Micro-batches an OOM escalation carried into this fold config (1 when none)."""
+    return int((config.get(RECOVERY_CONFIG_KEY) or {}).get("micro_batches", 1))
+
+
+def _record_fold_recovery(cell, attempt: int, outcome: str, step: Escalation, **fields) -> None:
+    record_recovery(
+        step="folds",
+        dataset=cell.dataset,
+        model=cell.recommender,
+        embedding=cell.visual_config,
+        job=cell.key(),
+        attempt=attempt,
+        outcome=outcome,
+        lazy_features=step.lazy_features,
+        micro_batches=step.micro_batches,
+        ranking_budget_factor=1.0,
+        **fields,
+    )
+
+
+def _run_cell_with_oom_recovery(runner, cell, config, plan, frames, *, results_dir, device):
+    """Run one fold cell, escalating on every OOM like the training pool.
+
+    The training pool escalates a job that dies allocating to lazy reads
+    and, once lazy, to gradient accumulation (``src.utils.oom_recoveries``);
+    the fold runner had no such recovery, so the same ACF cells that the
+    pool rescued died here instead and the whole K-fold run failed (found
+    2026-09-09).  Each retry and its outcome land in
+    ``oom_recoveries.csv``; the cell gets ``MAX_OOM_RETRIES`` retries.
+    """
+    import torch
+
+    from src.utils.parallel import MAX_OOM_RETRIES
+
+    residency = ((config.get("resources") or {}).get("features") or {}).get("residency")
+    step = Escalation(residency == "lazy", 1, "")
+    attempt_config = config
+    for attempt in range(1, MAX_OOM_RETRIES + 2):
+        try:
+            result = runner(
+                cell, attempt_config, plan, frames, results_dir=results_dir, device=device
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            if attempt > MAX_OOM_RETRIES:
+                _record_fold_recovery(cell, attempt, RECOVERY_FAILED, step, error=str(exc))
+                raise
+            step = escalate(lazy_features=step.lazy_features, micro_batches=step.micro_batches)
+            _record_fold_recovery(
+                cell, attempt, OUTCOME_RETRYING, step, action=step.action, error=str(exc)
+            )
+            attempt_config = _escalated_config(config, step)
+            continue
+        if attempt > 1:
+            _record_fold_recovery(cell, attempt, OUTCOME_RECOVERED, step)
+        return result
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _write_evaluation_tables(config: dict, results_dir: Path, datasets: set[str]) -> None:
+    """Tabulate the concatenated fold artifacts for ``beyond_accuracy`` / ``statistical``."""
+    from src.folds.evaluation_table import write_evaluation_table
+
+    condition = (config.get("pipeline") or {}).get("condition") or "frozen"
+    if condition == "both":
+        condition = "frozen"
+    k_values = [int(k) for k in (config.get("k_values") or [5, 10, 20])]
+    for dataset in sorted(datasets):
+        write_evaluation_table(results_dir, dataset, condition, k_values)
+
+
 def run_folds(
     config: dict,
     results_dir: str | Path,
@@ -514,7 +629,9 @@ def run_folds(
         model_key = f"{cell.recommender}_{cell.visual_config}"
         try:
             with time_cell("evaluate", dataset=cell.dataset, model_key=model_key, fold_k=plan.k):
-                extra = runner(cell, config, plan, frames, results_dir=results_dir, device=device)
+                extra = _run_cell_with_oom_recovery(
+                    runner, cell, config, plan, frames, results_dir=results_dir, device=device
+                )
             manifest.set_state(
                 key,
                 "done",
@@ -523,6 +640,11 @@ def run_folds(
                 **(extra or {}),
             )
         except Exception as exc:  # noqa: BLE001 — isolate per-cell failures
+            if is_fatal_cuda_error(exc):
+                # Not this cell's failure: the context is gone, and every
+                # later cell would fail the same way.  The cell stays
+                # pending so the resumed run picks it up.
+                raise
             logger.error("Fold cell failed: %s (%s)", key, exc)
             manifest.set_state(
                 key,
@@ -536,4 +658,7 @@ def run_folds(
         logger.error("K-fold run INCOMPLETE: %s", summary)
     else:
         logger.info("K-fold run finished: %s", summary)
+        # The folds replaced `evaluate` as the producer of the per-user
+        # records, so they owe the back half its input table too.
+        _write_evaluation_tables(config, results_dir, {cell.dataset for cell in cells})
     return manifest

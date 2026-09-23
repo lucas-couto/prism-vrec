@@ -9,11 +9,12 @@ recommenders_enabled:
   - vbpr
   - vnpr
   - deepstyle
+  - acf
 
 # Which embedding variants the recommenders are trained on, when a fixed
 # projection is configured under `projection:` in extractors.yaml.
 #   native    - the backbones' own widths only (the v2 default)
-#   projected - the fixed-dim <extractor>_p<dim> artifacts only
+#   projected - the fixed-dim <extractor>_<method><dim> artifacts only
 #   both      - one cell per variant, so the cost of the projection is
 #               visible instead of assumed
 # Applies to fusion outputs too: a hybrid built from projected sources
@@ -21,25 +22,14 @@ recommenders_enabled:
 embedding_variants: native
 
 common:
-  # Shared dimension budget T (dimension parity, He & McAuley 2016
-  # baselines protocol): every recommender derives its own dimensions
-  # from T through RecommenderSpec.dim_split so the comparison controls
-  # capacity — BPR-MF latent_dim = T; VBPR/AVBPR latent_dim = visual_dim
-  # = T/2; DeepStyle d = T; ACF k = T; VNPR latent k = T (its visual
-  # user vector lives in the image-feature space by construction).
-  # Declaring latent_dim / visual_dim directly is refused (parity guard).
-  # Search space (validation Phase D, 2026-09-04; results/validation/
-  # phase_d_search_cost.md): of the 182 Optuna studies of the 2026-08
-  # battery only learning_rate (0.001 in 153 cells) and total_dim (128
-  # in 138) carried signal; l2_reg split 87/95 and every per-model axis
-  # ~50/50.  The grid is therefore lr x total_dim (4 points per cell),
-  # searched exhaustively under ``hp_search.strategy: grid``; l2_reg is
-  # pinned to 1e-4 (the modal full config of VBPR and DeepStyle, and the
-  # per-group lambda already used below).  Optuna re-sampled winners on
-  # this tiny categorical space (median 17 trials, 6 distinct combos).
-  total_dim: [64, 128]
-  learning_rate: [0.001, 0.01]
-  l2_reg: [0.0001]
+  # Shared collaborative dimension budget T. BPR, DeepStyle, ACF and
+  # VNPR use latent_dim=T; VBPR/AVBPR use latent_dim=T and visual_dim=T.
+  # Search all 27 combinations per cell. Extend the previous grid toward
+  # a lower learning rate and larger capacity, and bracket its L2 value.
+  # Keep the previous values so compatible completed trials remain reusable.
+  total_dim: [64, 128, 256]
+  learning_rate: [0.0003, 0.001, 0.01]
+  l2_reg: [0.00001, 0.0001, 0.001]
   epochs: 50
   batch_size: 4096
   early_stopping_patience: 5
@@ -81,8 +71,33 @@ vbpr:
 
 vnpr:
   # NPR/VNPR (Niu et al. 2018): dropout on the embeddings; L2 over the
-  # whole embedding matrices under common.l2_reg.
-  dropout: 0.0
+  # sampled embedding rows under common.l2_reg (BPR-Opt adaptation).
+  dropout: [0.0, 0.5]
+
+  # The offline reduction the paper prescribes (section 5 + footnote 2):
+  # fc6 features are 4,096-d and "dimension reduction is further
+  # applied ... separately from model training", by PCA.  VNPR is the
+  # only recommender here without a learned projection -- the paper
+  # rejects VBPR's kernel explicitly -- so it is the only one exposed to
+  # the backbone's native scale.  Feeding it the raw feature left 4-6%
+  # of users with an all-tied score list (amazon_women, 2026-09-10):
+  # the single ReLU is negative over the whole catalogue for them and
+  # every item ranks by the tie-break.
+  #
+  # `pca_whitened` rather than the paper's plain PCA is a DECLARED
+  # divergence, and the measurement behind it is in docs/protocol.md:
+  # plain PCA only attenuates the tail (5.13% -> 0.89% on cvt_13, and it
+  # RAISES the per-component magnitude); whitening equalises that
+  # variance and takes the tail to 0.01% on all three of the worst
+  # backbones, lifting recall@10 by 10-61%.  The width is the paper's.
+  #
+  # Each entry selects ARTIFACTS, so listing two makes two cells per
+  # backbone, not two points inside one.  Applies to fusion outputs too
+  # (they are projected after fusion, over the vector the model
+  # receives).  Remove the block to feed VNPR the native feature.
+  visual_input:
+    projection: [pca_whitened]
+    dim: [128]
 
 avbpr:
   att_hidden: [64, 128]
@@ -96,15 +111,8 @@ acf:
   # uniform subsample (never the lowest item indices, which correlate
   # with popularity).  null = full history.
   max_history: [50]
-  # Optuna hp_space mirrors the grid lists exactly so both strategies
-  # explore the same space (keeps grid/optuna comparable and the
-  # hp_space <-> optuna.db distributions consistent).
-  hp_space:
-    total_dim: { type: categorical, choices: [64, 128] }
-    learning_rate: { type: categorical, choices: [0.001, 0.01] }
-    l2_reg: { type: categorical, choices: [0.0001, 0.001] }
-    att_hidden: { type: categorical, choices: [64, 128] }
-    max_history: { type: categorical, choices: [50] }
+  # No explicit hp_space: Optuna derives the same categorical axes from
+  # these declarations, avoiding drift between grid and Optuna searches.
 
 # =============================================================================
 # Hyperparameter-search strategy
@@ -132,7 +140,7 @@ hp_search:
   #            nothing is picked silently.  This is the K-fold path, where
   #            the hyperparameters were chosen beforehand (e.g. copied from
   #            results/best_hyperparams.json of the search run).
-  strategy: "grid" # "grid" | "optuna" | "fixed" — grid: see the common: note (Phase D)
+  strategy: "grid" # "grid" | "optuna" | "fixed"
 
   # The training worker count moved to configs/resources.yaml
   # (resources.workers.training); a `workers:` key here is rejected.

@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.reporting.long_format import (
+    _METRIC_COL_PATTERN,
     classify_table_file,
     evaluation_to_long,
     friedman_to_long,
@@ -41,22 +42,120 @@ def _known_recommenders() -> list[str]:
         return list(_BUILTIN_RECOMMENDERS)
 
 
-def consolidate_evaluation(tables_dir: Path) -> pd.DataFrame:
-    """Aggregate per-user evaluation CSVs into one row per cell × metric × k."""
+#: Rows read per chunk when a per-user evaluation table is consolidated.
+#: Melting the whole table first is what made this step unusable: a
+#: 2.57 M-row table with 30 metric columns becomes a 77 M-row
+#: intermediate on the way to a 2 025-row output, and the step was
+#: OOM-killed at the container's 16 GB limit (found 2026-09-09).  The
+#: melt is row-wise and the aggregation is a sum plus a count, so
+#: chunking gives the same numbers at bounded memory.
+EVALUATION_CHUNK_ROWS = 200_000
+
+#: Cell identity in the consolidated evaluation file, in column order.
+_GROUP_KEYS = (
+    "dataset",
+    "file_condition",
+    "recommender",
+    "embedding_name",
+    "extractor",
+    "fusion",
+    "condition",
+    "embedding_dim",
+    "metric",
+    "k",
+)
+
+
+#: What identifies a cell in the WIDE evaluation table.  Grouping by
+#: "every column that is not a metric" instead exploded the group count
+#: from 75 to 4 400: ``efd_excluded_frac@k`` and ``icov@k`` do not match
+#: the metric pattern, and the first varies per user, so each user's
+#: value became part of the key.  Those columns are dropped here exactly
+#: as ``evaluation_to_long``'s fixed column list already dropped them.
+_CELL_IDENTITY = ("dataset", "model_name", "embedding_name")
+
+
+def _wide_totals(chunk: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Per-cell ``(sums, non-null counts, row counts)`` of one WIDE chunk.
+
+    Aggregating before the melt is the point.  Melting first turned a
+    200 000-row chunk into 6 000 000 long rows and grouped them on ten
+    keys, seven of which are text: chunking alone kept that inside the
+    memory limit but not inside any usable time -- ten minutes on one
+    table and still going (found 2026-09-09).  Collapsing the wide chunk
+    to one row per cell first leaves ~75 rows to melt instead.
+
+    ``sum`` / ``count`` skip missing values while ``size`` does not,
+    which reproduces the original semantics exactly: ``n_users`` counts
+    every user of the cell, and a mean ignores the users whose metric is
+    undefined (EFD is ``nan`` when no recommended item has positive
+    train popularity).
+    """
+    metric_cols = [c for c in chunk.columns if _METRIC_COL_PATTERN.match(c)]
+    id_cols = [c for c in _CELL_IDENTITY if c in chunk.columns]
+    grouped = chunk.groupby(id_cols, dropna=False)
+    return (
+        grouped[metric_cols].sum(min_count=1),
+        grouped[metric_cols].count(),
+        grouped.size(),
+    )
+
+
+def consolidate_evaluation(
+    tables_dir: Path,
+    *,
+    datasets: set[str] | None = None,
+    conditions: set[str] | None = None,
+) -> pd.DataFrame:
+    """Aggregate per-user evaluation CSVs into one row per cell x metric x k.
+
+    ``datasets`` / ``conditions`` restrict the sweep to the run's own
+    scope.  Without them the step globbed the whole tables directory and
+    mixed a superseded run into the consolidated file: on 2026-09-09 a
+    ``frozen`` amazon_men run also consolidated amazon_fashion
+    ``finetuned`` tables written two days earlier.  ``None`` keeps the
+    historical sweep-everything behaviour for callers with no scope.
+    """
     frames: list[pd.DataFrame] = []
     for path in sorted(tables_dir.glob("*_evaluation_*.csv")):
         info = classify_table_file(path)
         if info is None or info["kind"] != "evaluation":
             continue
-        eval_df = pd.read_csv(path)
-        long_df = evaluation_to_long(
-            eval_df,
+        if datasets is not None and info["dataset"] not in datasets:
+            logger.info("  evaluation: %s outside this run's datasets - skipped.", path.name)
+            continue
+        if conditions is not None and info["condition"] not in conditions:
+            logger.info("  evaluation: %s outside this run's conditions - skipped.", path.name)
+            continue
+        sums = counts = sizes = None
+        for chunk in pd.read_csv(path, chunksize=EVALUATION_CHUNK_ROWS):
+            chunk_sums, chunk_counts, chunk_sizes = _wide_totals(chunk)
+            sums = chunk_sums if sums is None else sums.add(chunk_sums, fill_value=0)
+            counts = chunk_counts if counts is None else counts.add(chunk_counts, fill_value=0)
+            sizes = chunk_sizes if sizes is None else sizes.add(chunk_sizes, fill_value=0)
+        if sums is None or sums.empty:
+            continue
+        means = (sums / counts.where(counts > 0)).reset_index()
+        aggregated = evaluation_to_long(
+            means,
             dataset=info["dataset"],
             condition=info["condition"],
-        )
-        if long_df.empty:
+        ).rename(columns={"value": "mean"})
+        if aggregated.empty:
             continue
-        aggregated = _aggregate_per_user(long_df)
+        # ``evaluation_to_long`` keeps a fixed column list, so the user
+        # count rides back in by cell identity rather than through it.
+        # ``Series.add`` across chunks promotes the count to float.
+        per_cell = (
+            sizes.astype("int64")
+            .rename("n_users")
+            .reset_index()
+            .rename(columns={"model_name": "recommender"})
+        )
+        on = [c for c in per_cell.columns if c != "n_users" and c in aggregated.columns]
+        aggregated = aggregated.merge(per_cell[[*on, "n_users"]], on=on, how="left")
+        keys = [k for k in (*_GROUP_KEYS, "n_users") if k in aggregated.columns]
+        aggregated = aggregated[[*keys, "mean"]]
         frames.append(aggregated)
         logger.info("  evaluation: %s rows from %s", len(aggregated), path.name)
 
@@ -179,6 +278,9 @@ def consolidate_statistical_tests(
 def write_consolidated(
     tables_dir: Path,
     output_dir: Path | None = None,
+    *,
+    datasets: set[str] | None = None,
+    conditions: set[str] | None = None,
 ) -> dict[str, Path]:
     """Run the three consolidations and write the resulting CSVs.
 
@@ -191,7 +293,7 @@ def write_consolidated(
     known_recs = _known_recommenders()
 
     logger.info("Consolidating evaluation...")
-    eval_long = consolidate_evaluation(tables_dir)
+    eval_long = consolidate_evaluation(tables_dir, datasets=datasets, conditions=conditions)
     eval_path = out_dir / "evaluation_aggregated.csv"
     eval_long.to_csv(eval_path, index=False)
 

@@ -1,12 +1,12 @@
-"""The YAML is the only control surface for run configuration (3.0.0).
+"""The YAML is the only control surface: ``main.py`` takes NO arguments.
 
-The step range, the condition, the search strategy, the protocol, the
-seeds and the evaluation protocol (``folds.enabled``) come from
-``configs/*.yaml`` alone; the flags that duplicated them were removed by
-the researcher's decision.  Passing one fails with
-argparse's standard error plus the YAML key that replaced it; the
-resolved plan is printed by ``--show-plan`` and recorded in the run
-manifest.
+3.0.0 removed the flags that duplicated run configuration; 2026-09-09
+removed the rest, including ``--config-dir`` (the directory is always
+``configs/``).  What the command does is chosen by ``pipeline.mode``, and
+the step range, condition, search strategy, protocol and seeds come from
+``configs/*.yaml`` alone.  Passing any argument fails naming the key that
+carries its behaviour; the resolved plan is printed by
+``pipeline.mode: show_plan`` and recorded in the run manifest.
 """
 
 from __future__ import annotations
@@ -31,45 +31,54 @@ import main
         (["--n-trials", "3"], "hp_search.optuna.n_trials"),
         (["--eval-protocol=sampled"], "evaluation.protocol"),
         (["--seeds", "1,2"], "seeds"),
-        (["--folds"], "folds.enabled"),
+        (["--config-dir", "other"], "always `configs/`"),
+        # The battery mode was removed in 3.0.0, so its flags name no
+        # replacement key: nothing carries that behaviour any more.
+        (["--battery"], "nothing replaces it"),
+        (["--battery-status"], "nothing replaces it"),
+        (["--retry-failed"], "nothing replaces it"),
+        (["--show-plan"], "pipeline.mode: show_plan"),
+        (["--folds"], "folds.enabled: true"),
+        (["--list-datasets"], "pipeline.mode: list"),
+        (["--report"], "pipeline.mode: report"),
+        (["whatever"], "every knob lives in configs/*.yaml"),
     ],
 )
-def test_removed_flags_fail_with_the_yaml_key(argv, hint, capsys) -> None:
+def test_any_argument_fails_naming_the_yaml_key(argv, hint, capsys) -> None:
     code = main.run_cli(argv)
 
     err = capsys.readouterr().err
-    assert code == 2  # argparse's standard usage error
-    assert "was removed" in err
+    assert code != 0
+    assert "takes no arguments" in err
     assert hint in err
 
 
-def test_every_removed_flag_is_gone_from_the_parser() -> None:
-    parser = main.build_parser()
-    known = {opt for action in parser._actions for opt in action.option_strings}
-
-    assert not known & set(main.REMOVED_FLAGS)
-    for kept in ("--battery", "--show-plan", "--inspect-pending", "--config-dir"):
-        assert kept in known
+def test_there_is_no_parser_left_to_hold_a_flag() -> None:
+    """Not "the flags were removed" but "there is nowhere to put one"."""
+    assert not hasattr(main, "build_parser")
+    for gone in ("--battery", "--folds", "--show-plan", "--config-dir", "--report"):
+        assert gone in main.REMOVED_FLAGS
 
 
-def test_show_plan_prints_the_yaml_resolved_plan(monkeypatch, capsys) -> None:
+def test_show_plan_mode_prints_the_yaml_resolved_plan(monkeypatch, capsys) -> None:
     config = {
         "pipeline": {
             "run_all": False,
             "start_from": "fuse",
-            "stop_at": "evaluate",
+            "stop_at": "folds",
             "condition": "frozen",
+            "mode": "show_plan",
         }
     }
     monkeypatch.setattr(main, "load_config", lambda *a, **k: config)
 
-    assert main.run_cli(["--show-plan"]) == 0
+    assert main.run_cli([]) == 0
 
     out = capsys.readouterr().out
     assert "condition='frozen' (3 steps)" in out
-    assert "fuse" in out and "train" in out and "evaluate" in out
+    assert "fuse" in out and "train" in out and "folds" in out
+    assert "evaluate" not in out.replace("evaluate_finetuning", "")
     assert "finetune" not in out.replace("evaluate_finetuning", "")
-    assert "Evaluation protocol: single_split" in out
 
 
 def test_run_all_true_ignores_the_range_and_both_expands_condition_steps() -> None:

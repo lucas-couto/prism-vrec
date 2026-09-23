@@ -1,14 +1,15 @@
 """Paper properties that cut across recommenders.
 
 Dimension parity at the MODEL level: ``resolve_dimensions(name, T)``
-must leave every built-in recommender with the same number of USER
-parameters per user (``Σ embedding_dim`` over the ``nn.Embedding``
-tables indexed by user), the way the VBPR baseline protocol (He &
-McAuley 2016) equalises the factor budget across MF methods.  VNPR is
-the declared exception: its visual user vector lives in the native
-image-feature space ``D_v`` by construction (Niu et al. 2018), outside
-the budget.  The config-level guard (``total_dim`` only, direct dims
-refused) is pinned in ``tests/test_dimension_parity.py``.
+must leave every built-in recommender with the same COLLABORATIVE
+capacity — ``T`` latent factors per user — so a comparison at a fixed
+``T`` is a comparison of the visual mechanism rather than of how many
+collaborative factors each model was left with.  A visual model's own
+user-indexed table sits BESIDE that budget: VBPR/AVBPR add a visual
+user vector of ``T`` (2026-09-09 decision) and VNPR adds one of ``D_v``
+by construction (Niu et al. 2018).  Both are declared, not accidents.
+The config-level guard (``total_dim`` only, direct dims refused) is
+pinned in ``tests/test_dimension_parity.py``.
 """
 
 from __future__ import annotations
@@ -24,17 +25,29 @@ from src.recommenders.hp_search import resolve_dimensions
 from src.recommenders.registry import RecommenderSpec
 
 N_USERS, N_ITEMS, N_COMPONENTS, RAW_DIM = 5, 9, 3, 7
-TOTAL_DIM = 8  # even: the half split must be exact
+TOTAL_DIM = 8  # even: the (unregistered) half split must stay exact
 BUILTIN = ("bpr", "vbpr", "avbpr", "deepstyle", "vnpr", "acf")
-#: User parameters per user expected from ``dim_split`` — ``T`` for
-#: every model; VNPR adds ``D_v`` outside the budget (declared).
+#: User parameters per user expected from ``dim_split``: ``T``
+#: collaborative factors everywhere, plus whatever visual user vector the
+#: model declares beside the budget.
 EXPECTED_USER_DIMS = {
     "bpr": TOTAL_DIM,
-    "vbpr": TOTAL_DIM,  # T/2 latent + T/2 visual
-    "avbpr": TOTAL_DIM,  # T/2 latent + T/2 visual
+    "vbpr": 2 * TOTAL_DIM,  # gamma_u in T plus theta_u in T
+    "avbpr": 2 * TOTAL_DIM,  # mirrors VBPR
     "deepstyle": TOTAL_DIM,  # one p_u of dimension d = T
     "acf": TOTAL_DIM,  # U in k = T; the visual path is attention-only
     "vnpr": TOTAL_DIM + RAW_DIM,  # W_u in k = T plus W_v in D_v
+}
+
+#: The collaborative half of :data:`EXPECTED_USER_DIMS` — what parity is
+#: actually about.  Every model must hold exactly ``T`` of these.
+EXPECTED_VISUAL_USER_DIMS = {
+    "bpr": 0,
+    "vbpr": TOTAL_DIM,
+    "avbpr": TOTAL_DIM,
+    "deepstyle": 0,
+    "acf": 0,
+    "vnpr": RAW_DIM,
 }
 TRAIN = {0: {0, 1}, 1: {2, 3, 4}, 2: {5}, 3: {6, 7}}
 
@@ -97,18 +110,22 @@ def test_resolved_dimensions_sum_to_the_budget_for_the_half_split(spec: Recommen
         assert dims["latent_dim"] == TOTAL_DIM
 
 
-def test_every_built_in_spends_the_same_user_budget_up_to_vnpr_visual_space() -> None:
-    per_model = {spec.name: _user_dims_per_user(_build(spec)) for spec in _builtin_specs()}
-    vnpr_visual = per_model.pop("vnpr") - RAW_DIM
+def test_every_built_in_spends_the_same_collaborative_budget() -> None:
+    """Parity is about the COLLABORATIVE side: strip each model's declared
+    visual user vector and every built-in must be left with exactly ``T``."""
+    collaborative = {
+        spec.name: _user_dims_per_user(_build(spec)) - EXPECTED_VISUAL_USER_DIMS[spec.name]
+        for spec in _builtin_specs()
+    }
 
-    assert set(per_model.values()) == {TOTAL_DIM}
-    assert vnpr_visual == TOTAL_DIM
+    assert set(collaborative.values()) == {TOTAL_DIM}, collaborative
 
 
 @pytest.mark.parametrize("total_dim", [4, 16])
 def test_user_budget_scales_with_total_dim(total_dim: int) -> None:
     dims = {spec.name: _user_dims_per_user(_build(spec, total_dim)) for spec in _builtin_specs()}
 
-    assert dims["bpr"] == dims["vbpr"] == dims["avbpr"] == dims["deepstyle"] == dims["acf"]
-    assert dims["bpr"] == total_dim
+    assert dims["bpr"] == dims["deepstyle"] == dims["acf"] == total_dim
+    # The visual models carry their visual user vector beside the budget.
+    assert dims["vbpr"] == dims["avbpr"] == 2 * total_dim
     assert dims["vnpr"] == total_dim + RAW_DIM

@@ -36,6 +36,7 @@ PIPELINE_STEPS = (
     "evaluate_finetuning",
     "fuse",
     "train",
+    "folds",
     "evaluate",
     "beyond_accuracy",
     "statistical",
@@ -106,6 +107,20 @@ class PipelineConfig(BaseModel):
     start_from: str | None = None
     stop_at: str | None = None
     condition: Literal["frozen", "finetuned", "both"] = "both"
+    #: What ``python main.py`` does.  The command takes no arguments —
+    #: this key is how a run or an inspection is selected.  The
+    #: ``battery`` and ``battery_status`` modes were removed in 3.0.0:
+    #: the mode was never exercised, had no OOM recovery, and the
+    #: dissertation grid runs through the step plan instead.
+    mode: Literal[
+        "pipeline",
+        "show_plan",
+        "report",
+        "inspect_pending",
+        "validate_features",
+        "validate_datasets",
+        "list",
+    ] = "pipeline"
 
     @field_validator("start_from", "stop_at")
     @classmethod

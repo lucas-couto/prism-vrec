@@ -227,7 +227,7 @@ diagnostics:
 # pins, feature residency) live ONLY in configs/resources.yaml; see below.
 ```
 
-The YAML is the only control surface: `pipeline.{run_all,start_from,stop_at,condition}` decide what runs (`start_from` / `stop_at` are ignored while `run_all: true`), and `python main.py --show-plan` prints the resolved plan. The former `--all` / `--step` / `--from` / `--to` / `--condition` / `--hp-search` / `--n-trials` / `--eval-protocol` / `--seeds` flags were removed in 3.0.0; passing one fails naming the YAML key. Per-night narrowing goes in the git-ignored `configs/zz_local.yaml` (see `docs/battery_runbook.md`).
+The YAML is the only control surface, and `main.py` takes **no arguments**: `pipeline.mode` chooses what the command does (`pipeline`, `show_plan`, `report`, `inspect_pending`, `validate_features`, `validate_datasets`, `list`), and `pipeline.{run_all,start_from,stop_at,condition}` decide which steps run (`start_from` / `stop_at` are ignored while `run_all: true`). Every former flag — the 3.0.0 batch plus `--battery`, `--folds`, `--show-plan`, `--report`, the `--list-*` / `--validate-*` pair and `--config-dir`, whose directory is always `configs/` — fails naming the key that replaced it.
 
 The evaluation protocol is a YAML decision as well: `folds.enabled` selects what the `evaluate` step runs. With the shipped default (`true`) a plain run scores the frozen winners by user-level K-fold cross-validation with fold-in (`docs/protocol.md` §3b) and builds the battery tables from the concatenated fold artifacts; `false` runs the single leave-one-out split. The two never run in one invocation, `--show-plan` prints the resolved choice and the run manifest records it under `evaluation_protocol`. The former `--folds` mode was removed; passing it fails naming `folds.enabled`.
 
@@ -301,7 +301,7 @@ projection:
   seed: 42 # method: random only
 ```
 
-This writes `<extractor>_p128.npy` **alongside** the native artifact, never in place of it, so native and projected can be trained and compared in the same battery. Two flags then decide what *consumes* them:
+This writes `<extractor>_pcaw128.npy` **alongside** the native artifact, never in place of it, so native and projected can be trained and compared in the same battery. Two flags then decide what *consumes* them:
 
 ```yaml
 # configs/recommenders.yaml — which variants the recommenders train on
@@ -311,7 +311,7 @@ embedding_variants: both # native | projected | both
 extractor_variants: native # native | projected | both
 ```
 
-`extractor_variants: projected` is the shortcut this feature exists for: the sources already share a width, so the whole `alignment:` block is bypassed — nothing learned online, no PCA fit inside the fuse step. Outputs stay apart by the same token (`hybrid_mean` vs `hybrid_mean_p128`), and a hybrid built from projected sources is classified with them by `embedding_variants`. `random` is a seeded semi-orthogonal matrix (data-independent, so it cannot leak val/test items); `pca` is fit on train items only, like the fusion alignment; `pca_whitened` adds per-component variance equalisation on the same fit set. Any extractor overrides the block under `extractors.<name>.projection`. Already-extracted embeddings are projected in a linear pass — the backbone is not loaded again. Read [`docs/protocol.md` §1b](docs/protocol.md) before reporting a comparison run on projected artifacts: a fixed projection is a variable, not a free normalisation.
+`extractor_variants: projected` is the shortcut this feature exists for: the sources already share a width, so the whole `alignment:` block is bypassed — nothing learned online, no PCA fit inside the fuse step. Outputs stay apart by the same token (`hybrid_mean` vs `hybrid_mean_pcaw128`), and a hybrid built from projected sources is classified with them by `embedding_variants`. `random` is a seeded semi-orthogonal matrix (data-independent, so it cannot leak val/test items); `pca` is fit on train items only, like the fusion alignment; `pca_whitened` adds per-component variance equalisation on the same fit set. Any extractor overrides the block under `extractors.<name>.projection`. Already-extracted embeddings are projected in a linear pass — the backbone is not loaded again. Read [`docs/protocol.md` §1b](docs/protocol.md) before reporting a comparison run on projected artifacts: a fixed projection is a variable, not a free normalisation.
 
 To ablate an extractor, just remove its name from `extractors_enabled`, its block under `extractors:` stays as catalogue but the pipeline skips it (and the fine-tuning step skips it too).
 
@@ -798,7 +798,7 @@ Each method is toggled individually in `configs/evaluation.yaml` -> `statistical
 
 ### Need a process supervisor?
 
-The previous `scripts/watchdog.sh` supervisor (RunPod-era operational scaffolding) has been removed in favour of platform-native supervisors. For long runs on cloud pods, use the host's own facilities (systemd unit, Kubernetes liveness probe, `tini --restart-on-exit`, Docker `restart: unless-stopped`). The pipeline is idempotent: a hard kill followed by `python main.py` resumes from the last checkpoint regardless of which supervisor restarted it.
+`python main.py` supervises itself: the pipeline runs in a child process, and when a CUDA context fault (for example an NVRM Xid 8 launch timeout) or a SIGKILL ends that child, a fresh child resumes **the same run** (same `results/runs/<run_id>/`, same `logs/run_<id>.log`, a `restarts` entry in the manifest) after 30 s. An ordinary error still ends the run, and 3 restarts in a row without new work give up. Inside the container Ctrl+C (for example in `docker attach`) does not stop the run: detach with Ctrl+P Ctrl+Q and stop it with `docker compose stop`. For that reason `docker-compose.yml` sets `restart: "no"`: a new run begins only on `docker compose up -d`. Outside the fault path the pipeline stays idempotent, so a hard kill followed by `python main.py` resumes from the last checkpoint as a new run.
 
 ---
 

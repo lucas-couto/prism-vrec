@@ -29,6 +29,7 @@ stays open by design.
 | [S02](S02.md) | F10 | Non-learned online sidecar normalises each source at load; `SIDECAR_RECIPE_VERSION = 2` | verified; historical `hybrid_adaptive_gated_*` results non-comparable |
 | [S03](S03.md) | F11 | Extraction resume v2 from the validated durable prefix; v1 progress restarts | verified |
 | [S04](S04.md) | F13 | Opt-in training diagnostics + controlled VNPR collapse driver | probes verified; **cause still unresolved on synthetic data** (real-data run pending) |
+| [S05](S05.md) | — | ACF joins the fusion family: early per-region fusion of the component grids; `hybrid_*_comp` artifacts routed to component models | verified; not resource-certified |
 | [R01](R01.md) | F09 | Battery executor dispatches per declared strategy; replay from the primary winner | verified |
 | [R02](R02.md) | F09 | One canonical `effective_hyperparams`; replay resolution with provenance | verified |
 | [R03](R03.md) | F16 | Per-dataset budget consumed by every training path; `SELECTION_K_VALUES`; unsupported metric fails early | verified |

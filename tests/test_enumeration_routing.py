@@ -262,3 +262,38 @@ class TestExtractorFilterHonoursConfig:
         assert not any(j.embedding_name.startswith("vit_b16") for j in jobs)
         # hybrid (enabled strategy) and the bpr baseline survive.
         assert any(j.embedding_name == "hybrid_mean_D128" for j in jobs)
+
+
+def test_visual_input_routes_one_model_without_touching_the_others(tmp_path, monkeypatch) -> None:
+    """VNPR reads the offline reduction; VBPR keeps the raw feature.
+
+    Wiring guard for `route_visual_input`: the unit tests cover the
+    predicate, this covers that `_iter_cells` asks it PER MODEL.  The
+    pool used to be filtered by `embedding_variants` before the model
+    loop, which would have removed VNPR's artifacts before it could ask
+    for them.
+    """
+    monkeypatch.chdir(tmp_path)
+    processed, emb = _setup(tmp_path, with_comp=False)
+    np.save(
+        Path(emb) / DATASET / "vit_b16_D128_pcaw128.npy",
+        np.zeros((N_ITEMS, 8), dtype="float32"),
+    )
+
+    config = _config()
+    config["recommenders_enabled"] = ["vbpr", "vnpr"]
+    config["embedding_variants"] = "native"
+    config["vnpr"] = {"visual_input": {"projection": ["pca_whitened"], "dim": [128]}}
+
+    jobs = build_job_list("frozen", config, processed, emb, "cpu")
+
+    by_model = {}
+    for job in jobs:
+        by_model.setdefault(job.model_name, set()).add(job.embedding_name)
+
+    # vit_b16_D128 is SUPERSEDED for vnpr: its projection is on disk.
+    # hybrid_mean_D128 is not -- no array of an online fusion can be
+    # projected -- so vnpr keeps it rather than losing the strategy.
+    assert by_model["vnpr"] == {"vit_b16_D128_pcaw128", "hybrid_mean_D128"}
+    assert "vit_b16_D128" in by_model["vbpr"]
+    assert not any("pcaw" in name for name in by_model["vbpr"])

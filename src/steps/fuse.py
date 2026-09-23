@@ -31,13 +31,18 @@ Two conditions are supported:
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import numpy as np
 
-from src.extractors.projection import resolve_projection_config
+from src.extractors.projection import (
+    ProjectionConfig,
+    ensure_projected,
+    resolve_projection_config,
+)
 from src.fusions import (
     get_fusion_strategy,
     is_registered,
@@ -49,10 +54,19 @@ from src.fusions.streaming import (
     CHUNK_ROWS,
     is_streamable,
     run_streamed,
+    run_streamed_arrays,
     stream_pca_align,
+)
+from src.utils import timing
+from src.utils.artifact_names import (
+    COMPONENT_SUFFIX,
+    FUSION_PREFIX,
+    is_component_artifact,
+    is_projected_artifact,
 )
 from src.utils.atomic_io import atomic_np_save, atomic_write
 from src.utils.config import load_config
+from src.utils.cost_labels import source_labels
 from src.utils.identity import (
     check_provenance,
     feature_recipe,
@@ -201,7 +215,12 @@ def task_provenance(task: dict) -> dict:
     Source content (recursive recipe of every input, in order), the
     strategy and its keyword arguments, the normalisation flag, the
     alignment declared by an online sidecar and the fit-set digest for
-    the PCA strategies.  Output paths and worker layout are excluded.
+    the PCA strategies.  Output paths and worker layout are excluded,
+    and so is ``component``: it selects the execution route, not an
+    ingredient — a per-region output differs from a pooled one through
+    its ``_comp`` sources, which ``sources`` already records.  Listing
+    it here would change the digest of every pooled fusion already on
+    disk and refuse to reuse artifacts that are in fact identical.
     """
     reserved = {
         "strategy_name",
@@ -211,6 +230,7 @@ def task_provenance(task: dict) -> dict:
         "train_items",
         "sidecar_payload",
         "provenance",
+        "component",
     }
     kwargs = {k: v for k, v in task.items() if k not in reserved}
     sidecar = task.get("sidecar_payload")
@@ -239,6 +259,132 @@ def _reusable(task: dict) -> bool:
     return True
 
 
+def _fuse_component_rows(
+    strategy_name: str,
+    emb_list_paths: list[str],
+    normalize: bool,
+    train_items: list[int] | None,
+    **kwargs,
+) -> np.ndarray:
+    """Fuse per-region component sources ``(n_items, R, D_i)`` region by region.
+
+    Every source is flattened to ``(n_items * R, D_i)``, the pooled
+    strategy runs unchanged on those rows, and the result is folded back
+    to ``(n_items, R, D_fused)``.  Two consequences are the point of
+    doing it this way rather than fusing region maps independently:
+
+    * a fitted strategy (PCA) sees every region of every item as one
+      sample set, so ONE basis is shared by all regions -- regions stay
+      in a common space and ACF's component attention keeps comparing
+      like with like;
+    * ``train_items`` is expanded to the rows those items own
+      (``i * R + r``), so a PCA fit still never sees a validation or
+      test item.
+
+    The fusion runs in float32 and the result is cast back to the common
+    source dtype -- component artifacts are fp16, and the whole grid was
+    sized on that (see ``docs/protocol.md``, ACF component grid).
+    """
+    sources = [np.load(path, mmap_mode="r") for path in emb_list_paths]
+    layouts = {arr.shape[:-1] for arr in sources}
+    if len(layouts) != 1:
+        raise ValueError(
+            f"component fusion {strategy_name!r}: sources disagree on the "
+            f"item/region layout ({sorted(layouts)}).",
+        )
+    if len(sources[0].shape) != 3:
+        raise ValueError(
+            f"component fusion {strategy_name!r}: expected 3-D "
+            f"(n_items, R, D) sources, got shape {sources[0].shape}.",
+        )
+    n_items, regions = sources[0].shape[0], sources[0].shape[1]
+    dtype = np.result_type(*[arr.dtype for arr in sources])
+    flat = [np.asarray(arr, dtype=np.float32).reshape(n_items * regions, -1) for arr in sources]
+
+    if strategy_name in _PCA_STRATEGIES:
+        rows = None
+        if train_items is not None:
+            base = np.asarray(train_items, dtype=np.int64) * regions
+            rows = (base[:, None] + np.arange(regions, dtype=np.int64)[None, :]).ravel()
+        kwargs["train_items"] = rows
+
+    fuse_fn = get_fusion_strategy(strategy_name, **kwargs)
+    fused = fuse_fn(flat, normalize=normalize)
+    return fused.reshape(n_items, regions, -1).astype(dtype, copy=False)
+
+
+def _fuse_component_streamed(
+    strategy_name: str,
+    output_path: str,
+    emb_list_paths: list[str],
+    normalize: bool,
+    train_items: list[int] | None,
+    **kwargs,
+) -> tuple[int, ...]:
+    """Per-region fusion of a STREAMABLE strategy, chunk-bounded.
+
+    Same arithmetic and same bytes as :func:`_fuse_component_rows`, with
+    the peak bounded by the chunk instead of the catalogue.  The dense
+    path materialises every source in float32 up front: on amazon_women
+    that is 14.59 GiB of input alone, plus an equal-sized output for
+    ``concat``, against a 16 GiB container -- it OOM-killed its worker on
+    every attempt, and tradesy sits at 13.70 GiB behind it (2026-09-10).
+
+    Two properties make the reuse exact rather than approximate:
+
+    * a contiguous ``(n_items, R, D)`` memmap reshapes to
+      ``(n_items * R, D)`` as a VIEW, so the 2-D rows the chunked
+      kernels read are the same bytes, uncopied.  That is why "the
+      chunked kernels read 2-D rows" was never the obstacle it was
+      taken for;
+    * the writer allocates ``(n_items, R, D_fused)`` in the sources'
+      dtype, so the region layout and the fp16 the component grid was
+      sized on come out of the destination header rather than a trailing
+      reshape-and-cast over a materialised result.
+
+    ``train_items`` is expanded to the rows those items own
+    (``i * R + r``) exactly as the dense path does, so a PCA fit still
+    never sees a validation or test item and one basis is still shared
+    by every region.
+    """
+    sources = [np.load(path, mmap_mode="r") for path in emb_list_paths]
+    layouts = {arr.shape[:-1] for arr in sources}
+    if len(layouts) != 1:
+        raise ValueError(
+            f"component fusion {strategy_name!r}: sources disagree on the "
+            f"item/region layout ({sorted(layouts)}).",
+        )
+    if len(sources[0].shape) != 3:
+        raise ValueError(
+            f"component fusion {strategy_name!r}: expected 3-D "
+            f"(n_items, R, D) sources, got shape {sources[0].shape}.",
+        )
+
+    n_items, regions = int(sources[0].shape[0]), int(sources[0].shape[1])
+    dtype = np.result_type(*[arr.dtype for arr in sources])
+    flat = [arr.reshape(n_items * regions, arr.shape[-1]) for arr in sources]
+
+    rows = None
+    if strategy_name in _PCA_STRATEGIES and train_items is not None:
+        base = np.asarray(train_items, dtype=np.int64) * regions
+        rows = (base[:, None] + np.arange(regions, dtype=np.int64)[None, :]).ravel()
+
+    return run_streamed_arrays(
+        strategy_name,
+        flat,
+        output_path,
+        normalize=normalize,
+        train_items=rows,
+        n_components=kwargs.get("n_components"),
+        out_groups=regions,
+        out_dtype=dtype,
+        # float32 for the arithmetic, as the dense path gets by upcasting
+        # the whole matrix; the cast happens per chunk here and the
+        # result comes back to the sources' dtype on write.
+        compute_dtype=np.float32,
+    )
+
+
 def _fuse_single(
     strategy_name: str,
     output_path: str,
@@ -247,6 +393,7 @@ def _fuse_single(
     train_items: list[int] | None = None,
     sidecar_payload: dict | None = None,
     provenance: dict | None = None,
+    component: bool = False,
     **kwargs,
 ) -> str | None:
     """Execute a single fusion and save the result. Pickled by ProcessPool.
@@ -270,6 +417,24 @@ def _fuse_single(
         payload = json.dumps(sidecar_payload, indent=2)
         atomic_write(lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"), out)
         return f"{strategy_name} (online): sidecar written -> {out}"
+
+    if component:
+        if is_streamable(strategy_name):
+            # The heavy three (concat, pca, pca_per_model) are exactly
+            # the streamable ones, and a component source's rows are a
+            # free reshape away -- so the per-region pass is bounded by
+            # the chunk instead of the catalogue.
+            shape = _fuse_component_streamed(
+                strategy_name, str(out), emb_list_paths, normalize, train_items, **kwargs
+            )
+            _inherit_item_order(out, emb_list_paths, strategy_name)
+            return f"{strategy_name} (per-region, streamed): {tuple(shape)} -> {out}"
+        fused = _fuse_component_rows(
+            strategy_name, emb_list_paths, normalize, train_items, **kwargs
+        )
+        atomic_np_save(fused, out)
+        _inherit_item_order(out, emb_list_paths, strategy_name)
+        return f"{strategy_name} (per-region): {fused.shape} -> {out}"
 
     if is_streamable(strategy_name):
         # Row-wise strategies never materialise a full matrix: the peak
@@ -384,6 +549,7 @@ def _collect_fusion_tasks(
     suffix: str = "",
     variant_token: str = "",
     pre_aligned: bool = False,
+    component: bool = False,
 ) -> list[dict]:
     """Build the list of fusion tasks for a single dataset.
 
@@ -400,11 +566,23 @@ def _collect_fusion_tasks(
     block is then bypassed: the equal-dim strategies fuse the sources
     directly, with nothing learned online and no PCA fit inside this
     step, which is the point of projecting at extraction time.
+
+    *component* switches the pass to the per-region component artifacts
+    (``<ext>_comp.npy``, ``(n_items, R, D)``) that models declaring
+    ``requires_components`` consume.  Sources and outputs both carry the
+    ``_comp`` suffix LAST, so the result still satisfies
+    :func:`~src.utils.artifact_names.is_component_artifact` and is
+    routed to those models only.  The fusion itself is applied region by
+    region (:func:`_fuse_component_rows`, or per-region inside the
+    recommender for the online strategies), which is what keeps the
+    ``fusion_within_model`` axis comparable with the pooled recommenders
+    while preserving the per-region attention.
     """
     tasks: list[dict] = []
     dataset_dir = Path(embeddings_dir) / dataset_name
+    tail = COMPONENT_SUFFIX if component else ""
 
-    native_paths = [dataset_dir / f"{ext}{suffix}.npy" for ext in extractors]
+    native_paths = [dataset_dir / f"{ext}{suffix}{tail}.npy" for ext in extractors]
     if not all(p.exists() for p in native_paths):
         logger.info(
             "  %s%s: fusion sources missing (%s) — skipping dataset.",
@@ -419,6 +597,7 @@ def _collect_fusion_tasks(
     aligned_paths: list[Path] | None = None
     if (
         not pre_aligned
+        and not component
         and alignment_method == "pca"
         and any(s.equal_dim_required for s in iter_specs() if s.name in enabled_strategies)
     ):
@@ -440,7 +619,7 @@ def _collect_fusion_tasks(
         if not spec.equal_dim_required:
             # Concatenation family: operates on native dims directly.
             for fsuffix, fn_kwargs in grid:
-                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{variant_token}{suffix}.npy"
+                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{variant_token}{suffix}{tail}.npy"
                 tasks.append(
                     {
                         "strategy_name": spec.name,
@@ -448,6 +627,7 @@ def _collect_fusion_tasks(
                         "emb_list_paths": native_path_strs,
                         "normalize": normalize,
                         "train_items": train_items if spec.name in _PCA_STRATEGIES else None,
+                        "component": component,
                         **fn_kwargs,
                     }
                 )
@@ -456,7 +636,7 @@ def _collect_fusion_tasks(
         if pre_aligned:
             # Sources already share a width, so there is nothing to align.
             if spec.online:
-                out = dataset_dir / f"hybrid_{spec.name}{variant_token}{suffix}.json"
+                out = dataset_dir / f"hybrid_{spec.name}{variant_token}{suffix}{tail}.json"
                 tasks.append(
                     {
                         "strategy_name": spec.name,
@@ -475,13 +655,14 @@ def _collect_fusion_tasks(
                 )
                 continue
             for fsuffix, fn_kwargs in grid:
-                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{variant_token}{suffix}.npy"
+                out = dataset_dir / f"hybrid_{spec.name}{fsuffix}{variant_token}{suffix}{tail}.npy"
                 tasks.append(
                     {
                         "strategy_name": spec.name,
                         "output_path": str(out),
                         "emb_list_paths": native_path_strs,
                         "normalize": normalize,
+                        "component": component,
                         **fn_kwargs,
                     }
                 )
@@ -491,7 +672,7 @@ def _collect_fusion_tasks(
         if alignment_method == "learned":
             for fsuffix, fn_kwargs in grid:
                 out = dataset_dir / (
-                    f"hybrid_{spec.name}{fsuffix}_learned{suffix}_D{alignment_dim}.json"
+                    f"hybrid_{spec.name}{fsuffix}_learned{suffix}_D{alignment_dim}{tail}.json"
                 )
                 sidecar = {
                     "strategy": spec.name,
@@ -515,12 +696,25 @@ def _collect_fusion_tasks(
             continue
 
         # alignment_method == "pca"
+        if component:
+            # Aligning component sources would need a PCA basis fitted
+            # over the flattened regions of every source; not built.
+            # `alignment.method: learned` is the configured route and
+            # handles components (per-region projections inside the
+            # recommender).
+            logger.info(
+                "  %s: %r needs pca alignment, which is not built for the "
+                "per-region component pass — skipping.",
+                dataset_name,
+                spec.name,
+            )
+            continue
         if aligned_paths is None:
             continue
         if spec.online:
             # adaptive_gated over pca-aligned equal-dim sources: classic
             # 3-D stacked sidecar consumed by AdaptiveGatedFusion.
-            out = dataset_dir / f"hybrid_{spec.name}_pca{suffix}_D{alignment_dim}.json"
+            out = dataset_dir / f"hybrid_{spec.name}_pca{suffix}_D{alignment_dim}{tail}.json"
             sidecar = {
                 "strategy": spec.name,
                 "online": True,
@@ -541,13 +735,16 @@ def _collect_fusion_tasks(
             continue
 
         for fsuffix, fn_kwargs in grid:
-            out = dataset_dir / (f"hybrid_{spec.name}{fsuffix}_pca{suffix}_D{alignment_dim}.npy")
+            out = dataset_dir / (
+                f"hybrid_{spec.name}{fsuffix}_pca{suffix}_D{alignment_dim}{tail}.npy"
+            )
             tasks.append(
                 {
                     "strategy_name": spec.name,
                     "output_path": str(out),
                     "emb_list_paths": [str(p) for p in aligned_paths],
                     "normalize": normalize,
+                    "component": component,
                     **fn_kwargs,
                 }
             )
@@ -606,6 +803,62 @@ def _resolve_extractor_variants(
         dim = widths.pop()
         variants.append(([f"{ext}_p{dim}" for ext in extractors], f"_p{dim}", True))
     return variants
+
+
+def _fuse_components_enabled(config: dict) -> bool:
+    """Whether this run must also fuse the per-region component artifacts.
+
+    Mirrors the extraction gate: components are produced when some
+    enabled recommender declares ``requires_components``, and they are
+    fused for exactly the same reason.  No separate config key — the
+    recommender roster is the single declaration.
+    """
+    from src.recommenders import get_recommender_spec
+
+    for name in config.get("recommenders_enabled") or []:
+        try:
+            spec = get_recommender_spec(name)
+        except KeyError:
+            continue
+        if spec.requires_components:
+            return True
+    return False
+
+
+def project_fusion_outputs(
+    dataset_dir: Path,
+    projection: ProjectionConfig | None,
+    train_items: list[int] | None,
+) -> int:
+    """Write the fixed projection of every OFFLINE fusion in *dataset_dir*.
+
+    The extract step projects a single backbone's artifact; a fusion has
+    to be projected here, AFTER it is built, because whitening each
+    source and then mixing them is not the same transform as whitening
+    the mixture -- and it is the mixture the recommender receives
+    (VNPR, whose paper prescribes the offline reduction and which has no
+    learned projection to absorb the input scale).
+
+    Two families are skipped and both are skips of substance:
+
+    * an online fusion is a JSON sidecar whose mixing happens inside the
+      recommender at train time, so there is no array here to project.
+      Under ``alignment: learned`` that is most of them;
+    * a component fusion is ``(n_items, R, D)`` and the projector reads
+      2-D rows.
+
+    :returns: How many projected artifacts were written.
+    """
+    if projection is None:
+        return 0
+
+    written = 0
+    for source in sorted(dataset_dir.glob(f"{FUSION_PREFIX}*.npy")):
+        if is_component_artifact(source.stem) or is_projected_artifact(source.stem):
+            continue
+        if ensure_projected(source, projection, train_items) is not None:
+            written += 1
+    return written
 
 
 def run(condition: str = "frozen") -> None:
@@ -683,6 +936,15 @@ def run(condition: str = "frozen") -> None:
         alignment_dim,
     )
 
+    fuse_components = _fuse_components_enabled(config)
+    if fuse_components:
+        logger.info(
+            "Per-region component fusion enabled: a recommender in "
+            "recommenders_enabled declares requires_components, so every "
+            "strategy also runs over the <extractor>%s.npy artifacts.",
+            COMPONENT_SUFFIX,
+        )
+
     variants = _resolve_extractor_variants(config, extractors)
     all_tasks: list[dict] = []
     for source_names, variant_token, pre_aligned in variants:
@@ -708,6 +970,28 @@ def run(condition: str = "frozen") -> None:
             )
             all_tasks.extend(tasks)
 
+            if fuse_components:
+                # Second pass over the per-region component artifacts, so
+                # a model that consumes components (ACF) sees the same
+                # fusion family as the pooled recommenders.
+                all_tasks.extend(
+                    _collect_fusion_tasks(
+                        dataset_name,
+                        embeddings_dir,
+                        processed_dir,
+                        source_names,
+                        fusion_config,
+                        normalize,
+                        enabled_strategies,
+                        alignment_method,
+                        alignment_dim,
+                        suffix=suffix,
+                        variant_token=variant_token,
+                        pre_aligned=pre_aligned,
+                        component=True,
+                    )
+                )
+
     for task in all_tasks:
         task["provenance"] = task_provenance(task)
     # Reuse requires the output AND a matching provenance record (E05):
@@ -722,18 +1006,57 @@ def run(condition: str = "frozen") -> None:
                 Path(task["output_path"]), task["emb_list_paths"], task["strategy_name"]
             )
     skipped = len(all_tasks) - len(pending)
+    for _ in range(skipped):
+        timing.note_skipped_cell()
     if skipped:
         logger.info("Skipping %d already existing fusions.", skipped)
 
-    if not pending:
+    if pending:
+        n_workers = _plan_fusion_workers(pending, resolve_resources(config))
+        logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
+        _run_fusion_pool(pending, n_workers)
+    else:
         logger.info("All fusions already exist.")
-        return
 
-    n_workers = _plan_fusion_workers(pending, resolve_resources(config))
-    logger.info("Running %d fusions on %d workers...", len(pending), n_workers)
-
-    _run_fusion_pool(pending, n_workers)
+    # NOT inside the `pending` branch: a rerun whose fusions are all
+    # cached must still project them, or the projected artifacts would
+    # exist only on the run that happened to build the fusions.
+    _project_every_dataset(datasets, embeddings_dir, processed_dir, config)
     logger.info("Embedding fusion complete.")
+
+
+def _project_every_dataset(
+    datasets: list[str],
+    embeddings_dir: str,
+    processed_dir: str,
+    config: dict,
+) -> None:
+    """Run the fusion-output projection for every dataset, when configured."""
+    projection = resolve_projection_config(config, FUSION_PREFIX.rstrip("_"))
+    if projection is None:
+        return
+    for dataset_name in datasets:
+        dataset_dir = Path(embeddings_dir) / dataset_name
+        if not dataset_dir.exists():
+            continue
+        with timing.time_cell(
+            "fuse", dataset=dataset_name, stage="projection", method=projection.method
+        ) as cell:
+            train_items = (
+                train_item_indices(processed_dir, dataset_name) if projection.needs_fit else None
+            )
+            written = project_fusion_outputs(dataset_dir, projection, train_items)
+            if not written:
+                cell.skip("projected fusions exist")
+            cell.label(written=written, dim=projection.dim)
+        if written:
+            logger.info(
+                "  %s: projected %d offline fusion(s) to %s dim %d.",
+                dataset_name,
+                written,
+                projection.method,
+                projection.dim,
+            )
 
 
 class FusionWorkerLostError(RuntimeError):
@@ -753,6 +1076,36 @@ def _cgroup_oom_kills() -> int | None:
     return None
 
 
+def _timed_fusion(worker, task: dict) -> tuple[str | None, float]:
+    """Run *worker* on *task* inside the pool; return ``(result, seconds)``.
+
+    Timed in the worker, not the parent, so a task that waited in the
+    queue behind busier workers is not charged for the wait.
+    """
+    started = time.perf_counter()
+    result = worker(**task)
+    return result, time.perf_counter() - started
+
+
+def _record_fusion_cost(task: dict, result: str | None, seconds: float, n_workers: int) -> None:
+    """One ``fuse`` cost cell per fusion that did work (``None`` = output existed)."""
+    if result is None:
+        timing.note_skipped_cell()
+        return
+    output = Path(task.get("output_path") or "")
+    timing.record_cell(
+        "fuse",
+        seconds,
+        dataset=output.parent.name,
+        extractors=source_labels(task.get("emb_list_paths") or []),
+        fusion=task.get("strategy_name"),
+        embedding=output.name.rsplit(".", 1)[0],
+        online=task.get("sidecar_payload") is not None,
+        component=bool(task.get("component")),
+        concurrent_workers=n_workers,
+    )
+
+
 def _run_fusion_pool(pending: list[dict], n_workers: int, worker=_fuse_single) -> int:
     """Run *pending* fusions on a process pool; return how many completed.
 
@@ -768,9 +1121,10 @@ def _run_fusion_pool(pending: list[dict], n_workers: int, worker=_fuse_single) -
     completed = 0
     try:
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(worker, **task): task for task in pending}
+            futures = {pool.submit(_timed_fusion, worker, task): task for task in pending}
             for future in as_completed(futures):
-                result = future.result()
+                result, seconds = future.result()
+                _record_fusion_cost(futures[future], result, seconds, n_workers)
                 completed += 1
                 if result:
                     logger.info("  [%d/%d] %s", completed, len(pending), result)

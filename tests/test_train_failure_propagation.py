@@ -214,21 +214,32 @@ class TestCliBoundary:
         assert _manifest_status(tmp_path / "results") == "ok"
 
 
-class TestBatteryBoundary:
+class TestManifestBoundary:
+    """An incomplete manifest must reach the exit code (audit F04).
+
+    The boundary used to be reached through ``pipeline.mode: battery``.
+    That mode was removed in 3.0.0, so the surviving manifest runner is
+    the ``folds`` step -- the invariant is the same and is pinned here
+    through it.
+    """
+
     def _run(self, tmp_path, monkeypatch, states: list[str]) -> int:
-        import src.battery.runner as runner
+        import src.folds.runner as runner
 
         manifest = BatteryManifest(path=tmp_path / "manifest.json")
         for i, state in enumerate(states):
             manifest.set_state(f"cell-{i}", state)
-        monkeypatch.setattr(runner, "run_battery", lambda *a, **k: manifest)
-        monkeypatch.setattr(main, "load_config", lambda *a, **k: _grid_config(tmp_path))
-        return main.run_cli(["--battery"])
+        monkeypatch.setattr(runner, "run_folds", lambda *a, **k: manifest)
+        # The step is selected by the YAML: main.py takes no arguments.
+        config = _grid_config(tmp_path)
+        config["pipeline"]["start_from"] = "folds"
+        config["pipeline"]["stop_at"] = "folds"
+        config["folds"] = {"enabled": True}
+        monkeypatch.setattr(main, "load_config", lambda *a, **k: config)
+        return main.run_cli([])
 
-    def test_should_exit_nonzero_when_the_battery_manifest_has_failed_cells(
-        self, tmp_path, monkeypatch
-    ):
+    def test_should_exit_nonzero_when_the_manifest_has_failed_cells(self, tmp_path, monkeypatch):
         assert self._run(tmp_path, monkeypatch, ["done", "failed", "pending"]) == 1
 
-    def test_should_exit_zero_when_every_battery_cell_is_done(self, tmp_path, monkeypatch):
+    def test_should_exit_zero_when_every_cell_is_done(self, tmp_path, monkeypatch):
         assert self._run(tmp_path, monkeypatch, ["done", "done"]) == 0

@@ -347,18 +347,40 @@ def admit_workers(
     return plan
 
 
-def choose_lazy_features(policy: str, payload_bytes: int, plan_usable_bytes: int) -> bool:
+def choose_lazy_features(
+    policy: str,
+    payload_bytes: int,
+    plan_usable_bytes: int,
+    *,
+    vram_budget_bytes: int = 0,
+) -> bool:
     """Whether a job should read its features lazily under *policy*.
 
     ``dense`` never, ``lazy`` always, ``auto`` when the resident payload
-    alone would not leave room in the usable budget (half of it, so the
-    model state and the ranking workspace still fit).
+    alone would not leave room in the budget (half of it, so the model
+    state and the ranking workspace still fit).
+
+    ``auto`` measures against the **VRAM** budget when one is given, and
+    falls back to the host budget otherwise (CPU runs, or a caller with
+    no GPU figure to hand).  The resident feature matrix is moved onto
+    the card with the model, so it competes for VRAM, not for host RAM;
+    comparing it against the host budget made ``auto`` all but
+    unreachable — a 2.9 GB payload never exceeds half of a 16 GB host
+    limit, while it is a third of what a 16 GB card leaves after its
+    share (found 2026-09-09).
+
+    ``auto`` still only sees the RESIDENT payload. A model whose peak is
+    a transient proportional to the batch — ACF stages
+    ``(batch, history, regions, D)`` before its projection — is not
+    predicted by this rule and is caught by the OOM retry instead, which
+    escalates a failed job to lazy reads.
     """
     if policy == "lazy":
         return True
     if policy == "dense":
         return False
-    return payload_bytes > plan_usable_bytes // 2
+    budget = vram_budget_bytes or plan_usable_bytes
+    return payload_bytes > budget // 2
 
 
 def estimate_model_state_bytes(

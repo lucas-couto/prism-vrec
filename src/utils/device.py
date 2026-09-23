@@ -83,6 +83,33 @@ def cap_process_vram(n_workers: int = 1, *, vram_share: float) -> float:
     return fraction
 
 
+def planned_vram_bytes(vram_share: float, n_workers: int = 1, device=None) -> int:
+    """VRAM one worker is planned to get, computed WITHOUT capping anything.
+
+    :func:`vram_allowance_bytes` reports what the CALLING process may
+    use, which is the right number inside a worker but useless in the
+    parent that plans admission: the parent never caps itself, so it
+    would read the whole card and hand every planner an allowance no
+    worker will ever see.  This derives the same figure from the card
+    and the configured share instead.
+
+    :param vram_share: ``resources.gpu.vram_share`` (already carrying any
+        ``PRISM_VRAM_SHARE`` override).
+    :param n_workers: processes that will share the card.
+    :returns: Bytes, or ``0`` when there is no CUDA device.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        total = torch.cuda.get_device_properties(device or 0).total_memory
+    except (RuntimeError, AssertionError):
+        return 0
+    share = min(max(float(vram_share), 0.0), 1.0) / max(1, int(n_workers))
+    return int(total * share)
+
+
 def vram_allowance_bytes(device=None) -> int:
     """Bytes of VRAM THIS process may use, honouring the per-process cap.
 

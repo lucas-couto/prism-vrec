@@ -18,6 +18,7 @@ from src.data.base import get_dataset_provider
 from src.data.categories import enforce_category_contract
 from src.utils.config import load_config
 from src.utils.logging import get_logger
+from src.utils.timing import time_cell
 
 logger = get_logger(__name__)
 
@@ -39,17 +40,19 @@ def run() -> None:
     for dataset_name in datasets:
         output_dir = Path(processed_dir) / dataset_name
 
-        if (
-            (output_dir / "train.csv").exists()
-            and (output_dir / "val.csv").exists()
-            and (output_dir / "test.csv").exists()
-        ):
-            logger.info("%s: already processed, skipping.", dataset_name)
-        else:
-            logger.info("=== Preprocessing %s ===", dataset_name)
-            provider = get_dataset_provider(dataset_name)
-            provider.save_processed(output_dir)
-            logger.info("%s: preprocessing complete.", dataset_name)
+        with time_cell("preprocess", dataset=dataset_name, stage="splits") as cell:
+            if (
+                (output_dir / "train.csv").exists()
+                and (output_dir / "val.csv").exists()
+                and (output_dir / "test.csv").exists()
+            ):
+                logger.info("%s: already processed, skipping.", dataset_name)
+                cell.skip("splits exist")
+            else:
+                logger.info("=== Preprocessing %s ===", dataset_name)
+                provider = get_dataset_provider(dataset_name)
+                provider.save_processed(output_dir)
+                logger.info("%s: preprocessing complete.", dataset_name)
 
         # Enforce the declared category contract on the loaded data. Runs
         # even when preprocessing was skipped: the raw taxonomy / sidecar
@@ -64,17 +67,19 @@ def run() -> None:
             )
 
         image_dir = Path(raw_dir) / dataset_name / "images"
-        n_existing = len(list(image_dir.glob("*.jpg"))) if image_dir.exists() else 0
-        if n_existing > 0:
-            logger.info(
-                "%s: %d images already extracted, skipping.",
-                dataset_name,
-                n_existing,
-            )
-        else:
-            logger.info("=== Extracting images %s ===", dataset_name)
-            provider = get_dataset_provider(dataset_name)
-            provider.extract_images(image_dir)
-            logger.info("%s: image extraction complete.", dataset_name)
+        with time_cell("preprocess", dataset=dataset_name, stage="images") as cell:
+            n_existing = len(list(image_dir.glob("*.jpg"))) if image_dir.exists() else 0
+            if n_existing > 0:
+                logger.info(
+                    "%s: %d images already extracted, skipping.",
+                    dataset_name,
+                    n_existing,
+                )
+                cell.skip("images exist")
+            else:
+                logger.info("=== Extracting images %s ===", dataset_name)
+                provider = get_dataset_provider(dataset_name)
+                provider.extract_images(image_dir)
+                logger.info("%s: image extraction complete.", dataset_name)
 
     logger.info("All datasets preprocessed.")

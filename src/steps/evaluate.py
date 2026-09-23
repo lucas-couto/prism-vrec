@@ -34,6 +34,7 @@ from src.utils.artifact_names import (
 from src.utils.atomic_io import atomic_write
 from src.utils.checkpoint import load_best_checkpoint
 from src.utils.config import load_config
+from src.utils.cost_labels import embedding_labels
 from src.utils.device import cap_process_vram, resolve_device
 from src.utils.evaluation_protocol import MODE_KFOLD, resolve_evaluation_protocol
 from src.utils.identity import (
@@ -647,7 +648,13 @@ def _run_single_split(config: dict, results_root: Path) -> None:
                 continue
 
             logger.info("  Evaluating: %s/%s -> %s", mn, en, pending)
-            with time_cell("evaluate", dataset=dataset_name, model_key=f"{mn}_{en}"):
+            with time_cell(
+                "evaluate",
+                dataset=dataset_name,
+                model_key=f"{mn}_{en}",
+                model=mn,
+                **embedding_labels(en, _embedding_artifact(embeddings_dir, dataset_name, en)),
+            ):
                 per_user = _evaluate_cell(
                     model_info,
                     dataset_name,

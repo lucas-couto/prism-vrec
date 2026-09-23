@@ -24,6 +24,24 @@ def _record_bpr_batch(module: BaseRecommender, args: tuple) -> None:
         module._last_batch = args
 
 
+def _normalize_component_rows(rows: torch.Tensor) -> torch.Tensor:
+    """L2 normalise each component vector of gathered rows ``(*, R, D)``.
+
+    Torch counterpart of
+    :func:`~src.fusions.strategies.l2_normalize_components` for the lazy
+    path: same fp32 arithmetic, same zero-vector rule, same cast back to
+    the gathered dtype, so a lazy gather equals the dense buffer.
+
+    :param rows: Component rows whose last axis is the feature dimension.
+    :returns: Rows of the same shape and dtype with unit-norm components.
+    """
+    promoted = rows.float()
+    norms = torch.linalg.norm(promoted, dim=-1, keepdim=True)
+    # Avoid division by zero for zero-vectors (l2_normalize's rule).
+    norms = torch.where(norms == 0, torch.ones_like(norms), norms)
+    return (promoted / norms).to(rows.dtype)
+
+
 class BaseRecommender(nn.Module, abc.ABC):
     """Base class for all BPR-based recommendation models.
 
@@ -157,6 +175,11 @@ class BaseRecommender(nn.Module, abc.ABC):
         # learned projection E consumes, regardless of the layout.
         self._online_fusion: nn.Module | None = None
         self._feature_source = None
+        #: Set for a native component artifact consumed raw: its vectors
+        #: are L2-normalised on the way in (dense: once, at buffer
+        #: construction; lazy: per gather), so both paths agree and the
+        #: consumer never sees the backbone's native magnitude.
+        self._normalize_components = False
         self._visual_shape: tuple[int, ...] | None = None
         self.visual_dim_raw = 0
         from src.data.feature_source import is_feature_source  # avoid cycle
@@ -175,7 +198,16 @@ class BaseRecommender(nn.Module, abc.ABC):
         """Historical path: the whole matrix becomes a non-persistent buffer."""
         source_dims = getattr(visual_embeddings, "source_dims", None)
         if source_dims:
-            arr = torch.FloatTensor(np.asarray(visual_embeddings))
+            raw_sources = np.asarray(visual_embeddings)
+            if raw_sources.ndim == 3 and self.consumes_raw_components:
+                # Per-region component sources (n_items, R, sum(D_i)):
+                # keep the on-disk fp16, as the raw-component branch
+                # below does.  An fp32 copy would double the catalogue
+                # buffer the component grid was sized against
+                # (``docs/protocol.md``, ACF component grid).
+                arr = torch.from_numpy(np.array(raw_sources))
+            else:
+                arr = torch.FloatTensor(raw_sources)
             self.register_buffer("visual_features", arr, persistent=False)
             self._visual_shape = tuple(arr.shape)
             self.visual_dim_raw = int(visual_embeddings.aligned_dim)
@@ -188,8 +220,18 @@ class BaseRecommender(nn.Module, abc.ABC):
             # fusion module is created.  The on-disk dtype (fp16 for
             # every extracted ``*_comp.npy``) is KEPT — the consumer
             # casts the gathered rows — so the catalogue costs half the
-            # VRAM of an fp32 copy; ``np.array`` materialises a memmap.
-            arr = torch.from_numpy(np.array(raw))
+            # VRAM of an fp32 copy.
+            # Every component vector is L2-normalised here, the eager
+            # counterpart of ``NpyFeatureSource(normalize=True)``: the
+            # pooled embeddings the other recommenders read were
+            # normalised offline, and without this the attention logits
+            # scale with the backbone's native magnitude (see
+            # ``l2_normalize_components``).  The chunked pass also
+            # materialises the memmap, as ``np.array`` used to.
+            from src.fusions.strategies import l2_normalize_components  # avoid cycle
+
+            self._normalize_components = True
+            arr = torch.from_numpy(l2_normalize_components(raw))
         else:
             arr = torch.FloatTensor(raw)
         if arr.dim() not in (2, 3):
@@ -218,6 +260,12 @@ class BaseRecommender(nn.Module, abc.ABC):
             self._init_learned_alignment(source)
             return
         self.visual_dim_raw = int(shape[-1])
+        if len(shape) == 3 and self.consumes_raw_components:
+            # Lazy counterpart of the dense component buffer: the rows
+            # are normalised as they are gathered (see
+            # :meth:`_raw_visual_rows`), so residency stays an execution
+            # detail and never moves a metric.
+            self._normalize_components = True
         if len(shape) == 3 and not self.consumes_raw_components:
             self._init_online_fusion(int(shape[1]), self.visual_dim_raw, config)
 
@@ -315,7 +363,14 @@ class BaseRecommender(nn.Module, abc.ABC):
         tensor = torch.from_numpy(rows)
         if not keep_dtype:
             tensor = tensor.float()
-        gathered = tensor.to(item_ids.device)[inverse]
+        tensor = tensor.to(item_ids.device)
+        if self._normalize_components:
+            # On the unique rows and on their device: the dense path
+            # normalises its buffer once, so doing it per gather here is
+            # the same arithmetic done more often -- in numpy on the host
+            # it doubled ACF's epoch (9 s -> 19 s, amazon_men 2026-09-16).
+            tensor = _normalize_component_rows(tensor)
+        gathered = tensor[inverse]
         return gathered.reshape(*item_ids.shape, *gathered.shape[1:])
 
     def _map_visual(
@@ -380,8 +435,13 @@ class BaseRecommender(nn.Module, abc.ABC):
         return self._fuse_rows(item_ids)
 
     def _fuse_rows(self, item_ids: torch.Tensor) -> torch.Tensor:
-        """Gather the raw rows of ``item_ids`` and apply the online fusion."""
-        rows = self._raw_visual_rows(item_ids)
+        """Gather the raw rows of ``item_ids`` and apply the online fusion.
+
+        The rows are cast to float first: a component source keeps its
+        on-disk fp16 (see :meth:`_raw_visual_rows`), while the fusion's
+        projections are fp32, and ``Linear`` refuses the mix.
+        """
+        rows = self._raw_visual_rows(item_ids).float()
         from src.fusions.online import LearnedAlignmentFusion  # avoid cycle
 
         if isinstance(self._online_fusion, LearnedAlignmentFusion):

@@ -49,13 +49,16 @@ from src.recommenders.hp_search import (
 )
 from src.utils.artifact_names import (
     FUSION_PREFIX,
+    PROJECTED_SEGMENT,
     is_component_artifact,
     is_finetuned_artifact,
     is_projected_artifact,
+    projection_dim,
+    projection_method,
 )
 from src.utils.checkpoint import CheckpointManager
 from src.utils.config import load_config
-from src.utils.device import resolve_device
+from src.utils.device import planned_vram_bytes, resolve_device
 from src.utils.identity import (
     PROVENANCE_SUFFIX,
     SELECTION_SPLITS,
@@ -114,8 +117,89 @@ def filter_by_variant(names: list[str], variant: str) -> list[str]:
     return [n for n in names if n == "none" or is_projected_artifact(n) == want_projected]
 
 
+def route_visual_input(
+    names: list[str],
+    model_name: str,
+    config: dict,
+    variant: str,
+) -> list[str]:
+    """Keep the embeddings *model_name* is entitled to consume.
+
+    A recommender may declare, under its own config block, the input
+    transform its paper prescribes::
+
+        vnpr:
+          visual_input:
+            projection: [pca_whitened]
+            dim: [128]
+
+    VNPR is why this is per model rather than global.  The NPR paper
+    reduces the CNN feature OFFLINE before the model sees it and
+    explicitly rejects VBPR's learned kernel (Niu et al. WSDM 2018,
+    section 5); VNPR is also the only recommender here without a learned
+    projection, so it is the only one exposed to the backbone's native
+    scale -- measured 2026-09-10 as an all-tied score list for 4-6% of
+    users on amazon_women.  Routing it alone keeps VBPR, DeepStyle and
+    ACF on the raw feature THEIR papers prescribe.
+
+    The rule is SUPERSEDE, not require: an input is dropped only when a
+    projected counterpart of it is present.  Requiring the projection
+    outright removed every ONLINE fusion from VNPR -- those are JSON
+    sidecars whose mixing happens inside the recommender, so no array of
+    theirs exists to project -- and they were precisely the inputs that
+    never degenerated (0.00% of users in a tie block on amazon_women,
+    against 4-6% on the native backbones): they reach the model already
+    normalised and already at the paper's width.  Dropping them would
+    have left VNPR with 3 fusion strategies where every other model has
+    12, gutting the ``fusion_within_model`` family for it.
+
+    Each declared recipe selects ARTIFACTS, so it multiplies cells, not
+    hyperparameter points: the embedding is part of a cell's identity
+    (its name, its per-user records, its checkpoint), and two arrays
+    could not share one.
+
+    A model with no ``visual_input`` block falls back to the global
+    ``embedding_variants`` (*variant*), so nothing changes for it.
+    ``"none"`` -- the pseudo-embedding of the non-visual baselines --
+    never routes away.
+    """
+    block = (config.get(model_name) or {}).get("visual_input")
+    if not block:
+        return filter_by_variant(names, variant)
+
+    methods = set(block.get("projection") or [])
+    dims = set(block.get("dim") or [])
+
+    def _wanted(name: str) -> bool:
+        return projection_method(name) in methods and projection_dim(name) in dims
+
+    #: Base names that DO have a projection of the declared recipe, so
+    #: their unprojected form is superseded rather than eligible.
+    superseded = {_projection_base(name) for name in names if _wanted(name)}
+
+    kept = []
+    for name in names:
+        if name == "none" or _wanted(name):
+            kept.append(name)
+            continue
+        if is_projected_artifact(name):
+            continue  # a projection of some other recipe: never a fallback
+        if _projection_base(name) not in superseded:
+            kept.append(name)
+    return kept
+
+
+def _projection_base(name: str) -> str:
+    """*name* with its projection token removed, or unchanged if native."""
+    return "_".join(part for part in name.split("_") if not PROJECTED_SEGMENT.match(part))
+
+
 #: JSON companions of an artifact that must never be listed as embeddings.
-_NON_EMBEDDING_JSON_SUFFIXES = (PROVENANCE_SUFFIX, ".meta.json", "_ids.json")
+#: ``.proj.json`` describes the matrix of a fixed projection; it joined
+#: this list when fusion OUTPUTS started being projected (2026-09-10),
+#: which put one next to a ``hybrid_*`` artifact for the first time and
+#: turned each into a phantom embedding named ``hybrid_*_pcaw128.proj``.
+_NON_EMBEDDING_JSON_SUFFIXES = (PROVENANCE_SUFFIX, ".meta.json", "_ids.json", ".proj.json")
 
 
 def get_embedding_files(
@@ -294,7 +378,10 @@ def _iter_cells(
 
     for dataset_name in config.get("datasets", []):
         all_embs = get_embedding_files(embeddings_dir, dataset_name, dim_filter or None)
-        all_embs = filter_by_variant(all_embs, variant)
+        # The variant filter is applied PER MODEL below, not here: a
+        # recommender that declares `visual_input` reads the artifacts
+        # its own paper prescribes, and filtering the pool up front
+        # would have removed them before it could ask.
         all_embs = filter_by_enabled_fusions(all_embs, config)
         all_embs = filter_by_enabled_extractors(all_embs, config)
         if condition == "frozen":
@@ -319,6 +406,7 @@ def _iter_cells(
                     for e in embedding_names
                     if is_component_artifact(e) == spec.requires_components
                 ]
+                sources = route_visual_input(sources, model_name, config, variant)
 
             for emb_name in sources:
                 if emb_name == "none":
@@ -966,12 +1054,22 @@ def plan_training_admission(
     residency = resources.features.residency
     headroom = resources.host.headroom_bytes
     usable = max(0, budget.limit_bytes - headroom)
+    # ``auto`` weighs the resident feature matrix against the VRAM a
+    # worker will actually get, not against host RAM: the matrix travels
+    # to the card with the model.  Planned here rather than measured,
+    # because the parent never caps itself (see planned_vram_bytes).
+    vram_budget = planned_vram_bytes(
+        resources.gpu.vram_share,
+        requested_workers if requested_workers > 0 else 1,
+    )
     admitted: list[TrainingJob] = []
     refused: list[tuple[TrainingJob, str]] = []
     heaviest = 0
     for job in jobs:
         payload, _ = feature_payload_bytes(job.embeddings_path)
-        job.lazy_features = choose_lazy_features(residency, payload, usable)
+        job.lazy_features = choose_lazy_features(
+            residency, payload, usable, vram_budget_bytes=vram_budget
+        )
         estimate = estimate_job_bytes(job, processed_dir, config, lazy=job.lazy_features)
         if estimate.total > usable:
             refused.append((job, _refusal_reason(estimate, usable, budget.source)))
@@ -1053,7 +1151,12 @@ def lazy_features_for(config: dict, embeddings_path: str | Path | None) -> bool:
     budget = resolve_host_budget(config)
     payload, _ = feature_payload_bytes(embeddings_path)
     usable = max(0, budget.limit_bytes - resources.host.headroom_bytes)
-    return choose_lazy_features(residency, payload, usable)
+    return choose_lazy_features(
+        residency,
+        payload,
+        usable,
+        vram_budget_bytes=planned_vram_bytes(resources.gpu.vram_share),
+    )
 
 
 def _legit_trial_count(study) -> int:

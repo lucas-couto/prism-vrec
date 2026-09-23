@@ -72,6 +72,49 @@ def l2_normalize(x: np.ndarray) -> np.ndarray:
     return x / norms
 
 
+#: Rows normalised per pass by :func:`l2_normalize_components`, so a
+#: catalogue-sized component array is never staged in fp32 as a whole
+#: (a memmap input is paged in one chunk at a time).
+_COMPONENT_NORM_CHUNK = 8192
+
+
+def l2_normalize_components(x: np.ndarray) -> np.ndarray:
+    """L2 normalise every component vector of a 3-D component array.
+
+    Component artifacts (``<extractor>_comp.npy``, shape
+    ``(n_items, R, D)``) reach their consumer unnormalised, while the
+    pooled embeddings every other recommender reads were normalised
+    offline.  That asymmetry made ACF's attention logits scale with the
+    backbone's native magnitude, overflowing to ``inf`` under autocast
+    (``docs/protocol.md``, ACF component normalisation).  Normalising
+    each ``D``-vector — the same rule :func:`l2_normalize` applies to a
+    2-D row, applied along the last axis — removes it.
+
+    The arithmetic runs in fp32 and the result is cast back to *x*'s
+    dtype, so an fp16 artifact stays fp16 (the component grid was sized
+    against an fp16 catalogue) and the dense and lazy paths agree
+    bit-for-bit.  Zero vectors are left unchanged.
+
+    :param x: 3-D array (or memmap) of shape ``(n_items, R, D)``.
+    :returns: Array of the same shape and dtype with unit-norm
+        component vectors.
+    :raises ValueError: When *x* is not 3-D.
+    """
+    if x.ndim != 3:
+        raise ValueError(
+            f"component features must be 3-D (n_items, R, D); got shape {x.shape}.",
+        )
+    out = np.empty(x.shape, dtype=x.dtype)
+    for start in range(0, x.shape[0], _COMPONENT_NORM_CHUNK):
+        stop = start + _COMPONENT_NORM_CHUNK
+        block = np.asarray(x[start:stop], dtype=np.float32)
+        norms = np.linalg.norm(block, axis=-1, keepdims=True)
+        # Avoid division by zero for zero-vectors (l2_normalize's rule).
+        norms = np.where(norms == 0, np.float32(1.0), norms)
+        out[start:stop] = (block / norms).astype(x.dtype, copy=False)
+    return out
+
+
 def _validate_embeddings(embeddings: list[np.ndarray]) -> None:
     """Check that *embeddings* is a non-empty list of 2-D arrays with the
     same number of rows ``N``."""
@@ -446,10 +489,70 @@ def _fit_pca_train_only(
         # from already-centred data.
         pca = fit_pca_on_rows(fit_rows, n_components, random_state, label, copy=True)
     else:
-        fit_rows = matrix[np.asarray(train_items)]
+        fit_rows = matrix[cap_fit_indices(np.asarray(train_items), random_state, label)]
         n_components = min(n_components, *fit_rows.shape)
         pca = fit_pca_on_rows(fit_rows, n_components, random_state, label, copy=True)
     return pca.transform(matrix)
+
+
+#: Largest number of rows ANY PCA in this framework is fit on; larger
+#: fit sets are sampled down to it.
+#:
+#: One cap for every PCA — fusion strategies, the per-region component
+#: pass, the fusion alignment, the extractors' fixed projection — because
+#: an estimator that saw four million rows and one that saw three hundred
+#: thousand are not the same estimator, and a battery that mixes them is
+#: not a fair comparison.
+#:
+#: The value is a byte budget expressed in rows: 8 GB of host RAM over
+#: the widest fit matrix in the battery, the per-region concat of the two
+#: fusion extractors at 2048 + 768 = 2816 float32 columns
+#: (750,000 x 2816 x 4 B = 7.87 GiB).  The fit is scikit-learn on CPU and
+#: never touches the GPU.  Sizing it was forced by the per-region pass,
+#: which multiplies the fit set by the region count: amazon_women is
+#: 291,812 train items x 4 regions = 1,167,248 rows, a 13.1 GiB matrix
+#: against a 16 GiB container (2026-09-10).
+#:
+#: Statistically this is slack, not a compromise: 128 components over
+#: 2,816 dimensions are estimated from a sample two orders of magnitude
+#: larger than the dimension either way.  Every other PCA in the battery
+#: already fits well under it (a pooled fit is one row per train item),
+#: so the cap changes only the per-region pass.
+PCA_FIT_MAX_ROWS = 750_000
+
+
+def cap_fit_indices(
+    fit_idx: np.ndarray,
+    random_state: int | None,
+    label: str,
+) -> np.ndarray:
+    """Sample *fit_idx* down to :data:`PCA_FIT_MAX_ROWS` when larger.
+
+    Callers must apply this to the INDICES, before the fit matrix is
+    assembled.  Capping the assembled rows instead is worse than
+    useless: the full matrix has already been allocated by then, and the
+    sample adds its own copy on top -- measured on amazon_women as a
+    21 GiB peak where the uncapped path peaked at 13.1 (2026-09-10).
+
+    Indices are drawn without replacement and returned sorted, so the
+    sample is reproducible from *random_state* and gathered in file
+    order.
+    """
+    n_rows = int(fit_idx.shape[0])
+    if n_rows <= PCA_FIT_MAX_ROWS:
+        return fit_idx
+
+    seed = 42 if random_state is None else random_state
+    rng = np.random.default_rng(seed)
+    picked = np.sort(rng.choice(n_rows, size=PCA_FIT_MAX_ROWS, replace=False))
+    logger.info(
+        "%s: fit set sampled %d -> %d rows (PCA_FIT_MAX_ROWS, seed %s)",
+        label,
+        n_rows,
+        PCA_FIT_MAX_ROWS,
+        seed,
+    )
+    return fit_idx[picked]
 
 
 def fit_pca_on_rows(
@@ -486,6 +589,19 @@ def fit_pca_on_rows(
     :returns:
         The fitted estimator.
     """
+    if fit_rows.shape[0] > PCA_FIT_MAX_ROWS:
+        # Not sampled here: the matrix is already allocated, so cutting
+        # it now costs a second copy and saves nothing.  The caller is
+        # meant to have capped the indices (`cap_fit_indices`); say so
+        # rather than paper over it.
+        logger.warning(
+            "%s: fit set has %d rows, above PCA_FIT_MAX_ROWS (%d) — the "
+            "caller did not cap its indices, so this fit is neither "
+            "memory-bounded nor comparable with the capped ones.",
+            label,
+            fit_rows.shape[0],
+            PCA_FIT_MAX_ROWS,
+        )
     pca = PCA(n_components=n_components, random_state=random_state, copy=copy)
     pca.fit(fit_rows)
     explained = float(np.sum(pca.explained_variance_ratio_))

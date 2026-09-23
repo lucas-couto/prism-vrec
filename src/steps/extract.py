@@ -22,7 +22,6 @@ from src.extractors import (
 from src.extractors.projection import (
     ProjectionConfig,
     ensure_projected,
-    projected_path,
     resolve_projection_config,
 )
 from src.utils.atomic_io import atomic_write
@@ -273,18 +272,23 @@ def _extract_for_config(
     want_components = extract_components and getattr(extractor_cls, "supports_components", False)
     need_pooled = not pooled_path.exists()
     need_components = want_components and not comp_path.exists()
-    need_projection = (
-        projection is not None and not projected_path(pooled_path, projection.dim).exists()
-    )
-
-    if not need_pooled and not need_components and not need_projection:
-        logger.info("  %s: already exists, skipping.", extractor_name)
-        return False
 
     if not need_pooled and not need_components:
-        # Only the projection is missing.  The native features are already
-        # on disk and the projection is a linear map over them, so the
-        # backbone is never loaded.
+        if projection is None:
+            logger.info("  %s: already exists, skipping.", extractor_name)
+            return False
+        # A configured projection is NEVER decided by the existence of
+        # its artifact.  The name carries the method and the width since
+        # 2026-09-10, but never the fit set or the seed, so a cell
+        # configured for another recipe is not distinguishable by name
+        # alone.  Skipping on existence also skips `ensure_projected`,
+        # and with it the provenance check that catches exactly that --
+        # the stale array then feeds the run silently, which is how a
+        # whitening probe reported the plain-PCA numbers.  `_project_pooled`
+        # is idempotent: it returns False when the record already
+        # matches and raises `ArtifactProvenanceError` when it does not.
+        # The native features are on disk either way, so the backbone is
+        # never loaded here.
         return _project_pooled(pooled_path, projection, train_items)
 
     logger.info("  Extracting %s (native dim)...", extractor_name)

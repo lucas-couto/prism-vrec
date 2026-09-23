@@ -246,12 +246,18 @@ class ConcatFeatureSource(_MultiSource):
         fusion_kwargs: dict | None = None,
     ) -> None:
         super().__init__(sources)
-        for source in self._sources:
-            if len(source.shape) != 2:
-                raise ValueError(
-                    f"learned-alignment sources must be 2-D, got shape {source.shape}."
-                )
-        self.source_dims = [int(s.shape[1]) for s in self._sources]
+        leading = {tuple(int(d) for d in s.shape[:-1]) for s in self._sources}
+        if len(leading) != 1:
+            raise ValueError(
+                f"learned-alignment sources must agree on the item/region layout, "
+                f"got {sorted(leading)}."
+            )
+        if len(self._sources[0].shape) not in (2, 3):
+            raise ValueError(
+                f"learned-alignment sources must be 2-D (n_items, D) or 3-D "
+                f"(n_items, R, D), got shape {self._sources[0].shape}."
+            )
+        self.source_dims = [int(s.shape[-1]) for s in self._sources]
         self.strategy = str(strategy)
         self.aligned_dim = int(aligned_dim)
         self.normalize = bool(normalize)
@@ -259,12 +265,16 @@ class ConcatFeatureSource(_MultiSource):
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return (int(self._sources[0].shape[0]), int(sum(self.source_dims)))
+        leading = tuple(int(d) for d in self._sources[0].shape[:-1])
+        return (*leading, int(sum(self.source_dims)))
 
     def read_rows(self, item_ids: np.ndarray) -> np.ndarray:
         ids = _validate_ids(item_ids, self.shape[0])
         parts = [s.read_rows(ids).astype(self._dtype, copy=False) for s in self._sources]
-        return np.concatenate(parts, axis=1)
+        # Last axis: 2-D pooled rows concatenate on the feature axis, and
+        # 3-D per-region component rows concatenate within each region,
+        # which is what the per-region fusion consumes.
+        return np.concatenate(parts, axis=-1)
 
 
 class StackedFeatureSource(_MultiSource):

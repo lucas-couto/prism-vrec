@@ -140,20 +140,22 @@ class TestDispatch:
             ev_kfold.run_kfold({"folds": {"enabled": True, "seed": 1}}, tmp_path / "results")
 
 
-class TestRemovedFlag:
-    def test_folds_flag_fails_naming_folds_enabled(self, capsys) -> None:
+class TestProtocolIsYamlOnly:
+    """The protocol is chosen by ``folds.enabled``, never by a flag.
+
+    ``--folds`` was removed with the rest of the CLI (the researcher's
+    YAML-only decision, see ``tests/test_yaml_only_cli.py``): there is no
+    parser left to hold it, and the resolved protocol is printed by
+    ``pipeline.mode: show_plan``.
+    """
+
+    def test_folds_argument_fails_naming_folds_enabled(self, capsys) -> None:
         code = main.run_cli(["--folds"])
 
         err = capsys.readouterr().err
-        assert code == 2
-        assert "--folds was removed" in err
+        assert code != 0
+        assert "takes no arguments" in err
         assert "folds.enabled" in err
-
-    def test_folds_flag_is_gone_from_the_parser(self) -> None:
-        known = {opt for action in main.build_parser()._actions for opt in action.option_strings}
-
-        assert "--folds" not in known
-        assert "--battery" in known
 
     @pytest.mark.parametrize(
         ("folds", "expected"),
@@ -162,13 +164,16 @@ class TestRemovedFlag:
             ({"enabled": False}, "single_split (run seed=42"),
         ],
     )
-    def test_show_plan_prints_the_evaluation_protocol(
+    def test_show_plan_mode_prints_the_evaluation_protocol(
         self, monkeypatch, capsys, folds, expected
     ) -> None:
-        config = {"pipeline": {"run_all": True, "condition": "frozen"}, "folds": folds}
+        config = {
+            "pipeline": {"run_all": True, "condition": "frozen", "mode": "show_plan"},
+            "folds": folds,
+        }
         monkeypatch.setattr(main, "load_config", lambda *a, **k: config)
 
-        assert main.run_cli(["--show-plan"]) == 0
+        main.main([])
 
         assert f"Evaluation protocol: {expected}" in capsys.readouterr().out
 

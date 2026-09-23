@@ -69,8 +69,8 @@ class TestEffectiveHyperparams:
             "total_dim": 128,
             "learning_rate": 0.01,
             "l2_reg": 0.0001,
-            "latent_dim": 64,
-            "visual_dim": 64,
+            "latent_dim": 128,
+            "visual_dim": 128,
         }
 
     @pytest.mark.parametrize("model", BUILTIN)
@@ -93,7 +93,7 @@ class TestEffectiveHyperparams:
         cfg = _config()
 
         with pytest.raises(EffectiveHyperparamsError, match="latent_dim"):
-            effective_hyperparams("vbpr", {"total_dim": 128, "latent_dim": 128}, cfg)
+            effective_hyperparams("vbpr", {"total_dim": 128, "latent_dim": 64}, cfg)
 
     def test_leaves_multi_valued_unsuggested_keys_absent(self) -> None:
         cfg = _config()
@@ -227,8 +227,8 @@ class TestResolveReplayHyperparams:
             "total_dim": 64,
             "learning_rate": 0.01,
             "l2_reg": 0.0001,
-            "latent_dim": 32,
-            "visual_dim": 32,
+            "latent_dim": 64,
+            "visual_dim": 64,
         }
         assert origin.provenance["sources"]["l2_reg"] == "default"
 
@@ -292,7 +292,7 @@ class TestResolveCellHyperparamsProvenance:
             results_root=tmp_path,
         )
 
-        assert origin.hyperparams["latent_dim"] == 32
+        assert origin.hyperparams["latent_dim"] == 64
         assert origin.suggestion == {"total_dim": 64}
         assert origin.provenance["sources"]["latent_dim"] == "derived"
 
