@@ -26,6 +26,10 @@ services:
       - ./scripts:/app/scripts
       - ./main.py:/app/main.py
       - ./.cache:/app/.cache
+      # Read-only, for provenance only: without it `git rev-parse` fails
+      # inside the container and every run records `sha: null` (and a run
+      # directory named `_nogit`).  Nothing writes through this mount.
+      - ./.git:/app/.git:ro
     working_dir: /app
     # Run as the host user so everything written through the bind mounts
     # (data/, results/, logs/, checkpoints/) is owned by the researcher
@@ -53,6 +57,13 @@ services:
       # lower it while someone works at the workstation, e.g.
       #   PRISM_VRAM_SHARE=0.5 docker compose up -d
       PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-}
+      # /app is root-owned while the process runs as uid 1000, so git
+      # refuses the repository as "dubious ownership" and the manifest
+      # loses the sha.  Declared through the environment so no git config
+      # is written inside the container.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /app
     entrypoint: ["python", "main.py"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
@@ -131,6 +142,10 @@ services:
       - ./src:/app/src
       - ./main.py:/app/main.py
       - ./.cache:/app/.cache
+      # Read-only, for provenance only: without it `git rev-parse` fails
+      # inside the container and every run records `sha: null` (and a run
+      # directory named `_nogit`).  Nothing writes through this mount.
+      - ./.git:/app/.git:ro
     working_dir: /app
     # Run as the host user so everything written through the bind mounts
     # (data/, results/, logs/, checkpoints/) is owned by the researcher
@@ -175,6 +190,10 @@ services:
       - ./scripts:/app/scripts
       - ./main.py:/app/main.py
       - ./.cache:/app/.cache
+      # Read-only, for provenance only: without it `git rev-parse` fails
+      # inside the container and every run records `sha: null` (and a run
+      # directory named `_nogit`).  Nothing writes through this mount.
+      - ./.git:/app/.git:ro
     working_dir: /app
     # Run as the host user so everything written through the bind mounts
     # (data/, results/, logs/, checkpoints/) is owned by the researcher
@@ -195,6 +214,13 @@ services:
       # from the shell behave identically.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       PRISM_VRAM_SHARE: ${PRISM_VRAM_SHARE:-}
+      # /app is root-owned while the process runs as uid 1000, so git
+      # refuses the repository as "dubious ownership" and the manifest
+      # loses the sha.  Declared through the environment so no git config
+      # is written inside the container.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /app
     entrypoint: ["bash"]
     # Expose the host GPU.  Requires nvidia-container-toolkit on the host
     # (`sudo nvidia-ctk runtime configure --runtime=docker`).  Without the
